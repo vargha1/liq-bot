@@ -1,0 +1,128 @@
+import "dotenv/config";
+import { ethers } from "ethers";
+import { logger } from "./logger";
+import { CONFIG, AAVE_POOL, AAVE_POOL_ABI } from "./config";
+import { PositionTracker } from "./positions";
+import { AaveOracle } from "./oracle";
+import { Evaluator } from "./evaluator";
+import { Executor } from "./executor";
+
+let shuttingDown = false;
+process.on("SIGINT",  () => { shuttingDown = true; logger.info("Shutting down…"); process.exit(0); });
+process.on("SIGTERM", () => { shuttingDown = true; process.exit(0); });
+process.on("uncaughtException",  e  => logger.error(`Uncaught: ${e.message}`, e));
+process.on("unhandledRejection", r  => logger.error(`Rejection: ${r}`));
+
+async function main(): Promise<void> {
+  logger.info("═══════════════════════════════════════════════════════════");
+  logger.info("         Aave V3 Liquidation Bot — Arbitrum One            ");
+  logger.info("═══════════════════════════════════════════════════════════");
+  logger.info(`Contract   : ${CONFIG.contractAddress}`);
+  logger.info(`Min profit : $${CONFIG.minProfitUsd}`);
+  logger.info(`Batch size : ${CONFIG.positionsPerCycle} positions/cycle`);
+  logger.info(`Poll       : every ${CONFIG.pollIntervalMs}ms`);
+  logger.info("═══════════════════════════════════════════════════════════");
+
+  const provider = new ethers.JsonRpcProvider(CONFIG.rpcUrl, { chainId: 42161, name: "arbitrum" });
+  const network  = await provider.getNetwork();
+  if (network.chainId !== 42161n) throw new Error(`Wrong network: ${network.chainId}`);
+
+  const block = await provider.getBlockNumber();
+  logger.info(`Connected | block ${block}`);
+
+  const wallet    = new ethers.Wallet(CONFIG.privateKey, provider);
+  const ethBal    = await provider.getBalance(wallet.address);
+  logger.info(`Wallet: ${wallet.address} | ETH: ${ethers.formatEther(ethBal)}`);
+  if (ethBal < ethers.parseEther("0.01")) logger.warn("⚠️  Low ETH — top up for gas");
+
+  const tracker   = new PositionTracker(provider);
+  const oracle    = new AaveOracle(provider);
+  const evaluator = new Evaluator(oracle, provider);
+  const executor  = new Executor(wallet, CONFIG.contractAddress);
+
+  // ── Bootstrap: seed position list from subgraph ───────────────────────────
+  // await tracker.seed();
+  // logger.info(`Watching ${tracker.size} positions`);
+
+  // ── Start live event monitoring ────────────────────────────────────────────
+  tracker.startEventMonitoring();
+
+  // ── Stats ─────────────────────────────────────────────────────────────────
+  let cycles = 0, liquidatable = 0, executed = 0, totalProfitUsd = 0;
+  const start = Date.now();
+
+  setInterval(() => {
+    const upMin = ((Date.now() - start) / 60_000).toFixed(1);
+    logger.info(
+      `📊 uptime=${upMin}m cycles=${cycles} liquidatable=${liquidatable} ` +
+      `executed=${executed} profit=$${totalProfitUsd.toFixed(2)} watching=${tracker.size}`
+    );
+  }, 5 * 60_000);
+
+  // ── Main loop ─────────────────────────────────────────────────────────────
+  const loop = async () => {
+    if (shuttingDown) return;
+    cycles++;
+
+    try {
+      const feeData = await provider.getFeeData();
+      const gweiNow = Number(feeData.gasPrice ?? 0n) / 1e9;
+      if (gweiNow > CONFIG.maxGasGwei) {
+        logger.debug(`Gas ${gweiNow.toFixed(3)} gwei > max — skipping cycle`);
+        if (!shuttingDown) setTimeout(loop, CONFIG.pollIntervalMs);
+        return;
+      }
+      const gasPrice = feeData.gasPrice ?? 0n;
+
+      // Refresh a batch of positions — returns only HF < 1.0
+      const atRisk = await tracker.refreshBatch(CONFIG.positionsPerCycle);
+
+      if (atRisk.length > 0) {
+        liquidatable += atRisk.length;
+        logger.info(`🚨 ${atRisk.length} liquidatable position(s) found this cycle`);
+
+        for (const position of atRisk) {
+          if (executor.isExecuting) break;
+
+          logger.info(
+            `  Borrower ${position.address} | HF=${position.healthFactorNum.toFixed(4)} | ` +
+            `collateral=$${(Number(position.totalCollateralBase) / 1e8)} | ` +
+            `debt=$${(Number(position.totalDebtBase) / 1e8)}`
+          );
+
+          // Get per-asset breakdown
+          const { collaterals, debts } = await tracker.getAssetBreakdown(position.address);
+
+          // Evaluate profitability
+          const opp = await evaluator.evaluate(position, collaterals, debts, gasPrice);
+
+          if (!opp) {
+            logger.debug(`  → Not profitable enough (min $${CONFIG.minProfitUsd})`);
+            continue;
+          }
+
+          logger.info(
+            `  ✅ Profitable! ${opp.collateralSymbol}↔${opp.debtSymbol} | ` +
+            `bonus=$${opp.expectedBonusUsd.toFixed(2)} | net=$${opp.netProfitUsd.toFixed(2)}`
+          );
+
+          const receipt = await executor.execute(opp);
+          if (receipt?.status === 1) {
+            executed++;
+            totalProfitUsd += opp.netProfitUsd;
+          }
+        }
+      } else {
+        logger.debug(`Cycle ${cycles}: 0 liquidatable (checked ${CONFIG.positionsPerCycle} positions)`);
+      }
+    } catch (err: any) {
+      logger.error(`Loop error: ${err?.message ?? err}`);
+    }
+
+    if (!shuttingDown) setTimeout(loop, CONFIG.pollIntervalMs);
+  };
+
+  await loop();
+}
+
+main().catch(err => { logger.error(`Fatal: ${err.message}`); process.exit(1); });

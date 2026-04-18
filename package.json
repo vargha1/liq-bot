@@ -1,0 +1,24 @@
+{
+  "name": "aave-liquidation-bot",
+  "version": "1.0.0",
+  "description": "Aave V3 liquidation bot — monitors positions, executes via flashloan + Uniswap V3",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "diagnose": "tsx src/diagnose.ts",
+    "diag-excel": "tsx src/diagnose3.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "ethers": "6.16.0",
+    "exceljs": "^4.4.0",
+    "winston": "^3.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.15.0",
+    "typescript": "^5.4.5"
+  }
+}
