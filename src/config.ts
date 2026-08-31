@@ -132,6 +132,12 @@ export const CONFIG = {
   // correctness. Turn it on once you have watched the logs confirm it matching.
   sequencerFeedEnabled: opt("SEQUENCER_FEED_ENABLED", "false") === "true",
   sequencerFeedUrl:     opt("SEQUENCER_FEED_URL", "wss://arb1.arbitrum.io/feed"),
+  // Local health factor below which the trigger fires WITHOUT an authoritative
+  // check. The hot-path price snapshot mixes ratio estimates with TTL-stale
+  // entries, so the local figure carries low tens of bps of error; below this
+  // cut that cannot change the verdict. At or above it, one getUserAccountData
+  // multicall confirms before any gas is committed.
+  triggerConfirmHf:     parseFloat(opt("TRIGGER_CONFIRM_HF", "0.995")),
 } as const;
 
 // ─── Aave V3 Arbitrum core addresses ─────────────────────────────────────────

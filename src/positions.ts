@@ -2149,6 +2149,51 @@ export class PositionTracker {
     };
   }
 
+  // Authoritative health factors for a handful of addresses, in one multicall.
+  //
+  // The model is exact given exact prices (checkModel measures 0.000 bps drift),
+  // but the trigger's hot path feeds it snapshotAllPrices(), which mixes
+  // ratio-ESTIMATED prices with ones up to the cache TTL old, while Aave values
+  // every asset at one instant. In practice that is worth low tens of bps — two
+  // live fires computed 0.9997 and 0.9992 against a real 1.0010 and 1.0014, and
+  // both reverted with HealthFactorNotBelowThreshold(). Enough margin to matter
+  // only when the local figure is already close to 1.0, which is exactly when
+  // this is called.
+  async confirmHealthFactors(addresses: string[]): Promise<Map<string, bigint>> {
+    const out = new Map<string, bigint>();
+    const targets = [...new Set(addresses.map(a => a.toLowerCase()))];
+    if (targets.length === 0) return out;
+    try {
+      const results: Array<{ success: boolean; returnData: string }> = await this.multicall.tryAggregate(
+        false,
+        targets.map(addr => ({
+          target:   AAVE_POOL,
+          callData: IFACE.encodeFunctionData("getUserAccountData", [addr]),
+        })),
+      );
+      for (let i = 0; i < targets.length; i++) {
+        const r = results[i];
+        if (!r?.success || r.returnData === "0x") continue;
+        try {
+          const d = IFACE.decodeFunctionResult("getUserAccountData", r.returnData);
+          const hf = d.healthFactor as bigint;
+          out.set(targets[i]!, hf);
+          // Keep the tracked position in step with what the chain just told us.
+          const pos = this.positions.get(targets[i]!);
+          if (pos) {
+            pos.healthFactor        = hf;
+            pos.healthFactorNum     = Number(hf) / 1e18;
+            pos.totalCollateralBase = d.totalCollateralBase as bigint;
+            pos.totalDebtBase       = d.totalDebtBase as bigint;
+          }
+        } catch { /* skip undecodable */ }
+      }
+    } catch (e: any) {
+      logger.debug(`confirmHealthFactors failed: ${e?.message ?? e}`);
+    }
+    return out;
+  }
+
   // Health factor for one address straight from the model, or null if it can't
   // be computed. Used by the sweep to skip authoritative reads it doesn't need.
   localHealthFactor(address: string, prices: Map<string, bigint>): bigint | null {

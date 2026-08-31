@@ -91,6 +91,12 @@ const TRIGGER_HF_CEILING = 10n ** 18n; // 1.0 — findLocalCandidates treats thi
 // events in the same block.
 const FIRE_DEDUPE_MS = 2_000;
 
+interface BuiltOpp {
+  key:     string;
+  hfLocal: number;
+  opp:     ReturnType<Evaluator["buildFromLocal"]>;
+}
+
 export class TriggerEngine {
   // aggregator address (lowercase) → reserve asset addresses (lowercase) it prices
   private feeds        = new Map<string, Set<string>>();
@@ -443,7 +449,7 @@ export class TriggerEngine {
       // and firing in HF order burned all three slots before reaching the large
       // ones. Building an opportunity is pure computation, so ordering by value
       // costs nothing.
-      const built: Array<{ key: string; hfLocal: number; opp: ReturnType<Evaluator["buildFromLocal"]> }> = [];
+      const built: BuiltOpp[] = [];
       for (const cand of candidates) {
         const key = cand.pos.address;
         const lastFire = this.firedAt.get(key);
@@ -457,9 +463,36 @@ export class TriggerEngine {
       }
       built.sort((a, b) => b.opp!.netProfitUsd - a.opp!.netProfitUsd);
 
-      let fired = 0;
-      for (let i = 0; i < built.length; i++) {
-        const { key, hfLocal, opp } = built[i]!;
+      // Split by confidence. The local HF is computed from a price snapshot that
+      // mixes ratio estimates with TTL-stale entries, so it carries low tens of
+      // bps of error. Well below 1.0 that error cannot change the answer and we
+      // fire immediately — the whole point of the engine. Close to 1.0 it can,
+      // and did: two fires at 0.9997/0.9992 met a real 1.0010/1.0014 and both
+      // reverted. Those get one authoritative multicall first, which costs
+      // ~50-100ms on positions that have been sitting near the threshold for
+      // minutes.
+      const confidentCut = BigInt(Math.round(CONFIG.triggerConfirmHf * 1e18));
+      const confident = built.filter(b => BigInt(Math.round(b.hfLocal * 1e18)) < confidentCut);
+      const marginal  = built.filter(b => BigInt(Math.round(b.hfLocal * 1e18)) >= confidentCut);
+
+      const fired = this.fireAll(confident, now);
+      if (marginal.length > 0) this.confirmThenFire(marginal, now);
+
+      this.pruneFiredAt(now);
+      logger.debug(
+        `trigger: ${candidates.length} local candidates, ${fired} fired immediately, ` +
+        `${marginal.length} awaiting confirmation`
+      );
+    } finally {
+      stop();
+    }
+  }
+
+  // Dispatch a pre-sorted list, respecting executor capacity.
+  private fireAll(built: BuiltOpp[], now: number): number {
+    let fired = 0;
+    for (let i = 0; i < built.length; i++) {
+      const { key, hfLocal, opp } = built[i]!;
         // Check capacity BEFORE announcing. Previously every candidate logged
         // "firing" and the executor then silently dropped the ones over capacity,
         // so the log claimed to be acting on opportunities it never submitted.
@@ -476,17 +509,38 @@ export class TriggerEngine {
           `⚡ Trigger: ${key.slice(0,10)}… localHF=${hfLocal.toFixed(4)} ` +
           `${opp!.collateralSymbol}->>${opp!.debtSymbol} net=$${opp!.netProfitUsd.toFixed(2)} — firing`
         );
-        // Executor still enforces cooldown / in-flight guards internally.
-        this.executor.execute(opp!).catch(e =>
-          logger.error(`Trigger exec error: ${e?.shortMessage ?? e?.message ?? e}`)
-        );
-      }
-
-      this.pruneFiredAt(now);
-      logger.debug(`trigger: ${candidates.length} local candidates for asset move, ${fired} dispatched`);
-    } finally {
-      stop();
+      // Executor still enforces cooldown / in-flight guards internally.
+      this.executor.execute(opp!).catch(e =>
+        logger.error(`Trigger exec error: ${e?.shortMessage ?? e?.message ?? e}`)
+      );
     }
+    return fired;
+  }
+
+  // Marginal candidates: confirm against Aave's own getUserAccountData before
+  // committing gas. Anything the chain reports at or above 1.0 is dropped —
+  // liquidationCall would revert with HealthFactorNotBelowThreshold().
+  private confirmThenFire(marginal: BuiltOpp[], now: number): void {
+    const addresses = marginal.map(m => m.key);
+    this.tracker.confirmHealthFactors(addresses)
+      .then(confirmed => {
+        if (!this.canFire()) return;
+        const survivors: BuiltOpp[] = [];
+        for (const m of marginal) {
+          const hf = confirmed.get(m.key);
+          if (hf === undefined) continue;             // unknown — do not gamble gas
+          if (hf >= 10n ** 18n) {
+            logger.debug(
+              `  trigger: ${m.key.slice(0,10)}… localHF=${m.hfLocal.toFixed(4)} but chain HF=` +
+              `${(Number(hf) / 1e18).toFixed(6)} — not liquidatable, skipping`
+            );
+            continue;
+          }
+          survivors.push(m);
+        }
+        if (survivors.length > 0) this.fireAll(survivors, Date.now());
+      })
+      .catch(e => logger.debug(`trigger confirm failed: ${e?.message ?? e}`));
   }
 
   // firedAt only exists to dedupe within FIRE_DEDUPE_MS; without this it grows
