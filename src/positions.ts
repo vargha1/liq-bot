@@ -1975,16 +1975,52 @@ export class PositionTracker {
 
     for (const address of candidates) {
       if (this.badDebtDenylist.has(address)) continue;
-      const pos = this.positions.get(address);
-      if (!pos) continue;
       const state = this.userStates.get(address);
       if (!state) continue;
+      // Dormant positions stay in the model (parking only removes them from the
+      // active map), so they are evaluated here directly rather than being woken
+      // en masse first. See the note in the trigger engine's dispatch.
+      const isDormant = !this.positions.has(address);
+      if (isDormant && !this.dormant.has(address)) continue;  // evicted entirely
 
       const evaluated = this.evaluateUserState(state, prices, nowSec);
       if (!evaluated) continue;
-      const { collaterals, debts, hfE18 } = evaluated;
+      const { collaterals, debts, hfE18, collateralUsd8, debtUsd8 } = evaluated;
       if (hfE18 > ceiling) continue;
       if (collaterals.length === 0 || debts.length === 0) continue;
+      // Dust guard. The polling cycle has always filtered these, but the trigger
+      // path did not — so sub-cent positions were being evaluated, and were even
+      // driving background Uniswap route refreshes to quote 5 wei of USDC.
+      if (debtUsd8 < MIN_DEBT_USD8) continue;
+
+      let pos = this.positions.get(address);
+      if (!pos) {
+        // Crossed the ceiling while parked — pull it back into the active set
+        // now that it actually matters, instead of waking every dormant holder
+        // of this asset on every price tick.
+        pos = {
+          address,
+          healthFactor: hfE18,
+          healthFactorNum: Number(hfE18) / 1e18,
+          totalCollateralBase: collateralUsd8,
+          totalDebtBase: debtUsd8,
+        };
+        this.positions.set(address, pos);
+        this.dormant.delete(address);
+        this.markRotationDirty();
+        this.markDangerDirty();
+        this.priorityQueue.add(address);
+        logger.info(`⚡ Dormant position crossed locally: ${address.slice(0,10)}… HF=${(Number(hfE18)/1e18).toFixed(4)} — reactivated`);
+      }
+
+      // Publish the freshly computed figures so the close-factor rule, the
+      // profit math and the logs all use live values rather than whatever the
+      // last sweep happened to leave behind (which showed as HF=1.1000 debt=$0.00).
+      pos.healthFactor        = hfE18;
+      pos.healthFactorNum     = Number(hfE18) / 1e18;
+      pos.totalCollateralBase = collateralUsd8;
+      pos.totalDebtBase       = debtUsd8;
+      pos.userEmodeCategoryId = state.emodeId;
 
       out.push({ pos, collaterals, debts, hfLocal: Number(hfE18) / 1e18 });
     }
@@ -2005,11 +2041,15 @@ export class PositionTracker {
     state:  UserState,
     prices: Map<string, bigint>,
     nowSec: number,
-  ): { collaterals: AssetPosition[]; debts: AssetPosition[]; hfE18: bigint } | null {
+  ): {
+    collaterals: AssetPosition[]; debts: AssetPosition[];
+    hfE18: bigint; collateralUsd8: bigint; debtUsd8: bigint;
+  } | null {
     const collaterals: AssetPosition[] = [];
     const debts:       AssetPosition[] = [];
     let num = 0n;  // Σ collateralValue(USD8) × liquidationThreshold(bps)
     let den = 0n;  // Σ debtValue(USD8)
+    let colUsd8Total = 0n;
 
     for (const r of state.reserves) {
       const reserve = this.reserves.get(r.asset);
@@ -2022,6 +2062,7 @@ export class PositionTracker {
         const balance = (r.scaledATokenBalance * this.reserves.normalizedIncome(reserve, nowSec)) / RAY;
         if (balance > 0n) {
           const usd8 = (price * balance) / unit;
+          colUsd8Total += usd8;
           // E-mode aware: a position in a category uses the CATEGORY threshold,
           // and only for assets inside that category's collateral bitmap —
           // everything else contributes zero, exactly as on-chain.
@@ -2049,7 +2090,12 @@ export class PositionTracker {
     if (den === 0n) return null;
     // liquidationThreshold is in bps, so num carries an extra 1e4 that must be
     // divided out.
-    return { collaterals, debts, hfE18: (num * HF_ONE) / (den * 10_000n) };
+    return {
+      collaterals, debts,
+      hfE18: (num * HF_ONE) / (den * 10_000n),
+      collateralUsd8: colUsd8Total,
+      debtUsd8: den,
+    };
   }
 
   // Health factor for one address straight from the model, or null if it can't

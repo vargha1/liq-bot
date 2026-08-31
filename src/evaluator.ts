@@ -424,7 +424,9 @@ export class Evaluator {
     const swapDragPct   = isSameAsset ? 0 : CONFIG.slippageBps / 10_000;
     const finalNetProfit = best.expectedBonusUsd * (1 - swapDragPct) - finalGasCostUsd;
 
-    const logFn = finalNetProfit >= CONFIG.minProfitUsd ? logger.info.bind(logger) : logger.warn.bind(logger);
+    // An opportunity below the profit floor is routine, not a warning — during a
+    // crash there can be hundreds per second. Keep the profitable ones at info.
+    const logFn = finalNetProfit >= CONFIG.minProfitUsd ? logger.info.bind(logger) : logger.debug.bind(logger);
     logFn(
       `  eval ${best.collateralSymbol}/${best.debtSymbol} | ` +
       `HF=${best.healthFactor.toFixed(4)} debt=$${best.debtToCoverUsd.toFixed(2)} ` +

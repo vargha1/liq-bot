@@ -16,13 +16,47 @@ Everything below works regardless of region.
 
 ## 1. Node.js 22
 
-Ubuntu 24.04's `apt` Node is too old (18.x). Use NodeSource:
+Ubuntu 24.04's `apt` Node is 18.x, and — the trap — **Ubuntu's `nodejs` package
+does not include npm**; it's a separate package there. NodeSource's does. So if
+the NodeSource step silently fails, `apt install nodejs` falls back to Ubuntu's
+package and you get `sudo: npm: command not found`.
 
 ```bash
 sudo apt update && sudo apt install -y curl git build-essential
+
+# Purge first — NodeSource's nodejs conflicts with Ubuntu's npm/libnode-dev.
+sudo apt-get purge -y nodejs npm libnode-dev nodejs-doc
+sudo apt-get autoremove -y
+
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt install -y nodejs
-node -v      # expect v22.x
+sudo apt-get install -y nodejs
+
+node -v && npm -v      # must print v22.x and 10.x
+```
+
+Watch the `curl | bash` output. If it errors, stop and fix it — otherwise the
+following `apt install` quietly gives you the wrong Node.
+
+### Do not use nvm for the service
+
+nvm installs per-user under `$HOME/.nvm` and is a shell function loaded from
+`.bashrc`. That breaks in two places:
+
+- `sudo -u liqbot npm ...` never sources `.bashrc`, and if nvm was installed as
+  root the binaries sit under `/root` (mode 700) where `liqbot` cannot reach
+  them.
+- systemd has no `node` on PATH at all, and hardcoding
+  `/root/.nvm/versions/node/vX/bin/node` breaks on every `nvm install`.
+
+Keep nvm for interactive work if you like, but the service needs a system-wide
+Node in `/usr/bin` or `/usr/local/bin`. If you prefer not to use apt, the
+official tarball works anywhere:
+
+```bash
+NODE_VER=v22.21.1   # check current LTS at https://nodejs.org/dist/
+curl -fsSL "https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-linux-x64.tar.xz" -o /tmp/node.tar.xz
+sudo tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+/usr/local/bin/node -v && /usr/local/bin/npm -v
 ```
 
 ## 2. Get the code
@@ -31,6 +65,7 @@ node -v      # expect v22.x
 sudo adduser --system --group --home /opt/liq-bot liqbot
 sudo -u liqbot git clone git@github.com:vargha1/liq-bot.git /opt/liq-bot/app
 cd /opt/liq-bot/app
+sudo chown -R liqbot:liqbot /opt/liq-bot   # if you cloned as root
 sudo -u liqbot npm ci
 ```
 
@@ -139,6 +174,21 @@ Bot ready — watching for blocks
 
 Then within a few minutes the model fills in the background and you should see
 `⚡ Trigger:` lines when prices move.
+
+### Chainstack plan limits
+
+On plans without archive access, `eth_getLogs` is rejected with
+`-32002 Archive, Debug and Trace requests are not available on your current
+plan` — even for very recent ranges. Live `eth_subscribe` still works, so
+detection is unaffected, but two things degrade:
+
+- **Gap-fill after a WS reconnect does nothing.** Aave events missed while the
+  socket was down are not replayed; those positions are picked up again by the
+  next sweep or their next on-chain event instead.
+- **The cold-start on-chain scan cannot run.** Set `THEGRAPH_API_KEY` so seeding
+  uses the subgraph, which is the faster path anyway.
+
+Neither is fatal. Upgrading the plan restores both.
 
 Red flags:
 - `no resolvable Chainlink feeds` — feed resolution failed; run `checkFeeds`.

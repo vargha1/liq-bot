@@ -407,16 +407,14 @@ export class TriggerEngine {
       // estimated prices are already in here.
       const prices = this.oracle.snapshotAllPrices();
 
-      // Pull dormant positions holding these assets back into the active set
-      // BEFORE building candidates. Without this, the fast trigger path only
-      // ever sees positions already below HF_WATCH — anything parked dormant
-      // would otherwise sit invisible until the next poll tick notices the same
-      // price move, reintroducing the latency this engine exists to remove.
-      // Uses the dormant-only half of the wake logic — safe to call
-      // synchronously right before findLocalCandidates() because it never
-      // touches breakdownCache.
-      this.tracker.wakeDormantByAssets(assetsLower);
-
+      // No blanket dormant wake here. findLocalCandidates evaluates dormant
+      // positions straight from the in-memory model and reactivates only the
+      // ones that actually cross the ceiling.
+      //
+      // The old call woke EVERY dormant holder of the moved asset on EVERY
+      // feed update, up or down. With ETH/USD updating about once a minute and
+      // pricing six reserves, that churned thousands of positions back into the
+      // active set for nothing and defeated the dormant tier outright.
       const candidates = this.tracker.findLocalCandidates(assetsLower, prices, TRIGGER_HF_CEILING, 10);
       if (candidates.length === 0) return;
 
