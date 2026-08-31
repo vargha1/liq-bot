@@ -446,14 +446,25 @@ export class TriggerEngine {
       built.sort((a, b) => b.opp!.netProfitUsd - a.opp!.netProfitUsd);
 
       let fired = 0;
-      for (const { key, hfLocal, opp } of built) {
+      for (let i = 0; i < built.length; i++) {
+        const { key, hfLocal, opp } = built[i]!;
+        // Check capacity BEFORE announcing. Previously every candidate logged
+        // "firing" and the executor then silently dropped the ones over capacity,
+        // so the log claimed to be acting on opportunities it never submitted.
+        if (this.executor.isExecuting) {
+          logger.warn(
+            `  → executor at capacity (${this.executor.inFlightCount}/${CONFIG.maxConcurrentExecutions}) — ` +
+            `${built.length - i} lower-value opportunities dropped this tick`
+          );
+          break;
+        }
         this.firedAt.set(key, now);
         fired++;
         logger.info(
           `⚡ Trigger: ${key.slice(0,10)}… localHF=${hfLocal.toFixed(4)} ` +
           `${opp!.collateralSymbol}->>${opp!.debtSymbol} net=$${opp!.netProfitUsd.toFixed(2)} — firing`
         );
-        // Executor handles capacity/cooldown/in-flight guards internally.
+        // Executor still enforces cooldown / in-flight guards internally.
         this.executor.execute(opp!).catch(e =>
           logger.error(`Trigger exec error: ${e?.shortMessage ?? e?.message ?? e}`)
         );

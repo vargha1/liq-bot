@@ -279,6 +279,14 @@ export class Executor {
 
       const txOpts: ethers.Overrides = {
         gasLimit,
+        // REQUIRED. contract.fn.populateTransaction() only assembles to/data plus
+        // these overrides — unlike the signer's own populateTransaction() it does
+        // NOT resolve the network, so chainId is absent. signTransaction then
+        // serialises it as chainId 0 and every endpoint rejects the transaction
+        // with "invalid chain id for signer: have 0 want 42161". Because we sign
+        // manually to broadcast the same raw tx to several endpoints, nothing
+        // else fills this in.
+        chainId: CHAIN_ID,
         ...(suggestedMax > 0n
           ? { maxFeePerGas: maxFee, maxPriorityFeePerGas: priority }
           : { gasPrice: maxFee }),
@@ -330,6 +338,19 @@ export class Executor {
       );
       const signedTx = await this.submitWallet.signTransaction(populatedTx);
       const signedHash = ethers.keccak256(signedTx);
+
+      // Cheap self-check on the serialised transaction. A chainId of 0 (the
+      // symptom of a missing chainId above) makes every endpoint reject the
+      // broadcast, and without this the only clue is a provider error string.
+      const parsedTx = ethers.Transaction.from(signedTx);
+      if (parsedTx.chainId !== BigInt(CHAIN_ID)) {
+        logger.error(
+          `Executor: refusing to broadcast — signed chainId ${parsedTx.chainId} != ${CHAIN_ID}. ` +
+          `This is a bug in transaction construction, not a network problem.`
+        );
+        this.nonce = -1;
+        return null;
+      }
 
       const endpoints = this.broadcastEndpoints();
       const sendResults = await Promise.allSettled(
