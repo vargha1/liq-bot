@@ -310,10 +310,7 @@ export class Executor {
       logger.debug(`Gas: est=${gasUnits} limit=${gasLimit} maxFee=${Number(maxFee) / 1e9}gwei (${hops} hops)`);
 
       // ── OPT 3: Nonce management for parallel submissions ───────────────────
-      if (this.nonce < 0) {
-        this.nonce = await this.submitWallet.getNonce();
-      }
-      const nonce = this.nonce++;
+      const nonce = await this.reserveNonce();
       (txOpts as any).nonce = nonce;
 
       logger.debug(`Submitting nonce=${nonce}`);
@@ -391,7 +388,17 @@ export class Executor {
         throw best instanceof Error ? best : new Error(String(best));
       }
       if (acked.length < endpoints.length) {
-        logger.warn(`Broadcast: only ${acked.length}/${endpoints.length} endpoints accepted the tx`);
+        // Broadcasting one raw transaction to several endpoints means the slower
+        // ones reject it as a duplicate once the first has been accepted — that
+        // is the mechanism working, not a fault. Only surface genuinely
+        // unexpected rejections.
+        const rejects = sendResults
+          .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+          .map(r => describeRpcError(r.reason));
+        const expected = rejects.every(m => /nonce too low|already known|ALREADY_EXISTS|known transaction|replacement/i.test(m));
+        const line = `Broadcast: ${acked.length}/${endpoints.length} endpoints accepted`;
+        if (expected) logger.debug(`${line} (others saw it as a duplicate)`);
+        else logger.warn(`${line} — ${rejects.join(" ; ")}`);
       }
       logger.info(`Tx: ${signedHash} (nonce=${nonce}, seq-ack=${Math.round(submitMs)}ms via ${acked.length}/${endpoints.length} endpoint${endpoints.length > 1 ? "s" : ""})`);
 
@@ -446,6 +453,34 @@ export class Executor {
       if (p && !eps.includes(p)) eps.push(p);
     }
     return eps;
+  }
+
+  // Allocate a unique nonce for a parallel submission.
+  //
+  // The previous inline version was `if (this.nonce < 0) this.nonce = await
+  // getNonce()` followed by `this.nonce++`. With concurrent liquidations all
+  // three callers passed the `< 0` test before any of them assigned — the await
+  // yields — so all three fetched the same value and all three submitted with
+  // it. Two then failed with "nonce too low: tx 548 state 549" while the third
+  // landed. Single-flight the fetch so only one call goes out, and hand out
+  // numbers synchronously afterwards.
+  //
+  // "pending" rather than the default "latest": parallel submissions must count
+  // transactions that are already broadcast but not yet mined.
+  private noncePromise: Promise<void> | null = null;
+
+  private async reserveNonce(): Promise<number> {
+    if (this.nonce < 0) {
+      if (!this.noncePromise) {
+        this.noncePromise = (async () => {
+          try { this.nonce = await this.submitWallet.getNonce("pending"); }
+          finally { this.noncePromise = null; }
+        })();
+      }
+      await this.noncePromise;
+    }
+    if (this.nonce < 0) throw new Error("could not determine account nonce");
+    return this.nonce++;   // synchronous — no interleaving after this point
   }
 
   // Wallet ETH balance, cached briefly so the pre-flight check never becomes a

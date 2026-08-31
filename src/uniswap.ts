@@ -158,6 +158,7 @@ export interface CachedRoute {
   out:      bigint;
   gas:      number;
   ts:       number;
+  amountIn: bigint;   // the size this quote was taken at — required to judge impact
 }
 
 const routeCache          = new Map<string, CachedRoute>();   // "colLower->debtLower" → best route
@@ -231,6 +232,7 @@ export function scheduleRouteRefresh(
         out:  result.outputAmount,
         gas:  result.gasEstimate,
         ts:   Date.now(),
+        amountIn: amountHint,
       });
       logger.debug(`routeCache: ${symOf(tokenIn)}→${symOf(tokenOut)} via ${result.routeDesc}`);
     }

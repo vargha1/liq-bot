@@ -70,10 +70,22 @@ const FEED_WALK_MAX_DEPTH = 4;
 // periodically so a rotated feed doesn't silently stop delivering events.
 const FEED_RERESOLVE_MS = 6 * 60 * 60_000;  // 6 hours
 
-// Fire when locally-recomputed HF falls below this. Slightly above 1.0 so we
-// submit at the first plausible crossing; static LTs + e-mode uncertainty mean
-// our estimate errs high (under-firing), never dangerously low.
-const TRIGGER_HF_CEILING = 101n * 10n ** 16n; // 1.01
+// Fire only when the locally-recomputed HF is genuinely below 1.0 — Aave's own
+// liquidation threshold.
+//
+// This was 1.01, on the theory that the local estimate erred high and should
+// submit at "the first plausible crossing". That reasoning belonged to the old
+// model, which used stale cached breakdowns and static thresholds. The current
+// model reads scaled balances against live indices and e-mode categories and
+// agrees with getUserAccountData to 0.000 bps, so anything at or above 1.0 is
+// simply not liquidatable: Aave reverts with HealthFactorNotBelowThreshold()
+// after burning ~350k gas on the flashloan. Every fire in the first live run
+// (HF 1.0007 … 1.0075) was a guaranteed revert for this reason.
+//
+// The pre-block edge is unaffected: prices from the sequencer feed are applied
+// before the block lands, so a position crossing on that price is already below
+// 1.0 here while competitors are still waiting for the log.
+const TRIGGER_HF_CEILING = 10n ** 18n; // 1.0 — findLocalCandidates treats this as exclusive
 
 // Dedupe window per borrower — a single price move can land as several feed
 // events in the same block.

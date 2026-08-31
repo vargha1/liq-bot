@@ -2002,7 +2002,9 @@ export class PositionTracker {
       const evaluated = this.evaluateUserState(state, prices, nowSec);
       if (!evaluated) continue;
       const { collaterals, debts, hfE18, collateralUsd8, debtUsd8 } = evaluated;
-      if (hfE18 > ceiling) continue;
+      // Exclusive: Aave liquidates only when healthFactor < 1e18, so a position
+      // exactly at the ceiling is not liquidatable either.
+      if (hfE18 >= ceiling) continue;
       if (collaterals.length === 0 || debts.length === 0) continue;
       // Dust guard. The polling cycle has always filtered these, but the trigger
       // path did not — so sub-cent positions were being evaluated, and were even

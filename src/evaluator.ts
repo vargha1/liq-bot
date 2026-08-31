@@ -419,6 +419,32 @@ export class Evaluator {
       finalGasCostUsd = Number(SAME_ASSET_GAS * effectiveGasPrice) / 1e18 * ethPrice + l1FeeUsd;
     }
 
+    // ── Liquidity reality check ────────────────────────────────────────────
+    // amountOutMinimum is derived from ORACLE prices, which assume the pool can
+    // fill at close to the oracle rate. For a large trade in a thin pool it
+    // cannot: a live quote of 323 weETH returned 151 WETH, roughly 50% impact,
+    // against an impactPct model that caps at 2%. Such an opportunity looks like
+    // the most profitable one available, sorts to the front of the executor
+    // queue, and then reverts on-chain — crowding out the real ones.
+    //
+    // The background route cache holds a genuine QuoterV2 result at a known
+    // size, so compare like for like. Scaling linearly from that quote is
+    // OPTIMISTIC (real impact grows super-linearly with size), so rejecting when
+    // even the optimistic figure falls short can never discard a fillable trade.
+    if (!isSameAsset && amountOutMinimum > 0n) {
+      const quoted = getCachedRoute(best.collateralAsset, best.debtAsset);
+      if (quoted && quoted.amountIn > 0n && quoted.out > 0n) {
+        const optimisticOut = (quoted.out * best.expectedCollateral) / quoted.amountIn;
+        if (optimisticOut < amountOutMinimum) {
+          logger.debug(
+            `  eval SKIP ${best.borrower.slice(0,10)}: ${best.collateralSymbol}→${best.debtSymbol} ` +
+            `insufficient DEX liquidity — quote implies ${optimisticOut} out vs ${amountOutMinimum} required`
+          );
+          return null;
+        }
+      }
+    }
+
     // Final profitability check. Without a live quote we conservatively assume
     // swap execution eats up to SLIPPAGE_BPS of the bonus (only for diff-asset).
     const swapDragPct   = isSameAsset ? 0 : CONFIG.slippageBps / 10_000;
