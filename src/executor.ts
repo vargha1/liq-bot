@@ -16,6 +16,22 @@ function hopsFromPath(swapPath: string): number {
   return Math.max(1, Math.round((bytes - 20) / 23));
 }
 
+// ethers reports an unparseable JSON-RPC error as the useless "could not
+// coalesce error". The provider's actual message ("insufficient funds for gas *
+// price + value", "nonce too low", …) is buried in .error / .info, so dig it
+// out — without it an operator cannot tell why a liquidation failed.
+function describeRpcError(err: any): string {
+  const parts: string[] = [err?.shortMessage ?? err?.message ?? String(err)];
+  const inner = err?.error ?? err?.info?.error;
+  if (inner?.message) {
+    parts.push("rpc=" + inner.message + (inner.code !== undefined ? " (code " + inner.code + ")" : ""));
+  } else if (err?.info?.responseBody) {
+    parts.push("body=" + String(err.info.responseBody).slice(0, 300));
+  }
+  if (err?.code && err.code !== "UNKNOWN_ERROR") parts.push("ethers=" + err.code);
+  return parts.join(" | ");
+}
+
 type CooldownCause = "success" | "failure" | "external";
 interface CooldownEntry { ts: number; cause: CooldownCause }
 
@@ -239,31 +255,51 @@ export class Executor {
 
       const hops     = hopsFromPath(swapPath);
       const gasUnits = isSameAsset ? SAME_ASSET_GAS : estimateGasUnits(hops);
-      // Generous buffer: Arbitrum refunds unused L2 gas and its L1 data fee
-      // scales with CALDATA SIZE, not the gas limit — so a large limit costs
-      // nothing extra and eliminates out-of-gas reverts on multi-hop swaps.
-      const gasLimit = gasUnits + 1_500_000n;
-      logger.debug(`Gas: est=${gasUnits} limit=${gasLimit} (${hops} swap hops)`);
+      // Arbitrum refunds unused L2 gas, so an oversized limit costs nothing to
+      // EXECUTE — but the node still reserves gasLimit × maxFeePerGas from the
+      // wallet balance when validating the transaction. The old 1.5M buffer
+      // therefore locked up far more ETH per in-flight tx than a liquidation
+      // needs, and on a thin balance that is the difference between landing and
+      // being rejected outright.
+      const gasLimit = gasUnits + BigInt(CONFIG.gasLimitBuffer);
+
+      const feeData = feeDataOverride ?? this.feeDataSource?.() ?? await this.getFeeDataResilient();
 
       // NOTE on ordering: Arbitrum sequences FCFS by arrival time — priority
-      // tips do not reorder transactions. What wins races is arriving first
-      // (detection latency) and, optionally, the Timeboost express lane.
-      // We still set a modest tip because it is free and harmless.
-      const feeData      = feeDataOverride ?? this.feeDataSource?.() ?? await this.getFeeDataResilient();
-      const PRIORITY_WEI = BigInt(Math.round(CONFIG.timeboostPriorityGwei * 1e9));
-      const basePriority = feeData.maxPriorityFeePerGas ?? PRIORITY_WEI;
-      const bumpedPriority = basePriority > PRIORITY_WEI
-        ? (basePriority * 15n) / 10n
-        : PRIORITY_WEI;
-      const bumpedMax = feeData.maxFeePerGas && feeData.maxFeePerGas > bumpedPriority
-        ? feeData.maxFeePerGas : bumpedPriority;
+      // tips do not reorder transactions. So the tip is CLAMPED to the network's
+      // own maxFeePerGas rather than raising it. Paying above the network rate
+      // buys no ordering here, while inflating maxFeePerGas inflates the balance
+      // reservation above for exactly zero benefit.
+      const tipCap       = BigInt(Math.round(CONFIG.timeboostPriorityGwei * 1e9));
+      const suggestedMax = feeData.maxFeePerGas ?? 0n;
+      const maxFee       = suggestedMax > 0n ? suggestedMax : (feeData.gasPrice ?? 100_000_000n);
+      let   priority     = feeData.maxPriorityFeePerGas ?? 0n;
+      if (tipCap > priority) priority = tipCap;
+      if (priority > maxFee) priority = maxFee;   // clamp, never raise maxFee
 
       const txOpts: ethers.Overrides = {
         gasLimit,
-        ...(feeData.maxFeePerGas
-          ? { maxFeePerGas: bumpedMax, maxPriorityFeePerGas: bumpedPriority }
-          : { gasPrice: feeData.gasPrice ?? 100_000_000n }),
+        ...(suggestedMax > 0n
+          ? { maxFeePerGas: maxFee, maxPriorityFeePerGas: priority }
+          : { gasPrice: maxFee }),
       };
+
+      // Pre-flight: the node rejects outright if the balance cannot cover
+      // gasLimit × maxFeePerGas for every in-flight transaction. Checking here
+      // yields a precise, actionable message instead of an opaque provider
+      // error, and avoids burning a nonce on a doomed submission.
+      const reservePerTx = gasLimit * maxFee;
+      const needed       = reservePerTx * BigInt(this.inFlight.size || 1);
+      const balance      = await this.cachedBalance();
+      if (balance !== null && balance < needed) {
+        logger.error(
+          `Executor: insufficient ETH — need ${ethers.formatEther(needed)} ETH for ` +
+          `${this.inFlight.size || 1} in-flight tx (gasLimit=${gasLimit} @ ` +
+          `${Number(maxFee) / 1e9} gwei), wallet holds ${ethers.formatEther(balance)}. Top up.`
+        );
+        return null;
+      }
+      logger.debug(`Gas: est=${gasUnits} limit=${gasLimit} maxFee=${Number(maxFee) / 1e9}gwei (${hops} hops)`);
 
       // ── OPT 3: Nonce management for parallel submissions ───────────────────
       if (this.nonce < 0) {
@@ -320,8 +356,18 @@ export class Executor {
       metrics.record("exec.submit", submitMs);
 
       if (acked.length === 0) {
-        const firstErr = (sendResults[0] as PromiseRejectedResult).reason;
-        throw firstErr instanceof Error ? firstErr : new Error(String(firstErr));
+        // Every endpoint rejected. Prefer whichever reason carries a real
+        // JSON-RPC message — the first is often the sequencer, whose errors are
+        // the least informative of the set.
+        const reasons = sendResults
+          .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+          .map(r => r.reason);
+        const best = reasons.find(r => (r?.error ?? r?.info?.error)?.message) ?? reasons[0];
+        // A rejected broadcast leaves the reserved nonce unused, which drifts the
+        // local counter ahead of the chain (the "Nonce desync" warning) and makes
+        // every later submission fail too. Force a resync on the next attempt.
+        this.nonce = -1;
+        throw best instanceof Error ? best : new Error(String(best));
       }
       if (acked.length < endpoints.length) {
         logger.warn(`Broadcast: only ${acked.length}/${endpoints.length} endpoints accepted the tx`);
@@ -352,11 +398,13 @@ export class Executor {
     } catch (err: any) {
       this.recentlyExecuted.set(opp.borrower.toLowerCase(), { ts: Date.now(), cause: "failure" });
       // If nonce was wrong (race condition), reset so next call re-fetches
-      if (/nonce|replacement/i.test(err?.message ?? "")) {
+      const detail = describeRpcError(err);
+      if (/nonce|replacement/i.test(detail)) {
         this.nonce = -1;
-        logger.warn(`Executor: nonce error — reset. ${err?.shortMessage ?? err?.message}`);
+        logger.warn(`Executor: nonce error — reset. ${detail}`);
       } else {
-        logger.error(`Executor: ${err?.shortMessage ?? err?.message ?? err}`);
+        if (/insufficient funds/i.test(detail)) this.invalidateBalance();
+        logger.error(`Executor: ${detail}`);
       }
       return null;
     }
@@ -377,6 +425,25 @@ export class Executor {
       if (p && !eps.includes(p)) eps.push(p);
     }
     return eps;
+  }
+
+  // Wallet ETH balance, cached briefly so the pre-flight check never becomes a
+  // per-liquidation round-trip on the hot path. Returns null when unavailable,
+  // in which case the caller skips the check rather than blocking on it.
+  private _balance: { wei: bigint; ts: number } | null = null;
+  private static readonly BALANCE_CACHE_MS = 15_000;
+
+  private invalidateBalance(): void { this._balance = null; }
+
+  private async cachedBalance(): Promise<bigint | null> {
+    if (this._balance && Date.now() - this._balance.ts < Executor.BALANCE_CACHE_MS) return this._balance.wei;
+    const provider = this.fallbackProvider ?? this.wallet.provider;
+    if (!provider) return null;
+    try {
+      const wei = await provider.getBalance(this.wallet.address);
+      this._balance = { wei, ts: Date.now() };
+      return wei;
+    } catch { return null; }
   }
 
   // getFeeData against the WS provider throws while it is being replaced, which

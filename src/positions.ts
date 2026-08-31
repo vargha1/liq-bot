@@ -860,6 +860,18 @@ export class PositionTracker {
         if (chunkSize < SCAN_CHUNK) chunkSize = SCAN_CHUNK;
         await sleep(80);
       } catch (e: any) {
+        // Some RPC plans reject eth_getLogs outright as an "archive" request
+        // (Chainstack returns -32002) no matter how narrow the range. Retrying
+        // and halving the chunk cannot help, and logs one 403 per chunk for the
+        // whole scan — bail out and let live subscriptions carry the load.
+        if (isArchiveRestricted(e)) {
+          logger.warn(
+            `  Scan aborted at block ${block}: this RPC plan does not allow eth_getLogs ` +
+            `(historical scan unavailable). Live event subscriptions are unaffected; ` +
+            `seed from the subgraph by setting THEGRAPH_API_KEY.`
+          );
+          return loaded;
+        }
         if (chunkSize > 100n) { chunkSize = chunkSize / 2n; }
         else { logger.warn(`  Scan ${block}→${to} failed: ${e.message}`); block = to + 1n; }
       }
@@ -1150,6 +1162,10 @@ export class PositionTracker {
             for (const log of logs) this.handleRawLog(log, "gap-fill");
             total += logs.length;
           } catch (e: any) {
+            if (isArchiveRestricted(e)) {
+              logger.warn(`  Gap-fill unavailable on this RPC plan (eth_getLogs is archive-gated) — skipping`);
+              break;
+            }
             logger.warn(`  Gap-fill chunk ${from}→${to} failed: ${e.message}`);
           }
         }
@@ -2138,3 +2154,15 @@ export class PositionTracker {
 }
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
+// True when the provider refused the request because the plan lacks archive
+// access, rather than because the request itself was malformed or too large.
+// Chainstack uses code -32002 with an "Archive, Debug and Trace requests are not
+// available on your current plan" message; other providers word it differently.
+export function isArchiveRestricted(e: any): boolean {
+  const code = e?.error?.code ?? e?.info?.error?.code;
+  const msg  = String(
+    e?.error?.message ?? e?.info?.error?.message ?? e?.info?.responseBody ?? e?.message ?? ""
+  );
+  return code === -32002 || /archive|not available on your current plan|upgrade/i.test(msg);
+}

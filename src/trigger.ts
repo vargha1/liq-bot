@@ -422,7 +422,16 @@ export class TriggerEngine {
       const ethPrice = this.evaluator.ethPriceCached() || 3000; // gas-cost input only
 
       const now = Date.now();
-      let fired = 0;
+
+      // Build EVERY opportunity first, then dispatch most-profitable-first.
+      //
+      // findLocalCandidates returns candidates ordered by health factor, which
+      // is the wrong order to spend a scarce executor slot on: a single price
+      // move produced $0.89, $2.34, $954.00, $22.85 and $155.34 simultaneously,
+      // and firing in HF order burned all three slots before reaching the large
+      // ones. Building an opportunity is pure computation, so ordering by value
+      // costs nothing.
+      const built: Array<{ key: string; hfLocal: number; opp: ReturnType<Evaluator["buildFromLocal"]> }> = [];
       for (const cand of candidates) {
         const key = cand.pos.address;
         const lastFire = this.firedAt.get(key);
@@ -432,15 +441,20 @@ export class TriggerEngine {
           cand.pos, cand.collaterals, cand.debts, prices, gasPrice, ethPrice,
         );
         if (!opp) continue;
+        built.push({ key, hfLocal: cand.hfLocal, opp });
+      }
+      built.sort((a, b) => b.opp!.netProfitUsd - a.opp!.netProfitUsd);
 
+      let fired = 0;
+      for (const { key, hfLocal, opp } of built) {
         this.firedAt.set(key, now);
         fired++;
         logger.info(
-          `⚡ Trigger: ${cand.pos.address.slice(0,10)}… localHF=${cand.hfLocal.toFixed(4)} ` +
-          `${opp.collateralSymbol}->>${opp.debtSymbol} net=$${opp.netProfitUsd.toFixed(2)} — firing`
+          `⚡ Trigger: ${key.slice(0,10)}… localHF=${hfLocal.toFixed(4)} ` +
+          `${opp!.collateralSymbol}->>${opp!.debtSymbol} net=$${opp!.netProfitUsd.toFixed(2)} — firing`
         );
         // Executor handles capacity/cooldown/in-flight guards internally.
-        this.executor.execute(opp).catch(e =>
+        this.executor.execute(opp!).catch(e =>
           logger.error(`Trigger exec error: ${e?.shortMessage ?? e?.message ?? e}`)
         );
       }

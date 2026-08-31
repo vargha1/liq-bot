@@ -98,7 +98,9 @@ async function main(): Promise<void> {
   // This catches scenarios where the bot appears healthy (WS connected) but
   // the cycle loop is stuck (e.g. unhandled promise rejection, RPC hang).
   setInterval(() => {
-    if (ready && !shuttingDown && Date.now() - lastCycleBlockMs > 60_000) {
+    // The block loop is deliberately paused for the duration of the startup
+    // prune, so warning about it there is pure noise.
+    if (ready && !shuttingDown && !pruning && Date.now() - lastCycleBlockMs > 60_000) {
       const silentSec = ((Date.now() - lastCycleBlockMs) / 1000).toFixed(0);
       logger.warn(`\u26A0\uFE0F  Watchdog: no cycle processed for ${silentSec}s — check for stuck operations`);
     }

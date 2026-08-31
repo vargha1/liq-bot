@@ -69,6 +69,11 @@ export const CONFIG = {
   // fires on Chainlink events independently of this interval. Set to 0 to
   // restore the old every-block behaviour.
   cycleMinIntervalMs: parseInt(opt("CYCLE_MIN_INTERVAL_MS", "1000"), 10),
+  // Head-room added to the estimated gas units. Arbitrum refunds unused L2 gas,
+  // but the node reserves gasLimit × maxFeePerGas from the wallet balance when
+  // validating a transaction — so an oversized buffer starves concurrent
+  // submissions on a thin balance. 400k is ample over the measured estimates.
+  gasLimitBuffer:    parseInt(opt("GAS_LIMIT_BUFFER",      "400000"), 10),
   maxGasGwei:        parseFloat(opt("MAX_GAS_GWEI",        "2")),
   // FIX: slippageBps now properly wired from env (was hardcoded to 100 in executor)
   slippageBps:       parseInt(opt("SLIPPAGE_BPS",          "100"), 10),
