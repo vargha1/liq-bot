@@ -596,19 +596,52 @@ export class PositionTracker {
     this._fillInProgress = true;
     try {
       const todo: string[] = [];
+      const want = (addr: string) => !this.userStates.has(addr) && !this.badDebtDenylist.has(addr);
+
+      // Active positions first — they are closest to liquidation.
       for (const addr of this.positions.keys()) {
-        if (this.userStates.has(addr)) continue;
-        if (this.badDebtDenylist.has(addr)) continue;
+        if (!want(addr)) continue;
         todo.push(addr);
         if (todo.length >= maxAddresses) break;
       }
+
+      // Then DORMANT positions. These were the blind spot: the startup prune
+      // parks everything above HF_WATCH before the model ever sees it, so ~16k
+      // positions had no model entry and were therefore invisible to
+      // findLocalCandidates — the trigger engine could only ever fire on the few
+      // hundred active ones. They were reachable solely via wakeExpiredDormant,
+      // which at 500 per 5 minutes takes hours to cycle a list that size.
+      //
+      // Modelling them costs one multicall per 20 addresses, ONCE: scaled
+      // balances only change when the borrower transacts, and an Aave event
+      // drops the entry. After that the whole watchlist is evaluated in memory
+      // on every price tick, which is the entire point of the model — and
+      // dormant positions are exactly the ones a crash converts into
+      // opportunities.
+      if (todo.length < maxAddresses) {
+        for (const addr of this.dormant.keys()) {
+          if (!want(addr)) continue;
+          todo.push(addr);
+          if (todo.length >= maxAddresses) break;
+        }
+      }
+
       if (todo.length === 0) return 0;
       const loaded = await this.refreshUserStates(todo);
-      logger.debug(`model fill: +${loaded} (model=${this.userStates.size}/${this.positions.size})`);
+      logger.debug(
+        `model fill: +${loaded} (model=${this.userStates.size}/${this.positions.size + this.dormant.size})`
+      );
       return loaded;
     } finally {
       this._fillInProgress = false;
     }
+  }
+
+  // Model coverage, for the heartbeat. Detection only reaches positions that
+  // have a model entry, so this is the number that says how much of the
+  // watchlist the trigger engine can actually see.
+  modelCoverage(): { modelled: number; total: number } {
+    return { modelled: this.userStates.size, total: this.positions.size + this.dormant.size };
   }
 
   // Live index updates, free of charge — see ReserveRegistry.

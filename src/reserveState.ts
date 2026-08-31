@@ -165,8 +165,12 @@ export class ReserveRegistry {
         logger.debug(`ReserveRegistry: decode failed for ${list[i]}: ${e.message}`);
       }
     }
+    // Only announce the first load; this refreshes on a timer and would
+    // otherwise print an identical line every few minutes forever.
+    const first = this._loadedAt === 0;
     this._loadedAt = Date.now();
-    logger.info(`ReserveRegistry: ${ok}/${list.length} reserves loaded`);
+    if (first) logger.info(`ReserveRegistry: ${ok}/${list.length} reserves loaded`);
+    else logger.debug(`ReserveRegistry refreshed: ${ok}/${list.length} reserves`);
   }
 
   // Apply a ReserveDataUpdated log — keeps indices current between full refreshes

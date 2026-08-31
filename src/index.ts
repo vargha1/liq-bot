@@ -111,6 +111,7 @@ async function main(): Promise<void> {
   setInterval(() => {
     const upMin = ((Date.now() - startMs) / 60_000).toFixed(1);
     const dangerInfo = tracker?.getDangerTierSummary();
+    const cov = tracker?.modelCoverage();
     const dangerStr  = dangerInfo && dangerInfo.count > 0
       ? ` danger=${dangerInfo.count}[${dangerInfo.top3.map(p => `${p.addr}:${p.hf.toFixed(3)}`).join(" ")}]`
       : ` danger=${dangerInfo?.count ?? 0}`;
@@ -118,6 +119,7 @@ async function main(): Promise<void> {
       `📊 uptime=${upMin}m | cycles=${cycles} | liquidatable=${liquidatable} | ` +
       `executed=${executed} | profit=$${totalProfitUsd.toFixed(2)} | ` +
       `watching=${tracker?.size ?? 0} dormant=${tracker?.dormantSize ?? 0}` +
+      (cov ? ` model=${cov.modelled}/${cov.total}` : "") +
       dangerStr
     );
   }, 300_000);
