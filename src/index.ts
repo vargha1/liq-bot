@@ -6,6 +6,10 @@ import { PositionTracker } from "./positions";
 import { AaveOracle } from "./oracle";
 import { Evaluator } from "./evaluator";
 import { Executor } from "./executor";
+import { TriggerEngine } from "./trigger";
+import { metrics, startMetricsReporter } from "./metrics";
+import { attachCallLimiter } from "./rpcLimiter";
+import { ReserveRegistry, TOPIC_RESERVE_DATA_UPDATED } from "./reserveState";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 const HF_ONE = 10n ** 18n;
@@ -38,6 +42,9 @@ async function main(): Promise<void> {
   let providerGeneration = 0;   // incremented on every reconnect; stale cycles self-abort
 
   let cycles = 0, liquidatable = 0, executed = 0, totalProfitUsd = 0;
+  let lastCycleBlockMs = Date.now();  // Opt #25: watchdog timestamp
+  let lastCycleStartMs = 0;           // throttle reference — see requestCycle
+  let cycleTimer: ReturnType<typeof setTimeout> | null = null;
 
   // PERF: lastEvaluatedHF is pruned every 500 cycles to prevent unbounded growth.
   // Positions that haven't been seen in 500 cycles are no longer in the danger tier
@@ -46,6 +53,12 @@ async function main(): Promise<void> {
   const EVAL_HF_CHANGE_THRESHOLD = 5n * 10n ** 15n; // 0.005 HF
   const EVAL_BLOCK_REFRESH       = 10n;              // blocks
   const EVAL_MAP_PRUNE_INTERVAL  = 500;              // cycles between map prune passes
+
+  // Opt #26: Background price pre-fetch cache, populated by the interval set up
+  // during startup. Declared here rather than beside that interval because
+  // runCycle() reads it — a `let` declared after the reader is a temporal-dead-zone
+  // hazard that only stays benign as long as nothing calls runCycle early.
+  let bgPriceCache: { prices: Map<string, bigint>; droppedAssets: Set<string>; ts: number } | null = null;
 
   // PERF: feeData cached for 3 seconds — gas price on Arbitrum barely moves
   // block-to-block, no need to fetch it fresh every cycle.
@@ -68,15 +81,30 @@ async function main(): Promise<void> {
 
   // ── Services (initialised once, survive reconnects) ───────────────────────
   let tracker:   PositionTracker;
+  let reserveRegistry: ReserveRegistry;
   let oracle:    AaveOracle;
   let evaluator: Evaluator;
   let executor:  Executor;
+  let trigger:   TriggerEngine;
+
+  // Stage-timing reporter — logs p50/p95/max per stage every 3 minutes.
+  startMetricsReporter();
 
   // ── Provider slot — getProvider() always returns the live one ─────────────
   let provider: ethers.WebSocketProvider;
   const getProvider = (): ethers.WebSocketProvider => provider;
 
-  // ── Stats heartbeat ───────────────────────────────────────────────────────
+  // Opt #25: Watchdog timer — warns if no cycle has been processed for > 60 seconds.
+  // This catches scenarios where the bot appears healthy (WS connected) but
+  // the cycle loop is stuck (e.g. unhandled promise rejection, RPC hang).
+  setInterval(() => {
+    if (ready && !shuttingDown && Date.now() - lastCycleBlockMs > 60_000) {
+      const silentSec = ((Date.now() - lastCycleBlockMs) / 1000).toFixed(0);
+      logger.warn(`\u26A0\uFE0F  Watchdog: no cycle processed for ${silentSec}s — check for stuck operations`);
+    }
+  }, 30_000);
+
+  // Stats heartbeat
   const startMs = Date.now();
   setInterval(() => {
     const upMin = ((Date.now() - startMs) / 60_000).toFixed(1);
@@ -147,17 +175,25 @@ async function main(): Promise<void> {
         reconnectTimer = null;
         if (shuttingDown) return;
         try {
-          provider = createProvider();
+          const spawned = createProvider();
+          provider = spawned;
           if (executor) executor.attachProvider(provider);
           // FIX: if the WS is created but never fires 'open' (e.g. DNS failure, firewall),
           // reconnecting stays true forever and the block loop is frozen. Guard with a
           // 30s timeout: if we're still reconnecting by then, force a fresh retry.
+          //
+          // The retry must tear down the socket WE just spawned. Calling this
+          // provider's own scheduleReconnect would destroy the already-dead old
+          // socket instead and leave `spawned` running forever with its own
+          // health timer and block handler — one orphan accumulating per failed
+          // reconnect, each still mutating lastSeenBlock.
           setTimeout(() => {
-            if (reconnecting && !shuttingDown) {
-              logger.warn("WS open timed out after 30s — forcing reconnect retry");
-              reconnecting = false;
-              scheduleReconnect(5_000);
-            }
+            if (!reconnecting || shuttingDown) return;
+            if (provider !== spawned) return;  // something newer already took over
+            logger.warn("WS open timed out after 30s — forcing reconnect retry");
+            try { spawned.destroy(); } catch { /* ignore */ }
+            reconnecting = false;
+            scheduleReconnect(5_000);
           }, 30_000);
         } catch (e: any) {
           logger.error(`Reconnect failed: ${e.message} — retrying in 10s`);
@@ -186,6 +222,8 @@ async function main(): Promise<void> {
         logger.info("Reconnected — gap-filling…");
         try { await tracker.startEventMonitoring(p, () => {}); }
         catch (e: any) { logger.warn(`Gap-fill failed: ${e.message}`); }
+        // Re-subscribe the trigger engine's feed listeners on the fresh socket
+        try { trigger?.attach(p); } catch { /* non-fatal */ }
       }
     });
 
@@ -214,11 +252,13 @@ async function main(): Promise<void> {
   function onNewBlock(bn: bigint): void {
     latestPendingBlock = bn;
     tracker?.setCurrentBlock(bn);
+    const tEvent = performance.now();  // for cyc.detectLag instrumentation
 
-    // PERF: Pre-warm breakdown cache for danger-tier positions every 10 blocks.
+    // PERF: Pre-warm breakdown cache for danger-tier positions every N blocks.
     // Runs as a background fire-and-forget task — never blocks the cycle.
     // When a position crosses HF=1.0 its breakdown is already cached, saving
-    // ~100-200ms on the hot path when it matters most.
+    // the breakdown round-trip on the hot path when it matters most. The
+    // trigger engine also needs these cached breakdowns to compute local HF.
     if (ready && !pruning && !reconnecting && bn % 30n === 0n) {  // every 30 blocks (~7.5s)
       tracker.prewarmDangerBreakdowns().catch(() => { /* silent */ });
     }
@@ -228,17 +268,44 @@ async function main(): Promise<void> {
       else if (ready)       logger.debug(`Block ${bn} queued (cycle in progress)`);
       return;
     }
-    runCycle(bn).catch(e => logger.error(`Cycle error: ${e?.message ?? e}`));
+    requestCycle(bn, tEvent);
+  }
+
+  // Rate-limits how often the polling sweep starts. Without this the cycle ran
+  // back-to-back at block rate (~250ms) and monopolised the eth_call budget.
+  // When a request arrives too soon, one timer is armed for the remainder and
+  // it picks up the newest block at that point — requests in between collapse
+  // into that single pending run rather than queueing.
+  function requestCycle(bn: bigint, tEvent?: number): void {
+    if (!ready || refreshing || pruning || shuttingDown || reconnecting) return;
+
+    const waitMs = CONFIG.cycleMinIntervalMs - (Date.now() - lastCycleStartMs);
+    if (waitMs <= 0) {
+      runCycle(bn, tEvent).catch(e => logger.error(`Cycle error: ${e?.message ?? e}`));
+      return;
+    }
+    if (cycleTimer !== null) return;  // a run is already pending
+    cycleTimer = setTimeout(() => {
+      cycleTimer = null;
+      if (!ready || refreshing || pruning || shuttingDown || reconnecting) return;
+      const target = latestPendingBlock > 0n ? latestPendingBlock : bn;
+      runCycle(target).catch(e => logger.error(`Cycle error: ${e?.message ?? e}`));
+    }, waitMs);
   }
 
   // ── Core cycle ─────────────────────────────────────────────────────────────
-  async function runCycle(bn: bigint): Promise<void> {
+  async function runCycle(bn: bigint, tBlockEvent?: number): Promise<void> {
     if (!ready || refreshing || shuttingDown) return;
     if (reconnecting) return;   // provider is being replaced — skip cycle entirely
     refreshing = true;
     cycles++;
+    lastCycleBlockMs = Date.now();  // Opt #25: update watchdog timestamp
+    lastCycleStartMs = Date.now();  // throttle reference for requestCycle
     const mySeq   = ++cycleSeq;           // this cycle owns the lock; seq is our ticket
     const cycleGen = providerGeneration;  // snapshot — if this changes, provider was replaced
+
+    if (tBlockEvent !== undefined) metrics.record("cyc.detectLag", performance.now() - tBlockEvent);
+    const stopTotal = metrics.startTimer("cyc.total");
 
     // PERF: Prune lastEvaluatedHF map periodically to prevent unbounded growth.
     // Keep only addresses still in the active watchlist.
@@ -250,11 +317,16 @@ async function main(): Promise<void> {
       logger.debug(`lastEvaluatedHF pruned to ${lastEvaluatedHF.size} entries`);
     }
 
+    // Bug #9 fix: add AbortController so in-flight operations can be cancelled
+    // when the safety timeout fires, preventing concurrent cycles from running.
+    const abortController = new AbortController();
+
     const safety = setTimeout(() => {
       // Only release the lock if this cycle still owns it (seq unchanged).
       // If a newer cycle already started (e.g. from a block event), don't interfere.
       if (refreshing && cycleSeq === mySeq) {
-        logger.warn(`Cycle ${bn} safety timeout — releasing lock`);
+        logger.warn(`Cycle ${bn} safety timeout — releasing lock and aborting in-flight ops`);
+        abortController.abort();  // signal in-flight operations to stop
         refreshing = false;
         // Don't trigger a new cycle if we're reconnecting — the new provider's
         // block event will do it once the socket is healthy again.
@@ -265,7 +337,9 @@ async function main(): Promise<void> {
     try {
       logger.debug(`Cycle block=${bn} watching=${tracker.size}`);
 
+      const stopScan = metrics.startTimer("cyc.scan");
       const candidates = await tracker.refreshBatch(CONFIG.positionsPerCycle);
+      stopScan();
 
       // Provider was replaced while we were awaiting — discard results and exit cleanly
       if (providerGeneration !== cycleGen) return;
@@ -280,16 +354,39 @@ async function main(): Promise<void> {
 
       // PERF: feeData + oracle prices + ETH price all in parallel, feeData cached 3s
       // OPT 2: Use drop-detection variant — wakes dormant positions if a price fell ≥2%
-      const [feeData, priceResult, ethPriceUsd] = await Promise.all([
-        getFeeDataCached(),
-        oracle.prefetchAllPricesWithDropDetection(),
-        evaluator.getEthPrice(),
-      ]);
-      const allPrices = priceResult.prices;
-      // OPT 2: If any asset price dropped significantly, immediately wake dormant
-      // positions that may now be liquidatable — don't wait for the hourly timer.
-      if (priceResult.droppedAssets.size > 0) {
-        tracker.wakeByCollateralAssets(priceResult.droppedAssets);
+      // Opt #26: Use background price cache if fresh (<5s old) to skip the RPC call
+      // in the cycle's critical path, saving ~100-300ms.
+      const BG_PRICE_FRESHNESS_MS = 5_000;
+      const bgPrices = bgPriceCache && (Date.now() - bgPriceCache.ts < BG_PRICE_FRESHNESS_MS)
+        ? bgPriceCache : null;
+
+      let allPrices: Map<string, bigint>;
+      let ethPriceUsd: number;
+      let feeData: ethers.FeeData;
+      let priceResult: { prices: Map<string, bigint>; droppedAssets: Set<string> };
+
+      if (bgPrices) {
+        // Fast path: use background-cached prices, only fetch feeData + ETH price
+        [feeData, ethPriceUsd] = await Promise.all([
+          getFeeDataCached(),
+          evaluator.getEthPrice(),
+        ]);
+        allPrices = bgPrices.prices;
+        // Wake dormant on price drops found by background prefetch
+        if (bgPrices.droppedAssets.size > 0) {
+          tracker.wakeByCollateralAssets(bgPrices.droppedAssets);
+        }
+      } else {
+        // Slow path: no fresh background cache, fetch everything in cycle
+        [feeData, priceResult, ethPriceUsd] = await Promise.all([
+          getFeeDataCached(),
+          oracle.prefetchAllPricesWithDropDetection(),
+          evaluator.getEthPrice(),
+        ]);
+        allPrices = priceResult.prices;
+        if (priceResult.droppedAssets.size > 0) {
+          tracker.wakeByCollateralAssets(priceResult.droppedAssets);
+        }
       }
       const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice ?? 100_000_000n;
 
@@ -342,22 +439,24 @@ async function main(): Promise<void> {
       // Now: all breakdowns fire simultaneously, then all evaluations fire simultaneously.
       // For N actionable candidates this saves (N-1) × ~150ms in breakdown latency
       // and (N-1) × ~100ms in Uniswap quote latency.
-      logger.debug(`  Parallel breakdown for ${actionable.length} candidates`);
-      const breakdownResults = await Promise.allSettled(
-        actionable.map(pos => tracker.getAssetBreakdown(pos.address))
-      );
+      // Batched across ADDRESSES, not just across assets within one address:
+      // 2 eth_calls total instead of 2 per candidate.
+      logger.debug(`  Batched breakdown for ${actionable.length} candidates`);
+      const stopBreakdown = metrics.startTimer("cyc.breakdown");
+      const breakdowns = await tracker.getAssetBreakdownBatch(actionable.map(p => p.address));
+      stopBreakdown();
       if (providerGeneration !== cycleGen) return;
 
       // ── PERF: Parallel evaluate (includes Uniswap quote per candidate) ───
       const evalInputs: Array<{ pos: typeof actionable[0]; collaterals: any[]; debts: any[] }> = [];
       for (let i = 0; i < actionable.length; i++) {
-        const br = breakdownResults[i]!;
-        if (br.status !== "fulfilled" || !br.value.collaterals.length || !br.value.debts.length) {
+        const br = breakdowns.get(actionable[i]!.address.toLowerCase());
+        if (!br || !br.collaterals.length || !br.debts.length) {
           skippedNoBreakdown++;
           logger.debug(`  ${actionable[i]!.address.slice(0,10)}… no breakdown`);
           continue;
         }
-        const { collaterals, debts } = br.value;
+        const { collaterals, debts } = br;
         logger.info(
           `  breakdown ${actionable[i]!.address.slice(0,10)}: ` +
           `col=[${collaterals.map((c: any) => c.symbol).join(",")}] ` +
@@ -368,22 +467,24 @@ async function main(): Promise<void> {
         evalInputs.push({ pos: actionable[i]!, collaterals, debts });
       }
 
-      // Evaluate candidates serially — each evaluate() fires Uniswap staticCalls.
-      // Parallel evaluation with N candidates = N×8 concurrent staticCalls which
-      // saturates Tenderly and causes timeouts. Serial cost is negligible since
-      // there are rarely more than 1-3 actionable candidates per cycle.
-      const evalResults: PromiseSettledResult<any>[] = [];
-      for (const { pos, collaterals, debts } of evalInputs) {
-        if (providerGeneration !== cycleGen) break;  // abort if provider replaced mid-eval
-        evalResults.push(await Promise.allSettled([
+      // Evaluate candidates — evaluation is now pure CPU (no Uniswap quotes),
+      // so the old serial-loop rationale no longer applies. Parallel is free.
+      const stopEval = metrics.startTimer("cyc.evaluate");
+      const evalResults: PromiseSettledResult<any>[] = await Promise.allSettled(
+        evalInputs.map(({ pos, collaterals, debts }) =>
           evaluator.evaluate(pos, collaterals, debts, gasPrice, allPrices, ethPriceUsd)
-        ]).then(r => r[0]!));
-      }
+        )
+      );
+      stopEval();
+      if (providerGeneration !== cycleGen) return;
 
       // ── Process results — execute the best opportunity found ──────────────
       if (providerGeneration !== cycleGen) return;
-      let bestOpp: any = null;
-      let bestIdx = -1;
+      // Collect EVERY profitable opportunity, not just the single best. During a
+      // crash — the only time large profit is on the table — many positions are
+      // liquidatable at once, and the old code submitted one per sweep while the
+      // executor sat idle with spare concurrency.
+      const opportunities: Array<{ opp: any; pos: any }> = [];
 
       for (let i = 0; i < evalInputs.length; i++) {
         const pos = evalInputs[i]!.pos;
@@ -410,43 +511,48 @@ async function main(): Promise<void> {
           continue;
         }
 
-        // Track the single best opportunity across all candidates
-        if (!bestOpp || opp.netProfitUsd > bestOpp.netProfitUsd) {
-          bestOpp = opp;
-          bestIdx = i;
-        }
+        opportunities.push({ opp, pos });
       }
 
-      if (bestOpp) {
-        const pos = evalInputs[bestIdx]!.pos;
+      // Most profitable first, so limited executor slots go to the best ones.
+      opportunities.sort((a, b) => b.opp.netProfitUsd - a.opp.netProfitUsd);
+
+      for (const { opp, pos } of opportunities) {
+        // OPT 3: the Executor's parallel queue allows up to
+        // CONFIG.maxConcurrentExecutions simultaneous liquidations, each with its
+        // own nonce slot. Stop offering work once it is full rather than
+        // spamming skip warnings for every remaining candidate.
+        if (executor.isExecuting) {
+          logger.warn(
+            `  → executor at capacity (${executor.inFlightCount}/${CONFIG.maxConcurrentExecutions}) — ` +
+            `${opportunities.length} opportunities this cycle, dropping the rest`
+          );
+          break;
+        }
+
         logger.info(
           `🚨 Opp: ${pos.address.slice(0,10)}… | HF=${pos.healthFactorNum.toFixed(4)} | ` +
           `debt=$${(Number(pos.totalDebtBase)/1e8).toFixed(2)} | ` +
-          `${bestOpp.collateralSymbol}→${bestOpp.debtSymbol} | ` +
-          `bonus=$${bestOpp.expectedBonusUsd.toFixed(2)} net=$${bestOpp.netProfitUsd.toFixed(2)}`
+          `${opp.collateralSymbol}→${opp.debtSymbol} | ` +
+          `bonus=$${opp.expectedBonusUsd.toFixed(2)} net=$${opp.netProfitUsd.toFixed(2)}`
         );
 
-        // OPT 3: Execute the best opportunity. The parallel queue in Executor
-        // allows up to CONFIG.maxConcurrentExecutions simultaneous liquidations —
-        // each gets its own nonce slot so they don't block each other.
-        if (executor.isExecuting) {
-          logger.warn(`  → executor at capacity (${executor.inFlightCount}/${CONFIG.maxConcurrentExecutions})`);
-        } else {
-          // Fire-and-forget — don't await, so the cycle loop continues watching
-          // for more opportunities while this tx is in-flight.
-          executor.execute(bestOpp).then(receipt => {
-            if (receipt?.status === 1) {
-              executed++;
-              totalProfitUsd += bestOpp.netProfitUsd;
-              logger.info(`  ✅ ${receipt.hash}`);
-              lastEvaluatedHF.delete(pos.address);
-            } else if (receipt) {
-              logger.warn(`  ❌ tx reverted`);
-            }
-          }).catch(e => {
-            logger.error(`  Execute error: ${e?.shortMessage ?? e?.message ?? e}`);
-          });
-        }
+        // Fire-and-forget — don't await, so the cycle loop continues watching
+        // for more opportunities while this tx is in-flight.
+        // Bug #1 fix: pass block number and feeData for recentlyExecuted check
+        // and to avoid redundant getFeeData call (Opt #21).
+        executor.execute(opp, bn, feeData).then(receipt => {
+          if (receipt?.status === 1) {
+            executed++;
+            totalProfitUsd += opp.netProfitUsd;
+            logger.info(`  ✅ ${receipt.hash}`);
+            lastEvaluatedHF.delete(pos.address);
+          } else if (receipt) {
+            logger.warn(`  ❌ tx reverted`);
+          }
+        }).catch(e => {
+          logger.error(`  Execute error: ${e?.shortMessage ?? e?.message ?? e}`);
+        });
       }
 
       if (candidates.length > 0) {
@@ -461,18 +567,17 @@ async function main(): Promise<void> {
     } catch (err: any) {
       logger.error(`Cycle ${bn}: ${err.message || err}`);
     } finally {
+      stopTotal();
       clearTimeout(safety);
       // Only release the lock if we still own it — safety timer may have already
       // released it and spawned a new cycle that now owns the lock.
       if (cycleSeq === mySeq) {
         refreshing = false;
-        // Spawn catch-up only if provider is still the same and we still own the lock.
+        // Spawn catch-up only if provider is still the same and we still own the
+        // lock. Goes through requestCycle so the catch-up respects the sweep
+        // throttle — this path was the one that made cycles run back-to-back.
         if (latestPendingBlock > bn && !shuttingDown && !reconnecting && providerGeneration === cycleGen) {
-          setImmediate(() =>
-            runCycle(latestPendingBlock).catch(e =>
-              logger.error(`Catch-up cycle: ${e?.message ?? e}`)
-            )
-          );
+          setImmediate(() => requestCycle(latestPendingBlock));
         }
       }
     }
@@ -484,6 +589,20 @@ async function main(): Promise<void> {
 
   provider = createProvider();
   const httpProvider = new ethers.JsonRpcProvider(CONFIG.rpcUrl, undefined, { staticNetwork: true });
+  // Reads (multicall, price fetches, breakdown fetches — everything that isn't a
+  // block/log subscription) go over this dedicated HTTP connection, not the shared
+  // WebSocket. Root cause this fixes: the WS provider was carrying BOTH live
+  // subscription traffic (block headers, Aave events, Chainlink AnswerUpdated) AND
+  // every burst of concurrent eth_call multicall requests, multiplexed over one
+  // socket. The one code path that stayed clean under load — pruneStale — paces
+  // itself (waves of 8 with a 20ms sleep between them); refreshBatch and the
+  // breakdown fan-out don't, and fire straight onto the same socket the
+  // subscriptions depend on. HTTP requests are independent per-call (no shared
+  // stream to correlate responses on), which is the standard split for this
+  // reason: WS for subscriptions, HTTP for bulk/concurrent reads. Stateless, so
+  // no reconnect handling needed — created once, used for the process lifetime.
+  attachCallLimiter(httpProvider, CONFIG.rpcCallsPerSecond);
+  const getReadProvider = (): ethers.JsonRpcProvider => httpProvider;
 
   try {
     const [net, bn] = await Promise.all([
@@ -519,10 +638,51 @@ async function main(): Promise<void> {
     } catch { /* ignore — provider may be reconnecting */ }
   }, 15 * 60_000);
 
-  tracker   = new PositionTracker(getProvider);
-  oracle    = new AaveOracle(getProvider);
-  evaluator = new Evaluator(oracle, getProvider);
-  executor  = new Executor(wallet, CONFIG.contractAddress);
+  // PositionTracker/AaveOracle/Evaluator do only reads (multicall, price fetches) —
+  // route them through the HTTP provider. TriggerEngine below keeps the WS
+  // provider: it genuinely needs it to subscribe to Chainlink log events.
+  // Reserve-side mirror: indices, thresholds, bonuses, decimals, ids, e-mode.
+  // Must be loaded before the tracker can compute any health factor locally.
+  reserveRegistry = new ReserveRegistry(getReadProvider);
+  try {
+    await reserveRegistry.refreshAll();
+  } catch (e: any) {
+    logger.error(`Reserve registry load failed: ${e?.message ?? e}`);
+    process.exit(1);
+  }
+
+  tracker   = new PositionTracker(getReadProvider, reserveRegistry);
+  oracle    = new AaveOracle(getReadProvider);
+  evaluator = new Evaluator(oracle, getReadProvider, reserveRegistry);
+  // httpProvider doubles as a broadcast + receipt-polling endpoint so a WS
+  // reconnect can't strand an in-flight liquidation.
+  executor  = new Executor(wallet, CONFIG.contractAddress, httpProvider);
+
+  // Competitor-liquidation awareness: when someone else's LiquidationCall is
+  // seen for a tracked borrower, mark it so the executor skips accurately.
+  tracker.onExternalLiquidation = (borrower: string) => executor.noteExternalLiquidation(borrower);
+  tracker.ownLiquidator = CONFIG.contractAddress.toLowerCase();
+  // Lets trigger-path executions reuse the cycle's fee data instead of paying
+  // for a getFeeData round-trip before signing.
+  executor.setFeeDataSource(() =>
+    cachedFeeData && Date.now() - cachedFeeDataTs < FEE_CACHE_MS ? cachedFeeData : null
+  );
+
+  // Event-driven trigger engine — fires liquidations directly on Chainlink feed
+  // updates using local HF recomputation, bypassing the polling cycle entirely.
+  // Gas price comes from the cycle-level cache; canFire mirrors the block-loop
+  // guards but deliberately does NOT check `refreshing` — firing during an
+  // in-flight scan is exactly the point.
+  trigger = new TriggerEngine(
+    tracker,
+    oracle,
+    evaluator,
+    executor,
+    () => cachedFeeData?.maxFeePerGas ?? cachedFeeData?.gasPrice ?? 100_000_000n,
+    () => ready && !pruning && !reconnecting && !shuttingDown,
+    getProvider,      // WS — log subscriptions only
+    getReadProvider,  // HTTP — feed resolution and price reads
+  );
 
   const { skipPrune } = await tracker.seed();
   logger.info(`Seed complete — watching ${tracker.size} positions`);
@@ -547,6 +707,58 @@ async function main(): Promise<void> {
 
   await tracker.startEventMonitoring(provider, () => {});
 
+  // Bug #12 fix: periodically prune the full borrower cache to prevent unbounded growth
+  setInterval(() => {
+    if (!shuttingDown) tracker.pruneFullCache();
+  }, 6 * 60 * 60_000);  // every 6 hours
+
+  // Reserve thresholds and bonuses no longer need their own refresh job — the
+  // ReserveRegistry owns them and is refreshed below, e-mode included.
+
+  // Arbitrum L1 base fee — read from the ArbGasInfo precompile on an interval so
+  // the L1 data-fee estimate in evaluator.ts tracks real Ethereum L1 congestion
+  // instead of a flat guess. Cheap (one staticcall), off the hot path.
+  setInterval(() => {
+    if (!shuttingDown) evaluator.refreshL1BaseFee().catch(() => { /* silent */ });
+  }, 20_000);
+  evaluator.refreshL1BaseFee().catch(() => { /* silent */ });
+
+  // Opt #26: Background price pre-fetch with drop detection.
+  // Pre-fetch prices every 5 seconds and cache them so the cycle just reads
+  // the cache instead of waiting for the RPC call. This removes ~100-300ms of
+  // latency from the cycle's critical path (between "candidates found" and
+  // "evaluate + execute"), which matters when competing for liquidations.
+  const BG_PRICE_INTERVAL_MS = 5_000;
+  setInterval(async () => {
+    if (shuttingDown || !ready) return;
+    try {
+      const result = await oracle.prefetchAllPricesWithDropDetection();
+      bgPriceCache = { prices: result.prices, droppedAssets: result.droppedAssets, ts: Date.now() };
+      // If price dropped, wake dormant positions immediately (don't wait for cycle)
+      if (result.droppedAssets.size > 0) {
+        tracker.wakeByCollateralAssets(result.droppedAssets);
+      }
+    } catch { /* silent — cycle will fetch its own prices if cache is stale */ }
+  }, BG_PRICE_INTERVAL_MS);
+
+  // Reserve registry refresh — indices are kept current for free by the
+  // ReserveDataUpdated subscription below; this periodic full refresh picks up
+  // governance changes to thresholds/bonuses and resyncs any missed index.
+  setInterval(() => {
+    if (!shuttingDown) reserveRegistry.refreshAll().catch(e => logger.debug(`Reserve refresh: ${e?.message ?? e}`));
+  }, 5 * 60_000);
+
+  // Background model fill. Model entries hold SCALED balances, which change only
+  // when the borrower transacts — so this is a one-time cost per position, after
+  // which health factors for the whole watchlist are computable in memory with
+  // no RPC at all. Bounded per tick so it never competes with the hot path.
+  const MODEL_FILL_INTERVAL_MS = 2_000;
+  const MODEL_FILL_BATCH       = 60;   // 3 multicalls per tick at 20 users each
+  setInterval(() => {
+    if (shuttingDown || !ready || pruning || reconnecting) return;
+    tracker.fillModel(MODEL_FILL_BATCH).catch(() => { /* silent — retried next tick */ });
+  }, MODEL_FILL_INTERVAL_MS);
+
   // Dormant recheck — wake positions that were parked as healthy.
   // Interval shortened to 5 min (from 15 min) to match the reduced 1-hour
   // dormant window — ensures positions are never stale for longer than ~65 min.
@@ -555,6 +767,8 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     tracker.wakeExpiredDormant();
   }, DORMANT_WAKE_INTERVAL_MS);
+
+  await trigger.start().catch(e => logger.warn(`Trigger engine start failed: ${e?.message ?? e}`));
 
   ready = true;
   logger.info("Bot ready — watching for blocks");

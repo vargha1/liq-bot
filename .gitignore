@@ -1,0 +1,29 @@
+# ── Secrets — never commit ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── Dependencies / build ──────────────────────────────────────────────────────
+node_modules/
+dist/
+
+# ── Runtime state ─────────────────────────────────────────────────────────────
+# Rebuilt automatically on startup. borrowers-cache.json in particular grows to
+# hundreds of thousands of addresses and is pure derived data.
+active-cache.json
+borrowers-cache.json
+bad-debt-denylist.json
+loglevel.ctrl
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

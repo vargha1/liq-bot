@@ -10,10 +10,11 @@ import {
   CONFIG,
 } from "./config";
 import type { BorrowerPosition, AssetPosition } from "./types";
+import { ReserveRegistry, RAY, TOPIC_RESERVE_DATA_UPDATED } from "./reserveState";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const HF_ONE   = 10n ** 18n;
-const HF_WATCH = 130n * 10n ** 16n;   // 1.30 — prune threshold (delete if HF > this)
+const HF_WATCH = 109n * 10n ** 16n;   // 1.09 — prune threshold (delete if HF > this)
 // HF_PREWARM: pre-warm breakdown cache for positions approaching liquidation.
 // A position at HF=1.05 needs only a ~5% price drop to become liquidatable.
 // By pre-fetching its breakdown now, we skip that RPC call when it actually crosses 1.0.
@@ -29,7 +30,11 @@ const HF_SEED  = 110n * 10n ** 16n;   // 1.10 — initial HF for unseen position
 // check returning e.g. 1.04 they stay in danger forever and starve rotation).
 // FIX: Reduced from 50 000 to 2 000 — most RPC providers reject ranges > 10 000 blocks.
 // 2 000 is conservative and works on Alchemy, QuickNode, Infura, etc.
-const SCAN_CHUNK        = 2_000n;
+const SCAN_CHUNK        = 3_000n;
+// Gap-fill queries every monitored Aave topic at once, so a chunk yields far
+// more logs than the Borrow-only historical scan. Keep it small enough to stay
+// under provider result-count caps.
+const GAP_FILL_CHUNK    = 2_000n;
 const AAVE_DEPLOY_BLOCK = 7742429n;
 
 const MIN_DEBT_USD8             = 1_000_000_000n;     // $10 — eviction threshold (matches cycle MIN_DEBT_USD)
@@ -72,12 +77,24 @@ const FULL_CACHE_FILE = path.resolve(process.cwd(), "borrowers-cache.json");
 // full cache, detects them as liquidatable (HF=0), runs breakdown+evaluate, then evicts —
 // wasting a cycle and logging a false "liquidatable=1" indefinitely.
 const DENYLIST_FILE    = path.resolve(process.cwd(), "bad-debt-denylist.json");
+// A dormant position remembers which reserve addresses it actually touches, so a
+// price drop on an unrelated asset doesn't wake it. Populated from the breakdown
+// cache at park time; absent when the position was parked without a breakdown
+// (e.g. during the startup prune), in which case wake logic falls back to HF.
+interface DormantEntry {
+  lastHF:       bigint;
+  dormantSince: number;
+  assets?:      string[];   // lowercase reserve addresses (collateral + debt)
+}
+
 interface BorrowerCache {
   scannedUpToBlock: number;
   borrowers: string[];
-  // Dormant positions survive restarts so the 6-hour recheck window isn't reset.
-  // Stored as [address, lastHF (hex string), dormantSince (ms timestamp)] tuples.
-  dormant?: Array<[string, string, number]>;
+  // Dormant positions survive restarts so the recheck window isn't reset.
+  // Stored as [address, lastHF (hex string), dormantSince (ms), assets?] tuples.
+  // Older caches stored a single topCollateral string in slot 3 — loadCache
+  // normalises that shape.
+  dormant?: Array<[string, string, number, (string[] | string)?]>;
 }
 
 function loadDenylist(): Set<string> {
@@ -91,9 +108,11 @@ function loadDenylist(): Set<string> {
 }
 
 function saveDenylist(denylist: Set<string>): void {
-  try {
-    fs.writeFileSync(DENYLIST_FILE, JSON.stringify([...denylist]), "utf8");
-  } catch (e: any) { logger.warn(`Denylist save failed: ${e.message}`); }
+  // Bug #13 fix: use async write to avoid blocking the event loop.
+  // With a large denylist, sync writes could block for 100ms+ and miss block events.
+  const data = JSON.stringify([...denylist]);
+  fs.promises.writeFile(DENYLIST_FILE, data, "utf8")
+    .catch((e: any) => logger.warn(`Denylist save failed: ${e.message}`));
 }
 
 function loadCache(): BorrowerCache | null {
@@ -107,18 +126,19 @@ function loadCache(): BorrowerCache | null {
   } catch (e: any) { logger.warn(`Active cache read failed: ${e.message}`); return null; }
 }
 
-function saveCache(scannedUpToBlock: bigint, borrowers: string[], dormant?: Map<string, { lastHF: bigint; dormantSince: number }>): void {
-  try {
-    const dormantArr: Array<[string, string, number]> = dormant
-      ? [...dormant.entries()].map(([addr, e]) => [addr, e.lastHF.toString(16), e.dormantSince])
-      : [];
-    fs.writeFileSync(CACHE_FILE, JSON.stringify({
-      scannedUpToBlock: Number(scannedUpToBlock),
-      borrowers,
-      dormant: dormantArr,
-    }), "utf8");
-    logger.info(`Active cache saved: ${borrowers.length} borrowers + ${dormantArr.length} dormant at block ${scannedUpToBlock}`);
-  } catch (e: any) { logger.warn(`Active cache write failed: ${e.message}`); }
+function saveCache(scannedUpToBlock: bigint, borrowers: string[], dormant?: Map<string, DormantEntry>): void {
+  // Bug #13 fix: use async write to avoid blocking the event loop.
+  const dormantArr: Array<[string, string, number, string[]?]> = dormant
+    ? [...dormant.entries()].map(([addr, e]) => [addr, e.lastHF.toString(16), e.dormantSince, e.assets])
+    : [];
+  const data = JSON.stringify({
+    scannedUpToBlock: Number(scannedUpToBlock),
+    borrowers,
+    dormant: dormantArr,
+  });
+  fs.promises.writeFile(CACHE_FILE, data, "utf8")
+    .then(() => logger.info(`Active cache saved: ${borrowers.length} borrowers + ${dormantArr.length} dormant at block ${scannedUpToBlock}`))
+    .catch((e: any) => logger.warn(`Active cache write failed: ${e.message}`));
 }
 
 function loadFullCache(): BorrowerCache | null {
@@ -132,22 +152,35 @@ function loadFullCache(): BorrowerCache | null {
 }
 
 function saveFullCache(scannedUpToBlock: bigint, borrowers: string[]): void {
-  try {
-    fs.writeFileSync(FULL_CACHE_FILE, JSON.stringify({ scannedUpToBlock: Number(scannedUpToBlock), borrowers }), "utf8");
-    logger.info(`Full cache saved: ${borrowers.length} borrowers at block ${scannedUpToBlock}`);
-  } catch (e: any) { logger.warn(`Full cache write failed: ${e.message}`); }
+  // Bug #13 fix: use async write to avoid blocking the event loop.
+  const data = JSON.stringify({ scannedUpToBlock: Number(scannedUpToBlock), borrowers });
+  fs.promises.writeFile(FULL_CACHE_FILE, data, "utf8")
+    .then(() => logger.info(`Full cache saved: ${borrowers.length} borrowers at block ${scannedUpToBlock}`))
+    .catch((e: any) => logger.warn(`Full cache write failed: ${e.message}`));
 }
 
 
 // ── Topic hashes ───────────────────────────────────────────────────────────────
 const IFACE                  = new ethers.Interface(AAVE_POOL_ABI);
 const DATA_PROVIDER_IFACE    = new ethers.Interface(DATA_PROVIDER_ABI);
+const UI_IFACE               = new ethers.Interface(UI_POOL_DATA_PROVIDER_ABI);
+
+// Lowercase address → reserve config. Replaces the repeated
+// Object.values(RESERVES).find(...) linear scan that ran once per active asset
+// per address inside the breakdown hot path.
+const RESERVE_BY_ADDRESS: Record<string, (typeof RESERVES)[string]> = {};
+for (const r of Object.values(RESERVES)) RESERVE_BY_ADDRESS[r.address.toLowerCase()] = r;
 const TOPIC_BORROW           = IFACE.getEvent("Borrow")!.topicHash;
 const TOPIC_SUPPLY           = IFACE.getEvent("Supply")!.topicHash;
 const TOPIC_REPAY            = IFACE.getEvent("Repay")!.topicHash;
 const TOPIC_WITHDRAW         = IFACE.getEvent("Withdraw")!.topicHash;
 const TOPIC_LIQUIDATION_CALL = IFACE.getEvent("LiquidationCall")!.topicHash;
-export const MONITORED_TOPICS = [TOPIC_BORROW, TOPIC_SUPPLY, TOPIC_REPAY, TOPIC_WITHDRAW, TOPIC_LIQUIDATION_CALL];
+const TOPIC_COLLATERAL_ON    = IFACE.getEvent("ReserveUsedAsCollateralEnabled")!.topicHash;
+const TOPIC_COLLATERAL_OFF   = IFACE.getEvent("ReserveUsedAsCollateralDisabled")!.topicHash;
+export const MONITORED_TOPICS = [
+  TOPIC_BORROW, TOPIC_SUPPLY, TOPIC_REPAY, TOPIC_WITHDRAW, TOPIC_LIQUIDATION_CALL,
+  TOPIC_COLLATERAL_ON, TOPIC_COLLATERAL_OFF,
+];
 
 // ── Breakdown cache entry ──────────────────────────────────────────────────────
 interface BreakdownEntry {
@@ -156,9 +189,39 @@ interface BreakdownEntry {
   expiresAt:   bigint;  // block number after which the entry is stale
 }
 
+// ── In-memory user position model ─────────────────────────────────────────────
+// One entry per borrower, holding Aave's SCALED balances rather than actual
+// ones. Scaled balances are index-normalised: they do not move as interest
+// accrues, only when the user transacts. So an entry stays valid until an Aave
+// event touches that address, and interest is applied at read time from the
+// reserve indices in ReserveRegistry.
+//
+// This is what lets the trigger engine recompute health factors for the entire
+// watchlist, from memory, on every price tick — with no RPC and no dependence on
+// a per-position breakdown having been pre-warmed.
+interface UserReserveSnapshot {
+  asset:               string;   // lowercase
+  scaledATokenBalance: bigint;
+  usageAsCollateral:   boolean;
+  scaledVariableDebt:  bigint;
+}
+
+interface UserState {
+  reserves:  UserReserveSnapshot[];  // only reserves the user actually touches
+  emodeId:   number;
+  fetchedAt: number;                 // ms — for staleness reporting only
+}
+
 export class PositionTracker {
   private positions      = new Map<string, BorrowerPosition>();
   private priorityQueue  = new Set<string>();
+  // Set by index.ts — notified when a competitor liquidates a borrower we watch.
+  // The executor uses this to distinguish "beaten to it" from "our tx failed".
+  onExternalLiquidation: ((borrower: string) => void) | null = null;
+  // Our own liquidator contract (lowercase). LiquidationCall fires for our own
+  // successful txs too; without this the executor books every win as "beaten by
+  // a competitor" and applies the external cooldown on top of the success one.
+  ownLiquidator: string | null = null;
   // Permanently evicted bad-debt addresses — persisted to disk so restarts don't
   // re-evaluate known-bad positions. Only a new Borrow event can re-admit an address.
   private badDebtDenylist: Set<string> = loadDenylist();
@@ -188,15 +251,22 @@ export class PositionTracker {
   // dangerous due to price moves.
   // Shortened from 6h to 1h: crypto prices can move >10% in under an hour, and
   // a position parked at HF=1.35 could be liquidatable after a 5% ETH drop.
-  private dormant = new Map<string, { lastHF: bigint; dormantSince: number }>();
+  // Bug #11 fix: store the position's reserve set in the dormant map so
+  // wakeByCollateralAssets can filter by asset instead of waking ALL
+  // vulnerable positions.
+  private dormant = new Map<string, DormantEntry>();
   private static readonly DORMANT_RECHECK_MS = 1 * 60 * 60 * 1000; // 1 hour (was 6h)
   // Tracks last-known HF for danger positions. If HF is identical across consecutive
-  // cycles, skip re-queuing that position for DANGER_SKIP_BLOCKS to free slots.
-  // Reset whenever an Aave event touches that address (via breakdownCache invalidation).
-  // NOTE: set to 1 — danger positions should be re-checked every other cycle at minimum.
-  // A 3-cycle skip on Arbitrum = 750ms blind window where other bots can front-run.
-  private lastDangerHF = new Map<string, { hf: bigint; stableFor: number }>();
-  private static readonly DANGER_SKIP_BLOCKS = 1;  // skip only 1 cycle of unchanged HF
+  // cycles, the position can be skipped for DANGER_SKIP_BLOCKS cycles to free slots.
+  // CRITICAL: a stability skip must never become permanent. checkedAtBlock records
+  // when the position was last actually fetched; once it ages past
+  // DANGER_FORCE_RECHECK_BLOCKS it is force-included in the next batch regardless
+  // of stability. (The old implementation skipped stable positions forever — a
+  // price crash that cratered their HF without any borrower-side event was
+  // invisible until the borrower transacted.)
+  private lastDangerHF = new Map<string, { hf: bigint; stableFor: number; checkedAtBlock: bigint }>();
+  private static readonly DANGER_SKIP_BLOCKS = 1;          // skip only 1 cycle of unchanged HF
+  private static readonly DANGER_FORCE_RECHECK_BLOCKS = 40; // ~10s on Arbitrum — max blind window for any danger position
 
   private rebuildDangerList(): void {
     this.dangerList = [...this.positions.values()]
@@ -224,44 +294,102 @@ export class PositionTracker {
     this.markRotationDirty();
     this.markDangerDirty();
     this.lastDangerHF.delete(addr);
-    const jitterMs = Math.floor(Math.random() * 15 * 60_000); // 0–15 min
-    this.dormant.set(addr, { lastHF: hf, dormantSince: Date.now() + jitterMs });
+    // Opt #27 fix: use symmetric jitter (-5 to +5 min) instead of positive-only (0–15 min).
+    // Positive-only offset delays wake unnecessarily by up to 15 minutes.
+    const jitterMs = Math.floor(Math.random() * 10 * 60_000) - 5 * 60 * 1000; // -5 to +5 min
+    this.dormant.set(addr, { lastHF: hf, dormantSince: Date.now() + jitterMs, assets: this.assetsOf(addr) });
+  }
+
+  // Reserve addresses (collateral + debt) this position is known to touch, from
+  // the breakdown cache. Undefined when no breakdown was ever fetched — callers
+  // must then treat the position as potentially affected by any asset.
+  private assetsOf(addr: string): string[] | undefined {
+    const state = this.userStates.get(addr);
+    if (state) return state.reserves.length > 0 ? state.reserves.map(r => r.asset) : undefined;
+    const cached = this.breakdownCache.get(addr);
+    if (!cached) return undefined;
+    const set = new Set<string>();
+    for (const c of cached.collaterals) set.add(c.address.toLowerCase());
+    for (const d of cached.debts)       set.add(d.address.toLowerCase());
+    return set.size > 0 ? [...set] : undefined;
+  }
+
+  // Wake dormant positions that hold a specific collateral asset, moving them
+  // from `dormant` back into the active set. SAFE to call from the trigger
+  // engine's hot path (no breakdownCache mutation) — unlike wakeByCollateralAssets
+  // below, which also evicts breakdownCache for active positions and would
+  // blind findLocalCandidates() if called synchronously right before it.
+  // Newly-woken addresses go into the priority queue so the very next
+  // refreshBatch (or, if their breakdown is still cached, this same trigger
+  // dispatch) picks them up immediately instead of waiting for the rotation cursor.
+  wakeDormantByAssets(droppedAssetAddrs: Set<string>): number {
+    if (droppedAssetAddrs.size === 0) return 0;
+    // Bug #11 fix: if the position's reserve set is known, only wake it when one
+    // of those reserves moved. Fall back to waking all vulnerable positions when
+    // the set is unknown (parked before any breakdown was fetched).
+    const HF_VULNERABLE = 140n * 10n ** 16n; // 1.40 — conservative safety margin
+    const droppedLower = new Set([...droppedAssetAddrs].map(a => a.toLowerCase()));
+    let woke = 0;
+    for (const [addr, entry] of this.dormant) {
+      if (entry.lastHF >= HF_VULNERABLE || this.badDebtDenylist.has(addr)) continue;
+      // If the reserve set is known and disjoint from the dropped set, skip.
+      if (entry.assets && !entry.assets.some(a => droppedLower.has(a))) continue;
+      this.positions.set(addr, {
+        address: addr,
+        healthFactor: entry.lastHF,
+        healthFactorNum: Number(entry.lastHF) / 1e18,
+        totalCollateralBase: 0n,
+        totalDebtBase: 0n,
+      });
+      this.markRotationDirty();
+      if (entry.lastHF < HF_WATCH) this.markDangerDirty();
+      this.dormant.delete(addr);
+      this.priorityQueue.add(addr);
+      woke++;
+    }
+    if (woke > 0) {
+      logger.info(`⚡ Price-drop wake: ${woke} dormant positions re-activated (${this.dormant.size} still dormant, ${this.positions.size} active)`);
+    }
+    return woke;
   }
 
   // Wake dormant positions that hold a specific collateral asset.
   // Called when a price drop is detected for that asset — these positions may
   // now be liquidatable even though they were healthy when last checked.
-  // Uses the dormant map's lastHF as a heuristic: only wake positions whose
-  // last known HF was below 1.50 (i.e. a 2% price drop could push them under 1.0).
+  //
+  // Also re-activates ACTIVE danger positions holding the dropped asset: their
+  // stability-skip state (lastDangerHF) was computed at the old price, so they
+  // must be re-checked immediately. They go into the priority queue so the very
+  // next refreshBatch fetches them first.
+  //
+  // NOT safe to call from the trigger engine's synchronous hot path — the
+  // second loop below evicts breakdownCache for active positions, which would
+  // blind a findLocalCandidates() call made right after it in the same tick.
+  // The trigger engine uses wakeDormantByAssets() instead (first half only).
   wakeByCollateralAssets(droppedAssetAddrs: Set<string>): void {
     if (droppedAssetAddrs.size === 0) return;
-    // We don't store which collateral assets a dormant position holds (that would
-    // require keeping full breakdown data for every dormant entry). Instead we
-    // wake ALL dormant positions whose last HF was below a conservative threshold —
-    // a 2% price drop on a single collateral can push HF from 1.30 to <1.0 when
-    // the collateral has a high concentration in the position.
-    const HF_VULNERABLE = 140n * 10n ** 16n; // 1.40 — conservative safety margin
-    let woke = 0;
-    for (const [addr, entry] of this.dormant) {
-      if (entry.lastHF < HF_VULNERABLE && !this.badDebtDenylist.has(addr)) {
-        this.positions.set(addr, {
-          address: addr,
-          healthFactor: entry.lastHF,
-          healthFactorNum: Number(entry.lastHF) / 1e18,
-          totalCollateralBase: 0n,
-          totalDebtBase: 0n,
-        });
-        this.markRotationDirty();
-        if (entry.lastHF < HF_WATCH) this.markDangerDirty();
-        this.dormant.delete(addr);
-        woke++;
-      }
+    const droppedLower = new Set([...droppedAssetAddrs].map(a => a.toLowerCase()));
+    this.wakeDormantByAssets(droppedAssetAddrs);
+
+    // Active danger-tier holders of a dropped asset: force immediate recheck.
+    // Uses the model's asset index rather than the breakdown cache, so it covers
+    // every modelled position instead of only those with a warmed breakdown.
+    let prioBoosted = 0;
+    const holders = new Set<string>();
+    for (const asset of droppedLower) {
+      const set = this.assetIndex.get(asset);
+      if (set) for (const a of set) holders.add(a);
     }
-    if (woke > 0) {
-      logger.info(
-        `⚡ Price-drop wake: ${woke} vulnerable dormant positions re-activated ` +
-        `(${this.dormant.size} still dormant, ${this.positions.size} active)`
-      );
+    for (const address of holders) {
+      const pos = this.positions.get(address);
+      if (!pos || pos.healthFactor >= HF_WATCH || this.badDebtDenylist.has(address)) continue;
+      this.lastDangerHF.delete(address);   // clear stability skip
+      this.priorityQueue.add(address);
+      prioBoosted++;
+    }
+
+    if (prioBoosted > 0) {
+      logger.info(`⚡ Price-drop wake: ${prioBoosted} active danger positions prioritized for recheck`);
     }
   }
   // Called periodically by index.ts. Re-inserts them into the active rotation
@@ -321,10 +449,172 @@ export class PositionTracker {
   // FIX 4.2: Breakdown result cache — keyed by lowercase address.
   // Populated by getAssetBreakdown, invalidated by handleRawLog for that address.
   private breakdownCache = new Map<string, BreakdownEntry>();
+  // Bounded — breakdownCache previously had no eviction at all and grew for the
+  // life of the process.
+  private static readonly BREAKDOWN_CACHE_MAX = 20_000;
+
+  // ── In-memory model ────────────────────────────────────────────────────────
+  private userStates = new Map<string, UserState>();
+  // assetLower → borrowers touching it. Lets a price move scan only the
+  // positions that asset can possibly affect instead of the whole watchlist.
+  private assetIndex = new Map<string, Set<string>>();
 
   private getProvider(): ethers.Provider { return this._getProvider(); }
 
-  constructor(private _getProvider: () => ethers.Provider) {}
+  constructor(
+    private _getProvider: () => ethers.Provider,
+    public  readonly reserves: ReserveRegistry,
+  ) {}
+
+  // ── Model maintenance ──────────────────────────────────────────────────────
+
+  private setUserState(address: string, state: UserState): void {
+    this.clearAssetIndex(address);
+    this.userStates.set(address, state);
+    for (const r of state.reserves) {
+      let set = this.assetIndex.get(r.asset);
+      if (!set) { set = new Set(); this.assetIndex.set(r.asset, set); }
+      set.add(address);
+    }
+  }
+
+  private clearAssetIndex(address: string): void {
+    const prev = this.userStates.get(address);
+    if (!prev) return;
+    for (const r of prev.reserves) {
+      const set = this.assetIndex.get(r.asset);
+      if (set) { set.delete(address); if (set.size === 0) this.assetIndex.delete(r.asset); }
+    }
+  }
+
+  private dropUserState(address: string): void {
+    this.clearAssetIndex(address);
+    this.userStates.delete(address);
+  }
+
+  // Bounded write path for the legacy breakdown cache. It previously had no
+  // eviction whatsoever and grew for the life of the process; entries are only
+  // ever removed on an event for that address. Evicts oldest-inserted first
+  // (Map preserves insertion order).
+  private setBreakdownCache(address: string, entry: BreakdownEntry): void {
+    if (this.breakdownCache.size >= PositionTracker.BREAKDOWN_CACHE_MAX && !this.breakdownCache.has(address)) {
+      const overflow = this.breakdownCache.size - PositionTracker.BREAKDOWN_CACHE_MAX + 1;
+      let removed = 0;
+      for (const key of this.breakdownCache.keys()) {
+        this.breakdownCache.delete(key);
+        if (++removed >= overflow) break;
+      }
+    }
+    this.breakdownCache.set(address, entry);
+  }
+
+  hasUserState(address: string): boolean { return this.userStates.has(address.toLowerCase()); }
+  get modelSize(): number { return this.userStates.size; }
+
+  // Fetch scaled balances for a set of borrowers and load them into the model.
+  // One multicall per MODEL_USERS_PER_MC addresses; nothing else is needed to
+  // make those positions fully evaluable in memory from then on.
+  private static readonly MODEL_USERS_PER_MC = 20;
+
+  async refreshUserStates(addresses: string[]): Promise<number> {
+    const targets = [...new Set(addresses.map(a => a.toLowerCase()))]
+      .filter(a => !this.badDebtDenylist.has(a));
+    if (targets.length === 0) return 0;
+
+    const chunks: string[][] = [];
+    for (let i = 0; i < targets.length; i += PositionTracker.MODEL_USERS_PER_MC) {
+      chunks.push(targets.slice(i, i + PositionTracker.MODEL_USERS_PER_MC));
+    }
+
+    let loaded = 0;
+    const emodeIds = new Set<number>();
+
+    const settled = await Promise.allSettled(chunks.map(async chunk => {
+      const results: Array<{ success: boolean; returnData: string }> = await this.multicall.tryAggregate(
+        false,
+        chunk.map(user => ({
+          target:   UI_POOL_DATA_PROVIDER,
+          callData: UI_IFACE.encodeFunctionData("getUserReservesData", [POOL_ADDRESSES_PROVIDER, user]),
+        })),
+      );
+      return { chunk, results };
+    }));
+
+    for (const s of settled) {
+      if (s.status !== "fulfilled") continue;
+      const { chunk, results } = s.value;
+      for (let i = 0; i < chunk.length; i++) {
+        const address = chunk[i]!;
+        const r = results[i];
+        if (!r?.success || r.returnData === "0x") continue;
+        try {
+          const decoded = UI_IFACE.decodeFunctionResult("getUserReservesData", r.returnData);
+          const rows = decoded[0] as Array<{
+            underlyingAsset: string; scaledATokenBalance: bigint;
+            usageAsCollateralEnabledOnUser: boolean; scaledVariableDebt: bigint;
+          }>;
+          const emodeId = Number(decoded[1]);
+          const snapshots: UserReserveSnapshot[] = [];
+          for (const row of rows) {
+            if (row.scaledATokenBalance === 0n && row.scaledVariableDebt === 0n) continue;
+            snapshots.push({
+              asset:               row.underlyingAsset.toLowerCase(),
+              scaledATokenBalance: row.scaledATokenBalance,
+              usageAsCollateral:   row.usageAsCollateralEnabledOnUser,
+              scaledVariableDebt:  row.scaledVariableDebt,
+            });
+          }
+          this.setUserState(address, { reserves: snapshots, emodeId, fetchedAt: Date.now() });
+          const pos = this.positions.get(address);
+          if (pos) pos.userEmodeCategoryId = emodeId;
+          if (emodeId > 0) emodeIds.add(emodeId);
+          loaded++;
+        } catch (e: any) {
+          logger.debug(`refreshUserStates decode ${address}: ${e.message}`);
+        }
+      }
+    }
+
+    // E-mode categories are needed before those users' HFs can be computed
+    // correctly; they are cached permanently after the first fetch.
+    if (emodeIds.size > 0) {
+      await this.reserves.ensureEModes(emodeIds).catch((e: any) =>
+        logger.debug(`ensureEModes failed: ${e?.message ?? e}`)
+      );
+    }
+    return loaded;
+  }
+
+  // Background model fill — brings watched positions that have no model entry
+  // into the model, at a bounded rate. Because entries are invalidated only by
+  // events, this is a one-time cost per position: after the initial fill the
+  // model is maintained for free and steady-state RPC goes to ~zero.
+  private _fillInProgress = false;
+
+  async fillModel(maxAddresses: number): Promise<number> {
+    if (this._fillInProgress) return 0;
+    this._fillInProgress = true;
+    try {
+      const todo: string[] = [];
+      for (const addr of this.positions.keys()) {
+        if (this.userStates.has(addr)) continue;
+        if (this.badDebtDenylist.has(addr)) continue;
+        todo.push(addr);
+        if (todo.length >= maxAddresses) break;
+      }
+      if (todo.length === 0) return 0;
+      const loaded = await this.refreshUserStates(todo);
+      logger.debug(`model fill: +${loaded} (model=${this.userStates.size}/${this.positions.size})`);
+      return loaded;
+    } finally {
+      this._fillInProgress = false;
+    }
+  }
+
+  // Live index updates, free of charge — see ReserveRegistry.
+  handleReserveDataUpdated(log: ethers.Log): void {
+    this.reserves.applyReserveDataUpdated(log);
+  }
 
   // ── Cached contract instances ─────────────────────────────────────────────
   // Contracts are created once and cached. When the provider changes (reconnect),
@@ -402,6 +692,8 @@ export class PositionTracker {
         case TOPIC_REPAY:            addr = parsed.args[1]; break;
         case TOPIC_WITHDRAW:         addr = parsed.args[1]; break;
         case TOPIC_LIQUIDATION_CALL: addr = parsed.args[2]; break;
+        case TOPIC_COLLATERAL_ON:    addr = parsed.args[1]; break;
+        case TOPIC_COLLATERAL_OFF:   addr = parsed.args[1]; break;
       }
       if (addr) {
         const key = addr.toLowerCase();
@@ -410,7 +702,20 @@ export class PositionTracker {
         // FIX 4.2: Invalidate breakdown cache on any event for this address
         // so the next breakdown call gets fresh data immediately.
         this.breakdownCache.delete(key);
+        // The model holds SCALED balances, which move only when the user
+        // transacts — which is exactly what just happened. Dropping the entry
+        // here is the entire invalidation story for the model.
+        this.dropUserState(key);
         this.lastDangerHF.delete(key);  // force re-check on next cycle after any event
+        if (topic === TOPIC_LIQUIDATION_CALL) {
+          // Someone else liquidated this borrower — tell the executor so it can
+          // distinguish "beaten by a competitor" from "our own tx failed".
+          // args[5] is the non-indexed `liquidator`; skip our own contract.
+          const liquidator = (parsed.args[5] as string | undefined)?.toLowerCase();
+          if (!this.ownLiquidator || liquidator !== this.ownLiquidator) {
+            try { this.onExternalLiquidation?.(key); } catch { /* never throw from log path */ }
+          }
+        }
       }
     } catch { /* non-matching log */ }
   }
@@ -586,8 +891,11 @@ export class PositionTracker {
     let pruned    = 0;
     let checked   = 0;
 
-    // Process one chunk — returns number pruned from this chunk
-    const processChunk = async (chunk: string[]): Promise<number> => {
+    // Process one chunk — returns number pruned from this chunk.
+    // If the multicall fails (e.g. gas limit exceeded), splits the chunk
+    // in half and retries recursively down to MIN_CHUNK size.
+    const MIN_CHUNK = 25;  // floor for chunk-split retry
+    const processChunk = async (chunk: string[], depth = 0): Promise<number> => {
       const calls = chunk.map(addr => ({
         target:   AAVE_POOL,
         callData: poolIface.encodeFunctionData("getUserAccountData", [addr]),
@@ -628,7 +936,23 @@ export class PositionTracker {
         if (e.code === 'UNSUPPORTED_OPERATION' || /provider destroyed|cancelled request/i.test(e.message)) {
           throw e;  // re-throw so wave loop's provider check catches it cleanly
         }
-        logger.warn(`Prune chunk failed: ${e.message} — skipping ${chunk.length} addresses`);
+        // Chunk-split retry: if the multicall itself failed (e.g. gas limit exceeded
+        // on Arbitrum), split the chunk in half and retry each sub-chunk. This prevents
+        // a single oversized chunk from causing "0 removed" prune runs.
+        if (chunk.length > MIN_CHUNK && depth < 3) {
+          const mid = Math.ceil(chunk.length / 2);
+          logger.warn(`Prune chunk (${chunk.length}) failed at depth ${depth}: ${e.message} — splitting into ${mid}+${chunk.length - mid}`);
+          let subPruned = 0;
+          for (const sub of [chunk.slice(0, mid), chunk.slice(mid)]) {
+            try {
+              subPruned += await processChunk(sub, depth + 1);
+            } catch {
+              // if a sub-chunk also fails, skip it — at least we tried
+            }
+          }
+          return subPruned;
+        }
+        logger.warn(`Prune chunk failed (depth ${depth}): ${e.message} — skipping ${chunk.length} addresses`);
         return 0;
       }
     };
@@ -642,7 +966,10 @@ export class PositionTracker {
     for (let w = 0; w < chunks.length; w += CONCURRENCY) {
       // Abort if provider was destroyed mid-prune — remaining chunks will be
       // handled by the normal refresh cycle once the new provider is up.
-      try { await this.getProvider().getNetwork(); } catch {
+      // getBlockNumber, not getNetwork: providers are constructed with
+      // staticNetwork:true, so getNetwork() resolves from a cached value and
+      // never touches the RPC — it can't detect a dead connection.
+      try { await this.getProvider().getBlockNumber(); } catch {
         logger.warn(`Prune aborted at ${checked}/${total} — provider destroyed, resuming via normal cycle`);
         break;
       }
@@ -700,11 +1027,20 @@ export class PositionTracker {
       // so upsert() can correctly wake dormant entries that got live events since last run.
       if (activeCache?.dormant) {
         const now = Date.now();
-        for (const [addr, hfHex, dormantSince] of activeCache.dormant) {
-          // Drop entries that have already expired (past their 6-hour window) —
+        for (const entry of activeCache.dormant) {
+          const addr = entry[0]!;
+          const hfHex = entry[1]!;
+          const dormantSince = entry[2]!;
+          // Slot 3 is the position's reserve set. Older caches wrote a single
+          // topCollateral string here — normalise both shapes.
+          const rawAssets = entry[3];
+          const assets = Array.isArray(rawAssets)
+            ? rawAssets.map(a => a.toLowerCase())
+            : (typeof rawAssets === "string" ? [rawAssets.toLowerCase()] : undefined);
+          // Drop entries that have already expired (past their recheck window) —
           // they'll be re-seeded from the full cache and checked on first rotation.
           if (now - dormantSince < PositionTracker.DORMANT_RECHECK_MS) {
-            this.dormant.set(addr, { lastHF: BigInt("0x" + hfHex), dormantSince });
+            this.dormant.set(addr, { lastHF: BigInt("0x" + hfHex), dormantSince, assets });
           }
         }
         if (this.dormant.size > 0) {
@@ -778,25 +1114,46 @@ export class PositionTracker {
   //
   // onSubId kept in signature for backward compat but no longer used.
   private logFilter: ethers.Filter | null = null;
+  private reserveFilter: ethers.Filter | null = null;
   private activeWsProvider: ethers.WebSocketProvider | null = null;
 
   async startEventMonitoring(wsProvider: ethers.WebSocketProvider, onSubId: (id: string) => void): Promise<void> {
     // ── Gap-fill: catch events missed during disconnect ───────────────────
+    // Reads go over the HTTP read provider, not the WebSocket: this is a bulk
+    // query, and the whole point of the WS/HTTP split is to keep subscription
+    // traffic off the same socket as bulk reads.
     try {
-      const current = BigInt(await wsProvider.getBlockNumber());
+      const readProvider = this.getProvider();
+      const current = BigInt(await readProvider.getBlockNumber());
       if (current > this.lastEventBlock) {
-        const fromBlock = current - this.lastEventBlock > 2_000n
-          ? current - 2_000n   // cap — older gaps covered by position cache
+        // Bug #14 fix: increased gap-fill window from 2,000 to 10,000 blocks.
+        // If WS is disconnected for >2,000 blocks (~55 min), events in the gap
+        // were permanently missed. 10,000 blocks (~4.6 hours) is a much safer window.
+        const fromBlock = current - this.lastEventBlock > 10_000n
+          ? current - 10_000n   // cap — older gaps covered by position cache
           : this.lastEventBlock;
         logger.info(`Gap-filling ${fromBlock}→${current}…`);
-        const logs = await wsProvider.getLogs({
-          address: AAVE_POOL,
-          topics:  [MONITORED_TOPICS],
-          fromBlock,
-          toBlock:  current,
-        });
-        logger.info(`  Gap-fill: ${logs.length} events`);
-        for (const log of logs) this.handleRawLog(log, "gap-fill");
+        // Chunked: the previous single unchunked request could span the full
+        // 10,000 blocks. Providers cap getLogs by block range and by result
+        // count (Chainstack rejects wide ranges outright), so one oversized
+        // request would fail and silently drop the entire gap.
+        let total = 0;
+        for (let from = fromBlock; from <= current; from += GAP_FILL_CHUNK) {
+          const to = from + GAP_FILL_CHUNK - 1n <= current ? from + GAP_FILL_CHUNK - 1n : current;
+          try {
+            const logs = await readProvider.getLogs({
+              address: AAVE_POOL,
+              topics:  [MONITORED_TOPICS],
+              fromBlock: from,
+              toBlock:   to,
+            });
+            for (const log of logs) this.handleRawLog(log, "gap-fill");
+            total += logs.length;
+          } catch (e: any) {
+            logger.warn(`  Gap-fill chunk ${from}→${to} failed: ${e.message}`);
+          }
+        }
+        logger.info(`  Gap-fill: ${total} events`);
         this.lastEventBlock = current;
         this.currentBlock   = current;
       }
@@ -804,8 +1161,19 @@ export class PositionTracker {
 
     // ── Remove stale listeners from previous provider instance ────────────
     // This prevents duplicate handlers when reconnecting.
-    if (this.activeWsProvider && this.logFilter) {
-      try { this.activeWsProvider.removeListener(this.logFilter, this._onLog); } catch { /* ignore */ }
+    if (this.activeWsProvider) {
+      // off() is async in ethers v6 and rejects when the old socket is already
+      // destroyed — swallow that explicitly instead of leaving an unhandled
+      // rejection behind on every reconnect.
+      const detach = (filter: ethers.Filter | null, listener: (log: ethers.Log) => void) => {
+        if (!filter) return;
+        try {
+          const r = this.activeWsProvider!.off(filter, listener) as unknown;
+          if (r && typeof (r as Promise<void>).catch === "function") (r as Promise<void>).catch(() => {});
+        } catch { /* ignore */ }
+      };
+      detach(this.logFilter, this._onLog);
+      detach(this.reserveFilter, this._onReserveLog);
     }
     this.activeWsProvider = wsProvider;
 
@@ -817,11 +1185,28 @@ export class PositionTracker {
       address: AAVE_POOL,
       topics:  [MONITORED_TOPICS],
     };
+    // provider.on() is async in ethers v6 — it returns a Promise that rejects
+    // if eth_subscribe fails. Without awaiting, a failed subscription looks like
+    // success here and surfaces later as an unhandled rejection, leaving the bot
+    // silently blind to all Aave events.
     try {
-      wsProvider.on(this.logFilter, this._onLog);
+      await wsProvider.on(this.logFilter, this._onLog);
       logger.info("Subscribed to Aave logs via ethers provider.on()");
     } catch (e: any) {
       logger.warn(`provider.on(logs) failed: ${e.message}`);
+    }
+
+    // ── Reserve index updates ────────────────────────────────────────────────
+    // Kept as a SEPARATE subscription, deliberately not part of MONITORED_TOPICS:
+    // ReserveDataUpdated fires on every interaction with any reserve, so folding
+    // it into the gap-fill getLogs would balloon those result sets for no gain —
+    // the periodic registry refresh already resyncs indices after a disconnect.
+    this.reserveFilter = { address: AAVE_POOL, topics: [TOPIC_RESERVE_DATA_UPDATED] };
+    try {
+      await wsProvider.on(this.reserveFilter, this._onReserveLog);
+      logger.info("Subscribed to ReserveDataUpdated — indices now update without RPC");
+    } catch (e: any) {
+      logger.warn(`provider.on(ReserveDataUpdated) failed: ${e.message}`);
     }
   }
 
@@ -829,6 +1214,12 @@ export class PositionTracker {
   private _onLog = (log: ethers.Log): void => {
     try {
       if (!log.removed) this.handleRawLog(log, "ws-log");
+    } catch { /* ignore */ }
+  };
+
+  private _onReserveLog = (log: ethers.Log): void => {
+    try {
+      if (!log.removed) this.reserves.applyReserveDataUpdated(log);
     } catch { /* ignore */ }
   };
 
@@ -886,8 +1277,10 @@ export class PositionTracker {
           const entry = this.lastDangerHF.get(p.address);
           if (!entry) return true;  // never seen → always include
           if (entry.stableFor < PositionTracker.DANGER_SKIP_BLOCKS) return true;
-          // HF has been identical for DANGER_SKIP_BLOCKS cycles — skip for now.
-          // Will be re-included once stableFor resets (event or HF change).
+          // Starvation guard: HF has been stable, but this position hasn't been
+          // fetched in a while — force a recheck. A price move may have moved its
+          // real HF without any on-chain event from the borrower.
+          if (this.currentBlock - entry.checkedAtBlock >= PositionTracker.DANGER_FORCE_RECHECK_BLOCKS) return true;
           return false;
         })
         .slice(0, dangerBudget);
@@ -921,29 +1314,26 @@ export class PositionTracker {
 
     logger.debug(`refreshBatch ${batch.length}/${all.length}: ${prio.length} prio + ${danger.length}/${dangerBudget} danger + ${rotation.length}/${slots} rotation (cursor=${this.rotationCursor})`);
 
-    // Multicall3 — batch all getUserAccountData into a single RPC call.
+    // Multicall3 — batch all getUserAccountData into sub-chunked multicall requests.
     // Falls back to individual calls if multicall reverts (e.g. provider doesn't support it).
     // PERF: Uses module-level IFACE constant — avoids new Interface() allocation every cycle.
+    // SAFETY: Sub-chunks of 300 to avoid exceeding Arbitrum eth_call gas limits.
+    // getUserAccountData is gas-heavy (~200k per call); 1000 calls in one multicall
+    // would consume ~200M gas, exceeding most providers' eth_call limits.
+    // PERF: All sub-chunks are dispatched CONCURRENTLY — they are independent
+    // eth_calls. Sequential dispatch made refreshBatch cost N_chunks × RTT
+    // (up to ~12s at 1000 positions on a slow provider), serializing the entire
+    // cycle behind it. Concurrent dispatch costs one RTT regardless of chunk count.
+    const MC_SUBCHUNK = CONFIG.mcSubchunk;
     const liquidatable: BorrowerPosition[] = [];
-    try {
-      const calls = batch.map(addr => ({
-        target: AAVE_POOL,
-        callData: IFACE.encodeFunctionData("getUserAccountData", [addr]),
-      }));
 
-      // tryAggregate(false) never reverts — returns (success, data) per call
-      const results: Array<{ success: boolean; returnData: string }> =
-        await this.multicall.tryAggregate(false, calls);
-
-      for (let i = 0; i < batch.length; i++) {
-        const addr    = batch[i]!;
-        const result  = results[i];
-        if (!result?.success || result.returnData === "0x") {
-          logger.debug(`multicall skip ${addr}: call failed`);
-          continue;
-        }
+    // Single mutation pass, run after all RPC data has arrived so map updates
+    // (positions / danger / dormant / rotation dirty flags) stay deterministic.
+    const applyResults = (
+      pairs: Array<{ addr: string; decoded: ReturnType<ethers.Interface["decodeFunctionResult"]> }>,
+    ): void => {
+      for (const { addr, decoded } of pairs) {
         try {
-          const decoded = IFACE.decodeFunctionResult("getUserAccountData", result.returnData);
           const pos = this.processAccountData(addr, decoded);
           if (pos !== null) {
             // Skip re-insertion if this address was evicted as bad debt
@@ -959,15 +1349,15 @@ export class PositionTracker {
                 this.lastDangerHF.delete(addr);  // liquidatable — always re-check
               } else if (pos.healthFactor > HF_WATCH) {
                 // Healthy — park in dormant instead of deleting permanently.
-                // Will be re-checked after DORMANT_RECHECK_MS (6 hours) or on next live event.
+                // Will be re-checked after DORMANT_RECHECK_MS or on next live event.
                 this.parkAsDormant(pos.address, pos.healthFactor);
               } else if (pos.healthFactor < HF_WATCH) {
                 // In danger tier — track HF stability
                 const prev = this.lastDangerHF.get(addr);
                 if (prev && prev.hf === pos.healthFactor) {
-                  this.lastDangerHF.set(addr, { hf: pos.healthFactor, stableFor: prev.stableFor + 1 });
+                  this.lastDangerHF.set(addr, { hf: pos.healthFactor, stableFor: prev.stableFor + 1, checkedAtBlock: this.currentBlock });
                 } else {
-                  this.lastDangerHF.set(addr, { hf: pos.healthFactor, stableFor: 0 });
+                  this.lastDangerHF.set(addr, { hf: pos.healthFactor, stableFor: 0, checkedAtBlock: this.currentBlock });
                 }
               }
             }
@@ -975,6 +1365,62 @@ export class PositionTracker {
         } catch (e: any) {
           logger.debug(`multicall decode ${addr}: ${e.message}`);
         }
+      }
+    };
+
+    // Decode-only per chunk — no state mutation, safe to run concurrently.
+    const decodeChunk = async (subBatch: string[]) => {
+      const calls = subBatch.map(addr => ({
+        target: AAVE_POOL,
+        callData: IFACE.encodeFunctionData("getUserAccountData", [addr]),
+      }));
+      // tryAggregate(false) never reverts — returns (success, data) per call
+      const results: Array<{ success: boolean; returnData: string }> =
+        await this.multicall.tryAggregate(false, calls);
+
+      const pairs: Array<{ addr: string; decoded: ReturnType<ethers.Interface["decodeFunctionResult"]> }> = [];
+      for (let i = 0; i < subBatch.length; i++) {
+        const addr   = subBatch[i]!;
+        const result = results[i];
+        if (!result?.success || result.returnData === "0x") {
+          logger.debug(`multicall skip ${addr}: call failed`);
+          continue;
+        }
+        pairs.push({ addr, decoded: IFACE.decodeFunctionResult("getUserAccountData", result.returnData) });
+      }
+      return pairs;
+    };
+
+    try {
+      const chunks: string[][] = [];
+      for (let si = 0; si < batch.length; si += MC_SUBCHUNK) {
+        chunks.push(batch.slice(si, si + MC_SUBCHUNK));
+      }
+
+      const isProviderDestroyed = (e: any) =>
+        e?.code === 'UNSUPPORTED_OPERATION' || /provider destroyed|cancelled request/i.test(e?.message ?? "");
+
+      const settled = await Promise.allSettled(chunks.map(decodeChunk));
+      for (const r of settled) {
+        if (r.status === "rejected" && isProviderDestroyed(r.reason)) return liquidatable;
+      }
+
+      const pairs: Array<{ addr: string; decoded: ReturnType<ethers.Interface["decodeFunctionResult"]> }> = [];
+      let failedChunks = 0;
+      for (const r of settled) {
+        if (r.status === "fulfilled") pairs.push(...r.value);
+        else failedChunks++;
+      }
+
+      applyResults(pairs);
+
+      if (failedChunks > 0 && pairs.length === 0 && chunks.length > 0) {
+        // Every chunk failed — mimic the old behaviour so the individual-call
+        // fallback below runs.
+        throw new Error("all multicall chunks failed");
+      }
+      if (failedChunks > 0) {
+        logger.warn(`refreshBatch: ${failedChunks}/${chunks.length} multicall chunks failed (${pairs.length} results applied)`);
       }
     } catch (e: any) {
       // Multicall unavailable — fall back to individual parallel calls in chunks of 25
@@ -1005,9 +1451,9 @@ export class PositionTracker {
               // FIX: track danger HF stability in fallback path (was missing entirely)
               const prev = this.lastDangerHF.get(pos.address);
               if (prev && prev.hf === pos.healthFactor) {
-                this.lastDangerHF.set(pos.address, { hf: pos.healthFactor, stableFor: prev.stableFor + 1 });
+                this.lastDangerHF.set(pos.address, { hf: pos.healthFactor, stableFor: prev.stableFor + 1, checkedAtBlock: this.currentBlock });
               } else {
-                this.lastDangerHF.set(pos.address, { hf: pos.healthFactor, stableFor: 0 });
+                this.lastDangerHF.set(pos.address, { hf: pos.healthFactor, stableFor: 0, checkedAtBlock: this.currentBlock });
               }
             }
           }
@@ -1025,21 +1471,13 @@ export class PositionTracker {
     d: ethers.Result,
   ): BorrowerPosition | null {
     const debt = d.totalDebtBase as bigint;
-    if (debt < MIN_DEBT_USD8) {
-      this.positions.delete(address);
-      this.markRotationDirty();
-      this.markDangerDirty(); // FIX: danger list may contain this address — mark stale
-      return null;
-    }
     const hf    = d.healthFactor as bigint;
     const hfNum = Number(hf) / 1e18;
-    // HF=0 AND collateral=0 means Aave bad-debt write-off: no collateral bonus
-    // to capture regardless of debt size. Evict permanently.
-    //
-    // BUG FIX: Previous check (hfNum < 0.01 && debt < $100) missed 0xf740382c:
-    // HF=0, $201 DAI debt, $0 WETH collateral — looped with collValue=$0 forever.
-    // Now we check hf===0n && totalCollateralBase===0n (the definitive signal).
     const totalCollateral = d.totalCollateralBase as bigint;
+
+    // Bug #6 fix: check bad-debt BEFORE dust check. Previously, a position with
+    // HF=0, $0 collateral, and $8 debt (< $10 dust threshold) was silently deleted
+    // without being denylisted, causing restart loops.
     if (hf === 0n && totalCollateral === 0n) {
       logger.info(`Bad debt evicted: ${address} (HF=0, col=$0, debt=$${(Number(debt)/1e8).toFixed(2)}) -- no collateral to liquidate`);
       this.positions.delete(address);
@@ -1051,6 +1489,13 @@ export class PositionTracker {
       // wasting a cycle and logging a false "liquidatable" every restart indefinitely.
       this.badDebtDenylist.add(address);
       saveDenylist(this.badDebtDenylist);
+      return null;
+    }
+
+    if (debt < MIN_DEBT_USD8) {
+      this.positions.delete(address);
+      this.markRotationDirty();
+      this.markDangerDirty(); // FIX: danger list may contain this address — mark stale
       return null;
     }
     const existing = this.positions.get(address);
@@ -1079,7 +1524,108 @@ export class PositionTracker {
     }
   }
 
-  // ── Asset breakdown ───────────────────────────────────────────────────────────
+  // ── Batched asset breakdown ───────────────────────────────────────────────────
+  // Materialised from the in-memory model, which stores Aave's SCALED balances.
+  // Actual balance = scaled × the reserve's current normalised index, so no
+  // per-asset balance read is needed at all.
+  //
+  // Cost history for N addresses:
+  //   originally   2N eth_calls (getUserReservesData + getUserReserveData each),
+  //                except getUserReservesData was throwing on a bad ABI, so in
+  //                practice every address took the ~19-reserve fallback scan
+  //   now          ceil(N/20) eth_calls, and zero once the model is warm
+  //
+  // Addresses the model cannot represent (unknown reserve, failed fetch) fall
+  // back to the per-address path, so behaviour is unchanged for them.
+  async getAssetBreakdownBatch(
+    addresses: string[],
+    minDebtUsd8 = MIN_DEBT_FOR_BREAKDOWN_USD8,
+  ): Promise<Map<string, { collaterals: AssetPosition[]; debts: AssetPosition[] }>> {
+    const out = new Map<string, { collaterals: AssetPosition[]; debts: AssetPosition[] }>();
+    const wanted: string[] = [];
+
+    for (const raw of addresses) {
+      const address = raw.toLowerCase();
+      if (out.has(address) || wanted.includes(address)) continue;  // dedupe
+      const pos = this.positions.get(address);
+      if (pos && pos.totalDebtBase < minDebtUsd8) { out.set(address, { collaterals: [], debts: [] }); continue; }
+      wanted.push(address);
+    }
+    if (wanted.length === 0) return out;
+
+    // Fetch model entries for anything not already modelled. Entries persist
+    // until an Aave event touches the address, so this is usually a no-op.
+    const missing = wanted.filter(a => !this.userStates.has(a));
+    if (missing.length > 0) {
+      await this.refreshUserStates(missing).catch(e =>
+        logger.debug(`breakdownBatch: model refresh failed: ${e?.message ?? e}`)
+      );
+    }
+
+    const fallback: string[] = [];
+    for (const address of wanted) {
+      const materialised = this.materialiseBreakdown(address);
+      if (materialised) out.set(address, materialised);
+      else fallback.push(address);
+    }
+
+    if (fallback.length > 0) {
+      logger.debug(`breakdownBatch: ${fallback.length}/${wanted.length} addresses need the per-address path`);
+      const FALLBACK_CONCURRENCY = 4;
+      for (let i = 0; i < fallback.length; i += FALLBACK_CONCURRENCY) {
+        const slice = fallback.slice(i, i + FALLBACK_CONCURRENCY);
+        const settled = await Promise.allSettled(slice.map(a => this.getAssetBreakdown(a, minDebtUsd8)));
+        for (let j = 0; j < slice.length; j++) {
+          const r = settled[j]!;
+          if (r.status === "fulfilled") out.set(slice[j]!, r.value);
+        }
+      }
+    }
+
+    return out;
+  }
+
+  // Convert a model entry into the collateral/debt view the evaluator expects.
+  // Returns null when the address is not modelled or references a reserve the
+  // registry does not know, so the caller can fall back.
+  private materialiseBreakdown(
+    address: string,
+  ): { collaterals: AssetPosition[]; debts: AssetPosition[] } | null {
+    const state = this.userStates.get(address);
+    if (!state || !this.reserves.loaded) return null;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const collaterals: AssetPosition[] = [];
+    const debts:       AssetPosition[] = [];
+
+    for (const r of state.reserves) {
+      const reserve = this.reserves.get(r.asset);
+      if (!reserve) return null;
+      if (r.usageAsCollateral && r.scaledATokenBalance > 0n) {
+        const balance = (r.scaledATokenBalance * this.reserves.normalizedIncome(reserve, nowSec)) / RAY;
+        if (balance > 0n) {
+          collaterals.push({
+            symbol: reserve.symbol, address: reserve.address,
+            decimals: reserve.decimals, balance, balanceUsd: 0,
+          });
+        }
+      }
+      if (r.scaledVariableDebt > 0n) {
+        const balance = (r.scaledVariableDebt * this.reserves.normalizedVariableDebt(reserve, nowSec)) / RAY;
+        if (balance > 0n) {
+          debts.push({
+            symbol: reserve.symbol, address: reserve.address,
+            decimals: reserve.decimals, balance, balanceUsd: 0,
+          });
+        }
+      }
+    }
+    return { collaterals, debts };
+  }
+
+  // ── Asset breakdown (single address) ──────────────────────────────────────────
+  // Kept as the fallback path for getAssetBreakdownBatch and for callers that
+  // genuinely need one address. Prefer the batch method for any fan-out.
   // Strategy:
   //   1. UiPoolDataProvider → identifies which assets are active (1 RPC call)
   //   2. Multicall3 → fetches actual (non-scaled) balances for all relevant assets
@@ -1115,18 +1661,26 @@ export class PositionTracker {
     let relevantAssets: Array<{ symbol: string; address: string; decimals: number; hasCollateral: boolean; hasDebt: boolean }> = [];
 
     try {
-      const [userReserves]: [Array<{
+      const [userReserves, userEmodeCategoryId]: [Array<{
         underlyingAsset:               string;
         scaledATokenBalance:           bigint;
         usageAsCollateralEnabledOnUser: boolean;
         scaledVariableDebt:            bigint;
-      }>] = await this.uiDataProvider.getUserReservesData(POOL_ADDRESSES_PROVIDER, address);
+        principalStableDebt:           bigint;
+      }>, number] = await this.uiDataProvider.getUserReservesData(POOL_ADDRESSES_PROVIDER, address);
+
+      // Bug #8 fix: store e-mode category on the position for close factor calculation
+      const pos = this.positions.get(address);
+      if (pos) pos.userEmodeCategoryId = userEmodeCategoryId;
 
       for (const ur of userReserves) {
-        const hasActivity = ur.scaledATokenBalance > 0n || ur.scaledVariableDebt > 0n;
+        // Bug #2 fix: include principalStableDebt in hasActivity and hasDebt checks.
+        // Previously, borrowers with only stable-rate debt were silently skipped
+        // because scaledVariableDebt was 0 but principalStableDebt was > 0.
+        const hasActivity = ur.scaledATokenBalance > 0n || ur.scaledVariableDebt > 0n || ur.principalStableDebt > 0n;
         if (!hasActivity) continue;
         const assetAddr = ur.underlyingAsset.toLowerCase();
-        const reserve = Object.values(RESERVES).find(r => r.address.toLowerCase() === assetAddr);
+        const reserve = RESERVE_BY_ADDRESS[assetAddr];
         if (!reserve) {
           logger.warn(`Unknown active asset in position ${address.slice(0,10)}: ${ur.underlyingAsset} — using full fallback`);
           useFullFallback = true;
@@ -1137,7 +1691,7 @@ export class PositionTracker {
           address:       reserve.address,
           decimals:      reserve.decimals,
           hasCollateral: ur.scaledATokenBalance > 0n && ur.usageAsCollateralEnabledOnUser,
-          hasDebt:       ur.scaledVariableDebt > 0n,
+          hasDebt:       ur.scaledVariableDebt > 0n || ur.principalStableDebt > 0n,  // Bug #2 fix
         });
       }
     } catch (e: any) {
@@ -1191,13 +1745,13 @@ export class PositionTracker {
             collaterals: collaterals.filter(c => c.balance > 0n),
             debts:       debts.filter(d => d.balance > 0n),
           };
-          this.breakdownCache.set(address, { ...result, expiresAt: this.currentBlock + cacheBlocks });
+          this.setBreakdownCache(address, { ...result, expiresAt: this.currentBlock + cacheBlocks });
           return result;
         }
 
         // UiProvider returned slots but all balances came back zero — position closed
         const empty = { collaterals: [], debts: [] };
-        this.breakdownCache.set(address, { ...empty, expiresAt: this.currentBlock + cacheBlocks });
+        this.setBreakdownCache(address, { ...empty, expiresAt: this.currentBlock + cacheBlocks });
         return empty;
 
       } catch (e: any) {
@@ -1211,61 +1765,73 @@ export class PositionTracker {
     } else if (!useFullFallback && relevantAssets.length === 0) {
       // UiProvider succeeded but returned no active slots — position closed
       const empty = { collaterals: [], debts: [] };
-      this.breakdownCache.set(address, { ...empty, expiresAt: this.currentBlock + cacheBlocks });
+      this.setBreakdownCache(address, { ...empty, expiresAt: this.currentBlock + cacheBlocks });
       return empty;
     }
 
-    // ── Step 3: Full fallback — Multicall3 across all RESERVES ───────────────
+    // ── Step 3: Full fallback — Multicall3 across all RESERVES, CHUNKED ──────
     // Runs when: (a) UiProvider failed, OR (b) unknown asset detected.
-    // Still uses Multicall3 for a single batched call instead of N parallel ones.
+    // FIX: previously one unchunked tryAggregate across ALL ~19 reserves — every
+    // other multicall in this file chunks (refreshBatch, pruneStale), this one
+    // didn't. Some RPC providers (shared/free-tier nodes especially — e.g. a
+    // conservative eth_call gas cap, or throttling on large batched calls) reject
+    // a call this size outright with an empty-data CALL_EXCEPTION ("missing revert
+    // data"), which looks identical whether it happens once or on every borrower.
+    // Chunking shrinks each request and, on a chunk failure, falls back to
+    // individual calls for just that chunk instead of all ~19 reserves.
     const allReserves = Object.values(RESERVES);
-    const fallbackCalls = allReserves.map(reserve => ({
-      target:   AAVE_DATA_PROVIDER,
-      callData: dataProviderIface.encodeFunctionData("getUserReserveData", [reserve.address, address]),
-    }));
+    const FALLBACK_CHUNK = 6;
 
-    try {
-      const results: Array<{ success: boolean; returnData: string }> =
-        await this.multicall.tryAggregate(false, fallbackCalls);
-
-      for (let i = 0; i < allReserves.length; i++) {
-        const reserve = allReserves[i]!;
-        const result  = results[i];
-        if (!result?.success || result.returnData === "0x") continue;
-        try {
-          const ud = dataProviderIface.decodeFunctionResult("getUserReserveData", result.returnData);
-          const aTokenBal    = ud.currentATokenBalance as bigint;
-          const variableDebt = (ud.currentVariableDebt as bigint) + (ud.currentStableDebt as bigint);
-          if (aTokenBal > 0n && ud.usageAsCollateralEnabled)
-            collaterals.push({ symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals, balance: aTokenBal, balanceUsd: 0 });
-          if (variableDebt > 0n)
-            debts.push({ symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals, balance: variableDebt, balanceUsd: 0 });
-        } catch { /* skip undecoded */ }
-      }
-    } catch (e: any) {
-      // If the provider was destroyed (reconnect in progress), abort immediately.
-      // Spawning N individual calls against a dead socket just hangs for 45s each.
-      if (e.code === 'UNSUPPORTED_OPERATION' || /provider destroyed|cancelled request/i.test(e.message)) {
-        logger.debug(`Full fallback aborted (provider destroyed) for ${address.slice(0,10)}`);
-        return { collaterals: [], debts: [] };
-      }
-      // Last resort: parallel individual calls if multicall itself fails for other reasons
-      logger.warn(`Full fallback multicall failed: ${e.message} — individual calls`);
-      await Promise.allSettled(allReserves.map(async (reserve) => {
-        try {
-          const ud = await this.dataProvider.getUserReserveData(reserve.address, address);
-          const aTokenBal    = ud.currentATokenBalance as bigint;
-          const variableDebt = (ud.currentVariableDebt as bigint) + (ud.currentStableDebt as bigint);
-          if (aTokenBal > 0n && ud.usageAsCollateralEnabled)
-            collaterals.push({ symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals, balance: aTokenBal, balanceUsd: 0 });
-          if (variableDebt > 0n)
-            debts.push({ symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals, balance: variableDebt, balanceUsd: 0 });
-        } catch { /* asset not in pool for this user */ }
+    for (let start = 0; start < allReserves.length; start += FALLBACK_CHUNK) {
+      const chunk = allReserves.slice(start, start + FALLBACK_CHUNK);
+      const chunkCalls = chunk.map(reserve => ({
+        target:   AAVE_DATA_PROVIDER,
+        callData: dataProviderIface.encodeFunctionData("getUserReserveData", [reserve.address, address]),
       }));
+
+      try {
+        const results: Array<{ success: boolean; returnData: string }> =
+          await this.multicall.tryAggregate(false, chunkCalls);
+
+        for (let i = 0; i < chunk.length; i++) {
+          const reserve = chunk[i]!;
+          const result  = results[i];
+          if (!result?.success || result.returnData === "0x") continue;
+          try {
+            const ud = dataProviderIface.decodeFunctionResult("getUserReserveData", result.returnData);
+            const aTokenBal    = ud.currentATokenBalance as bigint;
+            const variableDebt = (ud.currentVariableDebt as bigint) + (ud.currentStableDebt as bigint);
+            if (aTokenBal > 0n && ud.usageAsCollateralEnabled)
+              collaterals.push({ symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals, balance: aTokenBal, balanceUsd: 0 });
+            if (variableDebt > 0n)
+              debts.push({ symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals, balance: variableDebt, balanceUsd: 0 });
+          } catch { /* skip undecoded */ }
+        }
+      } catch (e: any) {
+        // If the provider was destroyed (reconnect in progress), abort immediately.
+        // Spawning individual calls against a dead socket just hangs for 45s each.
+        if (e.code === 'UNSUPPORTED_OPERATION' || /provider destroyed|cancelled request/i.test(e.message)) {
+          logger.debug(`Full fallback aborted (provider destroyed) for ${address.slice(0,10)}`);
+          return { collaterals: [], debts: [] };
+        }
+        // Last resort for THIS chunk only: individual calls, not all ~19 reserves.
+        logger.debug(`Full fallback chunk failed for ${address.slice(0,10)}: ${e.message} — individual calls for ${chunk.length} reserves`);
+        await Promise.allSettled(chunk.map(async (reserve) => {
+          try {
+            const ud = await this.dataProvider.getUserReserveData(reserve.address, address);
+            const aTokenBal    = ud.currentATokenBalance as bigint;
+            const variableDebt = (ud.currentVariableDebt as bigint) + (ud.currentStableDebt as bigint);
+            if (aTokenBal > 0n && ud.usageAsCollateralEnabled)
+              collaterals.push({ symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals, balance: aTokenBal, balanceUsd: 0 });
+            if (variableDebt > 0n)
+              debts.push({ symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals, balance: variableDebt, balanceUsd: 0 });
+          } catch { /* asset not in pool for this user */ }
+        }));
+      }
     }
 
     const result = { collaterals: collaterals.filter(c => c.balance > 0n), debts: debts.filter(d => d.balance > 0n) };
-    this.breakdownCache.set(address, { ...result, expiresAt: this.currentBlock + cacheBlocks });
+    this.setBreakdownCache(address, { ...result, expiresAt: this.currentBlock + cacheBlocks });
     return result;
   }
 
@@ -1308,10 +1874,12 @@ export class PositionTracker {
     this._prewarmInProgress = true;
 
     try {
-      // Only warm the top 30 positions with HF closest to 1.0 — these are
-      // the only ones that could cross the liquidation threshold in the next
-      // few blocks. Warming 400 positions costs ~12s of RPC time; warming 30
-      // costs ~1s. The cycle's hot path only ever executes 1-3 of these anyway.
+      // Warm the most-at-risk positions (HF closest to 1.0). The event-driven
+      // trigger needs a cached breakdown to compute local HF — the wider this
+      // window, the more positions a sudden price move can fire on instantly.
+      // Cost is CONFIG.prewarmMax × 2 eth_calls, all of which pass through the
+      // shared rate limiter — see the PREWARM_MAX note in config.ts before
+      // raising it, since an oversized sweep starves the cycle and the trigger.
       const toWarm = [...this.positions.values()]
         .filter(p =>
           p.healthFactor > 0n &&
@@ -1324,21 +1892,17 @@ export class PositionTracker {
           })()
         )
         .sort((a, b) => (a.healthFactor < b.healthFactor ? -1 : 1))
-        .slice(0, 30);  // top 30 most-at-risk only
+        .slice(0, CONFIG.prewarmMax);  // most-at-risk first; see PREWARM_MAX in config.ts
 
       if (toWarm.length === 0) return;
       logger.debug(`prewarm: warming ${toWarm.length} most-at-risk danger positions`);
 
-      // Low concurrency (3) with 30ms gaps — prewarm is best-effort background work.
-      // It must not compete with the main cycle's RPC budget.
-      const PREWARM_CONCURRENCY = 3;
-      for (let i = 0; i < toWarm.length; i += PREWARM_CONCURRENCY) {
-        const batch = toWarm.slice(i, i + PREWARM_CONCURRENCY);
-        await Promise.allSettled(
-          batch.map(pos => this.getAssetBreakdown(pos.address).catch(() => {}))
-        );
-        if (i + PREWARM_CONCURRENCY < toWarm.length) await sleep(30);
-      }
+      // One batched fan-out instead of 2 eth_calls per position. This is the
+      // difference between ~4 calls and ~80 for a 40-position sweep, which is
+      // what let prewarm monopolise the shared rate limiter.
+      await this.getAssetBreakdownBatch(toWarm.map(p => p.address)).catch(e =>
+        logger.debug(`prewarm batch failed: ${e?.message ?? e}`)
+      );
     } finally {
       this._prewarmInProgress = false;
     }
@@ -1357,6 +1921,9 @@ export class PositionTracker {
       this.breakdownCache.delete(key);
       this.lastDangerHF.delete(key);
     }
+    // Bug #7 fix: also remove from dormant map so wakeExpiredDormant doesn't
+    // re-add a dust position that was just evicted.
+    this.dormant.delete(key);
     // No denylist — any subsequent Borrow/Supply/etc event re-admits naturally
   }
 
@@ -1371,8 +1938,149 @@ export class PositionTracker {
     };
   }
 
+  // ── Local HF recomputation for the event-driven trigger ────────────────────
+  // Given the assets whose prices just moved, find watched positions whose LOCAL
+  // health factor is at or below `ceiling` (1e18 fixed point). PURE COMPUTATION:
+  // no RPC, microsecond-scale, safe to call from an event handler.
+  //
+  // This now runs off the in-memory model (scaled balances + reserve indices +
+  // e-mode), not off pre-warmed breakdowns. That removes the coverage hole that
+  // made the fast path useless in a crash: previously only positions whose
+  // breakdown had been fetched — in practice those already near HF 1.05 — were
+  // visible, so a position at HF 1.2 taken straight past 1.0 by a sharp move was
+  // invisible to the trigger and had to wait for the polling sweep.
+  //
+  // Only positions the moved assets can actually affect are scanned, via
+  // assetIndex, so cost scales with holders-of-that-asset rather than watchlist
+  // size.
+  findLocalCandidates(
+    assetsLower: Set<string>,
+    prices: Map<string, bigint>,
+    ceiling: bigint,
+    maxResults = 10,
+  ): Array<{ pos: BorrowerPosition; collaterals: AssetPosition[]; debts: AssetPosition[]; hfLocal: number }> {
+    const out: Array<{ pos: BorrowerPosition; collaterals: AssetPosition[]; debts: AssetPosition[]; hfLocal: number }> = [];
+    if (assetsLower.size === 0 || !this.reserves.loaded) return out;
+
+    // Candidate borrowers = union of holders of any moved asset.
+    const candidates = new Set<string>();
+    for (const asset of assetsLower) {
+      const holders = this.assetIndex.get(asset);
+      if (!holders) continue;
+      for (const addr of holders) candidates.add(addr);
+    }
+    if (candidates.size === 0) return out;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    for (const address of candidates) {
+      if (this.badDebtDenylist.has(address)) continue;
+      const pos = this.positions.get(address);
+      if (!pos) continue;
+      const state = this.userStates.get(address);
+      if (!state) continue;
+
+      const evaluated = this.evaluateUserState(state, prices, nowSec);
+      if (!evaluated) continue;
+      const { collaterals, debts, hfE18 } = evaluated;
+      if (hfE18 > ceiling) continue;
+      if (collaterals.length === 0 || debts.length === 0) continue;
+
+      out.push({ pos, collaterals, debts, hfLocal: Number(hfE18) / 1e18 });
+    }
+
+    out.sort((a, b) => a.hfLocal - b.hfLocal);
+    return out.slice(0, maxResults);
+  }
+
+  // Turn a user's scaled balances into real ones and compute the health factor,
+  // applying e-mode exactly as Aave does. Returns null when a needed price is
+  // missing — the polling sweep still covers those positions with authoritative
+  // getUserAccountData.
+  //
+  // Not modelled: isolation-mode debt ceilings and siloed borrowing. Both make
+  // the real position WEAKER than computed here, so ignoring them errs toward
+  // firing on something that reverts cheaply, never toward missing a fire.
+  private evaluateUserState(
+    state:  UserState,
+    prices: Map<string, bigint>,
+    nowSec: number,
+  ): { collaterals: AssetPosition[]; debts: AssetPosition[]; hfE18: bigint } | null {
+    const collaterals: AssetPosition[] = [];
+    const debts:       AssetPosition[] = [];
+    let num = 0n;  // Σ collateralValue(USD8) × liquidationThreshold(bps)
+    let den = 0n;  // Σ debtValue(USD8)
+
+    for (const r of state.reserves) {
+      const reserve = this.reserves.get(r.asset);
+      if (!reserve) return null;               // unknown reserve — can't model it
+      const price = prices.get(r.asset);
+      if (price === undefined || price === 0n) return null;
+      const unit = BigInt(10 ** reserve.decimals);
+
+      if (r.usageAsCollateral && r.scaledATokenBalance > 0n) {
+        const balance = (r.scaledATokenBalance * this.reserves.normalizedIncome(reserve, nowSec)) / RAY;
+        if (balance > 0n) {
+          const usd8 = (price * balance) / unit;
+          // E-mode aware: a position in a category uses the CATEGORY threshold,
+          // and only for assets inside that category's collateral bitmap —
+          // everything else contributes zero, exactly as on-chain.
+          const lt = BigInt(this.reserves.effectiveLiquidationThreshold(reserve, state.emodeId));
+          num += usd8 * lt;
+          collaterals.push({
+            symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals,
+            balance, balanceUsd: 0,
+          });
+        }
+      }
+
+      if (r.scaledVariableDebt > 0n) {
+        const balance = (r.scaledVariableDebt * this.reserves.normalizedVariableDebt(reserve, nowSec)) / RAY;
+        if (balance > 0n) {
+          den += (price * balance) / unit;
+          debts.push({
+            symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals,
+            balance, balanceUsd: 0,
+          });
+        }
+      }
+    }
+
+    if (den === 0n) return null;
+    // liquidationThreshold is in bps, so num carries an extra 1e4 that must be
+    // divided out.
+    return { collaterals, debts, hfE18: (num * HF_ONE) / (den * 10_000n) };
+  }
+
+  // Health factor for one address straight from the model, or null if it can't
+  // be computed. Used by the sweep to skip authoritative reads it doesn't need.
+  localHealthFactor(address: string, prices: Map<string, bigint>): bigint | null {
+    const state = this.userStates.get(address.toLowerCase());
+    if (!state || !this.reserves.loaded) return null;
+    const r = this.evaluateUserState(state, prices, Math.floor(Date.now() / 1000));
+    return r ? r.hfE18 : null;
+  }
+
   get size(): number { return this.positions.size; }
   get dormantSize(): number { return this.dormant.size; }
+
+  // Bug #12 fix: periodically prune the full borrower cache to prevent unbounded growth.
+  // After months of running, the full cache can contain 200k+ addresses (most long-repaid).
+  // This method removes addresses not in the active or dormant maps.
+  pruneFullCache(): void {
+    const fullCache = loadFullCache();
+    if (!fullCache) return;
+    const activeAddrs = new Set([...this.positions.keys(), ...this.dormant.keys()]);
+    const before = fullCache.borrowers.length;
+    // Also keep denylisted addresses so they stay blocked after restart
+    for (const addr of this.badDebtDenylist) activeAddrs.add(addr);
+    fullCache.borrowers = fullCache.borrowers.filter(addr => activeAddrs.has(addr));
+    const after = fullCache.borrowers.length;
+    if (before !== after) {
+      saveFullCache(BigInt(fullCache.scannedUpToBlock), fullCache.borrowers);
+      logger.info(`Full cache pruned: ${before} → ${after} addresses (removed ${before - after} stale)`);
+    }
+  }
 
   // Returns a Set of all currently-watched addresses — used by index.ts to
   // prune the lastEvaluatedHF map without iterating over the full positions map.

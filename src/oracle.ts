@@ -207,6 +207,72 @@ export class AaveOracle {
     return { prices, droppedAssets };
   }
 
+  // ── Trigger-engine accessors ────────────────────────────────────────────────
+  // The Chainlink AnswerUpdated trigger needs synchronous access to the latest
+  // known prices: read the cache, write an estimated price into it, force a
+  // refresh past the TTL, and snapshot every reserve price without RPC.
+
+  peekPrice(tokenAddress: string): bigint | null {
+    const c = priceCache.get(tokenAddress.toLowerCase());
+    return c ? c.price : null;
+  }
+
+  pokePrice(tokenAddress: string, price: bigint): void {
+    priceCache.set(tokenAddress.toLowerCase(), { price, ts: Date.now() });
+  }
+
+  // Force-fetch past the cache TTL — used to establish an authoritative baseline
+  // right after a feed event. Returns 0n on failure.
+  async refreshPrice(tokenAddress: string): Promise<bigint> {
+    try {
+      const price: bigint = await this.oracle.getAssetPrice(tokenAddress);
+      priceCache.set(tokenAddress.toLowerCase(), { price, ts: Date.now() });
+      return price;
+    } catch {
+      return 0n;
+    }
+  }
+
+  // Batched force-refresh. One Chainlink aggregator can back many Aave reserves
+  // (ETH/USD alone prices WETH, wstETH, rETH, weETH, ezETH and rsETH), so a feed
+  // event needs a confirmation read for all of them at once — six individual
+  // getAssetPrice calls per event is six times the rate-limit budget for the
+  // same data. Returns 0n for any asset that failed.
+  async refreshPrices(tokenAddresses: string[]): Promise<Map<string, bigint>> {
+    const unique = [...new Set(tokenAddresses.map(a => a.toLowerCase()))];
+    const out = new Map<string, bigint>();
+    if (unique.length === 0) return out;
+    if (unique.length === 1) {
+      out.set(unique[0]!, await this.refreshPrice(unique[0]!));
+      return out;
+    }
+    const now = Date.now();
+    try {
+      const prices: bigint[] = await this.oracle.getAssetsPrices(unique);
+      for (let i = 0; i < unique.length; i++) {
+        const price = prices[i] ?? 0n;
+        out.set(unique[i]!, price);
+        if (price > 0n) priceCache.set(unique[i]!, { price, ts: now });
+      }
+    } catch {
+      // A single dead feed reverts the whole batch. Serve what we have cached
+      // rather than fanning out into per-asset calls on the hot path — the
+      // background prefetch will sort out a genuinely dead feed.
+      for (const addr of unique) out.set(addr, priceCache.get(addr)?.price ?? 0n);
+    }
+    return out;
+  }
+
+  // Latest known price for EVERY reserve (0n where nothing cached yet).
+  snapshotAllPrices(): Map<string, bigint> {
+    const out = new Map<string, bigint>();
+    for (const r of Object.values(RESERVES)) {
+      const c = priceCache.get(r.address.toLowerCase());
+      out.set(r.address.toLowerCase(), c ? c.price : 0n);
+    }
+    return out;
+  }
+
   async toUsd8(tokenAddress: string, rawAmount: bigint, decimals: number): Promise<bigint> {
     const price = await this.getPrice(tokenAddress);
     return (price * rawAmount) / BigInt(10 ** decimals);

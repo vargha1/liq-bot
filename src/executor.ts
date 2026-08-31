@@ -1,7 +1,8 @@
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { CONFIG, LIQUIDATOR_ABI } from "./config";
+import { CONFIG, LIQUIDATOR_ABI, ARBITRUM_SEQUENCER_RPC, CHAIN_ID } from "./config";
 import { estimateGasUnits, SAME_ASSET_GAS } from "./evaluator";
+import { metrics } from "./metrics";
 import type { LiquidationOpportunity } from "./types";
 
 // Re-export so index.ts doesn't need to change its import
@@ -13,6 +14,21 @@ function hopsFromPath(swapPath: string): number {
   if (!swapPath || swapPath === "0x") return 0;
   const bytes = (swapPath.length - 2) / 2;
   return Math.max(1, Math.round((bytes - 20) / 23));
+}
+
+type CooldownCause = "success" | "failure" | "external";
+interface CooldownEntry { ts: number; cause: CooldownCause }
+
+const COOLDOWN_SUCCESS_MS   = 30_000; // position is gone — no point retrying soon
+const COOLDOWN_FAILURE_MS   = 3_000;  // our own tx failed — retry quickly (may have been transient)
+const COOLDOWN_EXTERNAL_MS  = 30_000; // a competitor liquidated the borrower
+
+function cooldownMsFor(cause: CooldownCause): number {
+  switch (cause) {
+    case "success":  return COOLDOWN_SUCCESS_MS;
+    case "failure":  return COOLDOWN_FAILURE_MS;
+    case "external": return COOLDOWN_EXTERNAL_MS;
+  }
 }
 
 export class Executor {
@@ -38,12 +54,61 @@ export class Executor {
   private inFlight = new Map<string, Promise<ethers.TransactionReceipt | null>>();
   private nonce    = -1;  // managed manually to allow parallel submissions
 
-  constructor(private wallet: ethers.Wallet, contractAddress: string) {
+  // Recently-attempted map with per-cause cooldowns. Distinguishes:
+  //   success  — we liquidated it (30s)
+  //   failure  — OUR tx failed for a transient reason (3s, then retry allowed)
+  //   external — a competitor's LiquidationCall event was seen (30s)
+  private recentlyExecuted = new Map<string, CooldownEntry>();
+
+  // Clock skew between local machine and the chain. The on-chain deadline guard
+  // compares against block.timestamp, so a skewed host clock makes deadlines
+  // wrong in either direction. Calibrated once a minute against latest block ts.
+  private _clockSkewMs = 0;
+
+  // Stateless HTTP provider (index.ts's read provider). The main wallet rides on
+  // the WebSocket, which is destroyed and rebuilt on every reconnect — during
+  // that window eth_sendRawTransaction and receipt polling both fail against a
+  // dead socket. Broadcasting and polling here too costs nothing and keeps
+  // submission alive across reconnects.
+  private fallbackProvider: ethers.JsonRpcProvider | null = null;
+
+  // Broadcast-only. Never polled for receipts or reads — the sequencer endpoint
+  // exists to shave the forwarding hop off submission, nothing else.
+  private sequencerProvider: ethers.JsonRpcProvider | null = null;
+  private sequencerFailures = 0;
+
+  // Supplies the cycle's cached fee data. The trigger engine calls execute()
+  // without an override, so without this the single most latency-critical path
+  // in the bot paid for a getFeeData round-trip before it could even sign.
+  private feeDataSource: (() => ethers.FeeData | null) | null = null;
+
+  setFeeDataSource(fn: () => ethers.FeeData | null): void { this.feeDataSource = fn; }
+
+  constructor(
+    private wallet: ethers.Wallet,
+    contractAddress: string,
+    fallbackProvider?: ethers.JsonRpcProvider,
+  ) {
     this.contract = new ethers.Contract(contractAddress, LIQUIDATOR_ABI, wallet);
+    this.fallbackProvider = fallbackProvider ?? null;
+
+    if (CONFIG.broadcastToSequencer) {
+      try {
+        // Submission-only endpoint: it serves eth_sendRawTransaction but not
+        // eth_blockNumber/eth_chainId, so the network is pinned explicitly and
+        // staticNetwork stops ethers probing for a chain id it cannot answer.
+        this.sequencerProvider = new ethers.JsonRpcProvider(
+          ARBITRUM_SEQUENCER_RPC, CHAIN_ID, { staticNetwork: true },
+        );
+        logger.info(`Executor: also broadcasting to Arbitrum sequencer (${ARBITRUM_SEQUENCER_RPC})`);
+      } catch (e: any) {
+        logger.warn(`Executor: sequencer endpoint unavailable: ${e?.message ?? e}`);
+      }
+    }
 
     // OPT 1: If SUBMIT_RPC_URL is set, use a dedicated provider for tx submission.
     // This can be a lower-latency or geographically closer endpoint to the
-    // Arbitrum sequencer, giving us a few ms advantage in FCFS ordering.
+    // Arbitrum sequencer, giving us a few ms FCFS ordering advantage.
     if (CONFIG.submitRpcUrl) {
       const submitProvider = new ethers.JsonRpcProvider(
         CONFIG.submitRpcUrl, undefined, { staticNetwork: true }
@@ -53,6 +118,49 @@ export class Executor {
     } else {
       this.submitWallet = wallet;
     }
+
+    // Cleanup expired cooldown entries
+    setInterval(() => {
+      const cutoff = Date.now() - Math.max(COOLDOWN_SUCCESS_MS, COOLDOWN_EXTERNAL_MS) * 2;
+      for (const [k, v] of this.recentlyExecuted) {
+        if (v.ts < cutoff) this.recentlyExecuted.delete(k);
+      }
+    }, 60_000);
+
+    // Bug #5 fix: periodic nonce sync to detect desync after dropped/replaced txs
+    setInterval(async () => {
+      if (this.nonce >= 0) {
+        try {
+          const onChainNonce = await this.submitWallet.getNonce();
+          if (onChainNonce !== this.nonce) {
+            logger.warn(`Nonce desync: local=${this.nonce} on-chain=${onChainNonce} — resetting`);
+            this.nonce = onChainNonce;
+          }
+        } catch { /* ignore — provider may be reconnecting */ }
+      }
+    }, 30_000);
+
+    // Clock-skew calibration against the chain clock
+    const calibrateClock = async () => {
+      try {
+        const block = await this.wallet.provider!.getBlock("latest");
+        if (block?.timestamp) {
+          this._clockSkewMs = block.timestamp * 1000 - Date.now();
+          if (Math.abs(this._clockSkewMs) > 5_000) {
+            logger.warn(`Clock skew vs chain: ${Math.round(this._clockSkewMs / 1000)}s — deadlines adjusted`);
+          }
+        }
+      } catch { /* ignore */ }
+    };
+    calibrateClock();
+    setInterval(calibrateClock, 60_000);
+  }
+
+  // Called by index.ts when a competitor's LiquidationCall is observed on a
+  // borrower we track. Lets execute() skip instantly with an accurate reason
+  // instead of waiting out the generic cooldown.
+  noteExternalLiquidation(borrower: string): void {
+    this.recentlyExecuted.set(borrower.toLowerCase(), { ts: Date.now(), cause: "external" });
   }
 
   // OPT 3: isExecuting is true only if we've hit the concurrency cap.
@@ -74,10 +182,27 @@ export class Executor {
   // OPT 3: Execute with parallel queue support.
   // Returns immediately if this borrower is already being liquidated.
   // Allows up to CONFIG.maxConcurrentExecutions simultaneous executions.
-  async execute(opp: LiquidationOpportunity): Promise<ethers.TransactionReceipt | null> {
+  async execute(opp: LiquidationOpportunity, currentBlock: bigint = 0n, feeDataOverride?: ethers.FeeData): Promise<ethers.TransactionReceipt | null> {
+    const key = opp.borrower.toLowerCase();
+
+    // Per-cause cooldown check
+    const entry = this.recentlyExecuted.get(key);
+    if (entry) {
+      const limit = cooldownMsFor(entry.cause);
+      const age = Date.now() - entry.ts;
+      if (age < limit) {
+        if (entry.cause === "external") {
+          logger.info(`  → ${key.slice(0,10)} already liquidated by competitor — skipping`);
+        } else {
+          logger.debug(`  → ${key.slice(0,10)} recent ${entry.cause} ${age}ms ago (<${limit}ms) — skipping`);
+        }
+        return null;
+      }
+    }
+
     // Don't double-liquidate the same borrower
-    if (this.inFlight.has(opp.borrower.toLowerCase())) {
-      logger.warn(`  → ${opp.borrower.slice(0,10)} already in-flight — skipping`);
+    if (this.inFlight.has(key)) {
+      logger.warn(`  → ${key.slice(0,10)} already in-flight — skipping`);
       return null;
     }
     // Concurrency cap
@@ -86,15 +211,16 @@ export class Executor {
       return null;
     }
 
-    const key = opp.borrower.toLowerCase();
-    const promise = this._executeOne(opp).finally(() => {
+    const promise = this._executeOne(opp, feeDataOverride).finally(() => {
       this.inFlight.delete(key);
     });
     this.inFlight.set(key, promise);
     return promise;
   }
 
-  private async _executeOne(opp: LiquidationOpportunity): Promise<ethers.TransactionReceipt | null> {
+  private async _executeOne(opp: LiquidationOpportunity, feeDataOverride?: ethers.FeeData): Promise<ethers.TransactionReceipt | null> {
+    const key = opp.borrower.toLowerCase();
+    const e2eStart = performance.now();
     try {
       logger.info(
         `Liquidating ${opp.borrower.slice(0, 10)}... | HF=${opp.healthFactor.toFixed(4)} | ` +
@@ -113,19 +239,19 @@ export class Executor {
 
       const hops     = hopsFromPath(swapPath);
       const gasUnits = isSameAsset ? SAME_ASSET_GAS : estimateGasUnits(hops);
-      const gasLimit = (gasUnits * 120n) / 100n;
-      logger.debug(`Gas: fixed=${gasUnits} limit=${gasLimit} (${hops} swap hops)`);
+      // Generous buffer: Arbitrum refunds unused L2 gas and its L1 data fee
+      // scales with CALDATA SIZE, not the gas limit — so a large limit costs
+      // nothing extra and eliminates out-of-gas reverts on multi-hop swaps.
+      const gasLimit = gasUnits + 1_500_000n;
+      logger.debug(`Gas: est=${gasUnits} limit=${gasLimit} (${hops} swap hops)`);
 
-      // ── OPT 1: Timeboost priority fee ──────────────────────────────────────
-      // Arbitrum's mempool is private (no front-running), but FCFS ordering means
-      // arriving first matters. Among non-express-lane txs, the sequencer orders
-      // by arrival time; a higher priority tip also helps beat the 200ms Timeboost
-      // artificial delay imposed on non-express-lane transactions.
-      // Source: https://docs.arbitrum.io/how-arbitrum-works/timeboost/gentle-introduction
-      const feeData      = await this.wallet.provider!.getFeeData();
+      // NOTE on ordering: Arbitrum sequences FCFS by arrival time — priority
+      // tips do not reorder transactions. What wins races is arriving first
+      // (detection latency) and, optionally, the Timeboost express lane.
+      // We still set a modest tip because it is free and harmless.
+      const feeData      = feeDataOverride ?? this.feeDataSource?.() ?? await this.getFeeDataResilient();
       const PRIORITY_WEI = BigInt(Math.round(CONFIG.timeboostPriorityGwei * 1e9));
       const basePriority = feeData.maxPriorityFeePerGas ?? PRIORITY_WEI;
-      // Use whichever is higher: our configured floor or 1.5× the network tip
       const bumpedPriority = basePriority > PRIORITY_WEI
         ? (basePriority * 15n) / 10n
         : PRIORITY_WEI;
@@ -140,21 +266,23 @@ export class Executor {
       };
 
       // ── OPT 3: Nonce management for parallel submissions ───────────────────
-      // Fetch nonce once and increment manually so parallel calls don't collide.
       if (this.nonce < 0) {
         this.nonce = await this.submitWallet.getNonce();
       }
       const nonce = this.nonce++;
       (txOpts as any).nonce = nonce;
 
-      logger.debug(`Submitting nonce=${nonce} priority=${Number(bumpedPriority)/1e9}gwei`);
+      logger.debug(`Submitting nonce=${nonce}`);
 
-      // FIX: compute a deadline (now + deadlineSecs) so stale/stuck txs revert
-      // cleanly instead of executing at wrong prices long after opportunity passed.
-      const deadline = BigInt(Math.floor(Date.now() / 1000) + CONFIG.deadlineSecs);
+      // Deadline from CHAIN time (calibrated), not host clock — the contract
+      // compares against block.timestamp.
+      const chainNowMs = Date.now() + this._clockSkewMs;
+      const deadline   = BigInt(Math.floor(chainNowMs / 1000) + CONFIG.deadlineSecs);
 
-      // Submit via the cached dedicated submit contract (OPT 1)
-      const tx = await this.getSubmitContract().liquidate(
+      // Sign once, broadcast to every available endpoint simultaneously.
+      // First sequencer ack wins; duplicates are idempotent (same hash).
+      const t0 = performance.now();
+      const populatedTx = await this.getSubmitContract().liquidate.populateTransaction(
         opp.collateralAsset,
         opp.debtAsset,
         opp.borrower,
@@ -164,20 +292,65 @@ export class Executor {
         deadline,
         txOpts,
       );
+      const signedTx = await this.submitWallet.signTransaction(populatedTx);
+      const signedHash = ethers.keccak256(signedTx);
 
-      logger.info(`Tx: ${tx.hash} (nonce=${nonce})`);
-      const receipt = await tx.wait(1);
+      const endpoints = this.broadcastEndpoints();
+      const sendResults = await Promise.allSettled(
+        endpoints.map(p =>
+          p.send("eth_sendRawTransaction", [signedTx]).then(() => { return performance.now() - t0; })
+        )
+      );
+      // If the sequencer endpoint is unreachable from this host, stop paying for
+      // a doomed request on every liquidation. Other endpoints already carry the
+      // transaction, so losing it costs latency, not correctness.
+      if (this.sequencerProvider && endpoints[0] === (this.sequencerProvider as unknown as ethers.JsonRpcApiProvider)) {
+        if (sendResults[0]?.status === "rejected") {
+          if (++this.sequencerFailures >= 3) {
+            logger.warn("Executor: sequencer broadcast failed 3× — disabling it; other endpoints still carry the transaction");
+            this.sequencerProvider = null;
+          }
+        } else {
+          this.sequencerFailures = 0;
+        }
+      }
+
+      const acked = sendResults.filter(r => r.status === "fulfilled") as PromiseFulfilledResult<number>[];
+      const submitMs = performance.now() - t0;
+      metrics.record("exec.submit", submitMs);
+
+      if (acked.length === 0) {
+        const firstErr = (sendResults[0] as PromiseRejectedResult).reason;
+        throw firstErr instanceof Error ? firstErr : new Error(String(firstErr));
+      }
+      if (acked.length < endpoints.length) {
+        logger.warn(`Broadcast: only ${acked.length}/${endpoints.length} endpoints accepted the tx`);
+      }
+      logger.info(`Tx: ${signedHash} (nonce=${nonce}, seq-ack=${Math.round(submitMs)}ms via ${acked.length}/${endpoints.length} endpoint${endpoints.length > 1 ? "s" : ""})`);
+
+      // Wait for confirmation on the primary provider with a timeout — dropped
+      // txs must not block the nonce slot forever.
+      const receipt = await this.waitForReceipt(this.receiptProviders(), signedHash, 120_000);
+      const confirmMs = performance.now() - t0;
+      metrics.record("exec.e2e", performance.now() - e2eStart);
+      if (receipt) metrics.record("exec.confirm", confirmMs - submitMs);
 
       if (receipt?.status === 1) {
         logger.info(`✅ Confirmed block=${receipt.blockNumber}`);
+        this.recentlyExecuted.set(key, { ts: Date.now(), cause: "success" });
         this._parseReceipt(receipt);
+      } else if (receipt) {
+        // Reverted — mark short failure cooldown so we retry fast but don't loop.
+        this.recentlyExecuted.set(key, { ts: Date.now(), cause: "failure" });
+        logger.error(`❌ Reverted: ${signedHash}`);
       } else {
-        // On revert, the nonce was consumed — no adjustment needed.
-        logger.error(`❌ Reverted: ${tx.hash}`);
+        this.recentlyExecuted.set(key, { ts: Date.now(), cause: "failure" });
+        logger.error(`❌ Confirmation timeout: ${signedHash}`);
       }
       return receipt;
 
     } catch (err: any) {
+      this.recentlyExecuted.set(opp.borrower.toLowerCase(), { ts: Date.now(), cause: "failure" });
       // If nonce was wrong (race condition), reset so next call re-fetches
       if (/nonce|replacement/i.test(err?.message ?? "")) {
         this.nonce = -1;
@@ -187,6 +360,69 @@ export class Executor {
       }
       return null;
     }
+  }
+
+  // Unique providers to broadcast to: dedicated submit endpoint (if configured)
+  // plus the main provider. Broadcasting the same signed tx to both costs
+  // nothing and removes single-endpoint stalls from the race.
+  private broadcastEndpoints(): ethers.JsonRpcApiProvider[] {
+    const eps: ethers.JsonRpcApiProvider[] = [];
+    const submitP   = this.submitWallet.provider as ethers.JsonRpcApiProvider | null;
+    const mainP     = this.wallet.provider       as ethers.JsonRpcApiProvider | null;
+    const fallbackP = this.fallbackProvider      as ethers.JsonRpcApiProvider | null;
+    const seqP      = this.sequencerProvider     as ethers.JsonRpcApiProvider | null;
+    // Sequencer first: it is the endpoint with the fewest hops to the thing that
+    // actually decides ordering, and Promise.allSettled dispatches in order.
+    for (const p of [seqP, submitP, mainP, fallbackP]) {
+      if (p && !eps.includes(p)) eps.push(p);
+    }
+    return eps;
+  }
+
+  // getFeeData against the WS provider throws while it is being replaced, which
+  // would abort an otherwise-valid liquidation. Try each endpoint in turn.
+  private async getFeeDataResilient(): Promise<ethers.FeeData> {
+    let lastErr: unknown;
+    for (const p of this.receiptProviders()) {
+      try { return await p.getFeeData(); } catch (e) { lastErr = e; }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error("getFeeData failed on all endpoints");
+  }
+
+  // Providers to poll for a receipt, primary first. Includes the HTTP fallback
+  // so a mid-flight WS reconnect doesn't turn every confirmed tx into a
+  // "confirmation timeout".
+  private receiptProviders(): ethers.Provider[] {
+    const out: ethers.Provider[] = [];
+    for (const p of [this.submitWallet.provider, this.wallet.provider, this.fallbackProvider]) {
+      if (p && !out.includes(p)) out.push(p);
+    }
+    return out;
+  }
+
+  // Receipt polling loop — avoids relying on provider-specific wait APIs and
+  // survives WS hiccups better than tx.wait().
+  private async waitForReceipt(
+    providers: ethers.Provider[],
+    hash: string,
+    timeoutMs: number,
+  ): Promise<ethers.TransactionReceipt | null> {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      // One call per round in the normal case. Only fail OVER to the next
+      // endpoint when this one throws — a null receipt means "not mined yet",
+      // which every endpoint would answer identically, so asking all of them
+      // would triple the poll cost for nothing.
+      for (const provider of providers) {
+        try {
+          const r = await provider.getTransactionReceipt(hash);
+          if (r) return r;
+          break;  // answered, just not mined — wait and retry on this endpoint
+        } catch { /* dead socket or transient — try the next endpoint */ }
+      }
+      await new Promise(res => setTimeout(res, 2_000));
+    }
+    return null;
   }
 
   private _parseReceipt(receipt: ethers.TransactionReceipt): void {
@@ -213,4 +449,3 @@ export class Executor {
     logger.info(`Withdrawn ${tokenAddress}: ${tx.hash}`);
   }
 }
-

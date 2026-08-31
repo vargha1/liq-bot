@@ -9,6 +9,8 @@ export interface BorrowerPosition {
   // Per-asset breakdown (populated lazily when profitable)
   collaterals?:      AssetPosition[];
   debts?:            AssetPosition[];
+  // Bug #8 fix: e-mode category — if > 0, close factor can be 100% regardless of HF threshold
+  userEmodeCategoryId?: number;
 }
 
 export interface AssetPosition {

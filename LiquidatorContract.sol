@@ -159,6 +159,9 @@ contract AaveLiquidator {
 
         uint256 repayToAave = amount + premium;
         uint256 colBefore   = IERC20(p.collateralAsset).balanceOf(address(this));
+        // Balance at entry ALREADY includes the flashloaned `amount`, so
+        // (debtBefore - amount) is whatever this contract held beforehand.
+        uint256 debtBefore  = IERC20(p.debtAsset).balanceOf(address(this));
 
         // Step 1: approve Aave to pull debt repayment during liquidationCall
         _safeApprove(IERC20(p.debtAsset), AAVE_POOL, p.debtToCover);
@@ -192,11 +195,22 @@ contract AaveLiquidator {
             _safeApprove(IERC20(p.collateralAsset), SWAP_ROUTER, 0);
         }
 
-        // Step 4: enforce profitability — revert if we can't repay the flashloan
-        uint256 debtBal = IERC20(p.debtAsset).balanceOf(address(this));
-        require(debtBal >= repayToAave, "Unprofitable — cannot repay flashloan");
+        // Step 4: enforce profitability on the DELTA, not the total balance.
+        //
+        // Comparing the whole balance against repayToAave was wrong: any debt
+        // tokens already sitting in this contract — profit left over from an
+        // earlier liquidation, or a stray transfer — would cover the shortfall
+        // and let a swap that actually lost money pass the check.
+        //
+        // Let B0 be the balance at entry (which includes the flashloaned
+        // `amount`) and S the tokens produced by the swap. Preserving prior
+        // profit requires S >= amount + premium, i.e. the final balance must be
+        // at least (B0 - amount) + repayToAave.
+        uint256 debtBal  = IERC20(p.debtAsset).balanceOf(address(this));
+        uint256 required = debtBefore - amount + repayToAave;
+        require(debtBal >= required, "Unprofitable — cannot repay flashloan");
 
-        uint256 profit = debtBal - repayToAave;
+        uint256 profit = debtBal - required;
 
         // Step 5: authorize Aave to pull flashloan repayment
         _safeApprove(IERC20(p.debtAsset), AAVE_POOL, repayToAave);

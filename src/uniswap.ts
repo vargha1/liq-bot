@@ -10,7 +10,7 @@
  */
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { RESERVES } from "./config";
+import { RESERVES, MULTICALL3, MULTICALL3_ABI } from "./config";
 
 export const UNISWAP_ROUTER = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"; // SwapRouter02
 export const UNISWAP_QUOTER = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"; // QuoterV2
@@ -25,16 +25,37 @@ const QUOTER_ABI = [
 let _cachedQuoterProvider: ethers.Provider | null = null;
 let _cachedQuoter: ethers.Contract | null = null;
 
+const QUOTER_IFACE = new ethers.Interface(QUOTER_ABI);
+let _cachedMulticall: ethers.Contract | null = null;
+
+// Both contracts are rebuilt together whenever the provider instance changes,
+// from a single tracked provider so neither getter can invalidate the other's
+// cache out from under it.
+function refreshContractCache(provider: ethers.Provider): void {
+  if (provider === _cachedQuoterProvider) return;
+  _cachedQuoterProvider = provider;
+  _cachedQuoter    = new ethers.Contract(UNISWAP_QUOTER, QUOTER_ABI, provider);
+  _cachedMulticall = new ethers.Contract(MULTICALL3, MULTICALL3_ABI, provider);
+}
+
 function getQuoter(provider: ethers.Provider): ethers.Contract {
-  if (provider !== _cachedQuoterProvider) {
-    _cachedQuoterProvider = provider;
-    _cachedQuoter = new ethers.Contract(UNISWAP_QUOTER, QUOTER_ABI, provider);
-  }
+  refreshContractCache(provider);
   return _cachedQuoter!;
 }
 
-// Fee tiers available on Uniswap V3
-const FEE_TIERS = [500, 3000, 10000] as const;
+function getMulticall(provider: ethers.Provider): ethers.Contract {
+  refreshContractCache(provider);
+  return _cachedMulticall!;
+}
+
+// Fee tiers available on Uniswap V3. The 0.01% tier was missing and is often
+// the deepest pool for stable pairs and for WETH/USDC on Arbitrum — a live
+// quote of 1 WETH returned more USDC through the 100 tier than through 3000.
+// Adding it costs nothing now that all candidate paths are quoted in one
+// batched eth_call. It is used for QUOTING only; the pre-cache heuristic path
+// still picks widely-present tiers, since a heuristic path that names a
+// non-existent pool reverts on-chain.
+const FEE_TIERS = [100, 500, 3000, 10000] as const;
 type FeeTier = typeof FEE_TIERS[number];
 
 // Intermediate routing tokens (deepest liquidity on Arbitrum)
@@ -123,6 +144,109 @@ export interface UniswapQuoteResult {
 // queue when Tenderly is slow, which causes cascading delays across cycles.
 const QUOTE_TIMEOUT_MS = 1_500;
 
+// ─── Background route cache ──────────────────────────────────────────────────
+// HOT-PATH RULE: evaluate() must never wait on a QuoterV2 staticCall. Instead:
+//   1. The best-known route for a (collateral→debt) pair is cached here.
+//   2. On a cache miss, a deterministic heuristic path is used immediately.
+//   3. A background refresh re-quotes all candidate paths and updates the cache,
+//      throttled to once per ROUTE_REFRESH_MIN_INTERVAL_MS per pair.
+// Slippage protection does not depend on the quote: amountOutMinimum is derived
+// from Aave oracle prices in evaluator.ts, and the contract enforces it on-chain.
+export interface CachedRoute {
+  path:     string;
+  desc:     string;
+  out:      bigint;
+  gas:      number;
+  ts:       number;
+}
+
+const routeCache          = new Map<string, CachedRoute>();   // "colLower->debtLower" → best route
+const inflightRefreshes   = new Map<string, Promise<void>>();
+const lastRefreshAttempt  = new Map<string, number>();
+const ROUTE_REFRESH_MIN_INTERVAL_MS = 60_000;   // at most one background quote fan-out per pair per minute
+const ROUTE_TTL_MS                  = 10 * 60_000; // routes older than this are refreshed on next touch
+
+function pairKey(tokenIn: string, tokenOut: string): string {
+  return `${tokenIn.toLowerCase()}->${tokenOut.toLowerCase()}`;
+}
+
+// Deterministic fallback route used when no quoted route is cached.
+// Mirrors the liquidity layout on Arbitrum: stables cluster around USDC 0.05%,
+// volatile assets route through WETH 0.3%.
+function heuristicCandidate(tokenIn: string, tokenOut: string): { tokens: string[]; fees: FeeTier[] } {
+  const inL  = tokenIn.toLowerCase();
+  const outL = tokenOut.toLowerCase();
+  const inIsStable  = STABLES.has(inL);
+  const outIsStable = STABLES.has(outL);
+
+  if (inL === WETH.toLowerCase() || outL === WETH.toLowerCase()) {
+    const stableSide = inIsStable || outIsStable;
+    return { tokens: [tokenIn, tokenOut], fees: [stableSide ? 500 : 3000] };
+  }
+  if (inIsStable && outIsStable) {
+    if (inL === USDC.toLowerCase()) return { tokens: [tokenIn, tokenOut], fees: [500] };
+    return { tokens: [tokenIn, USDC, tokenOut], fees: [500, 500] };
+  }
+  if (inIsStable && !outIsStable) return { tokens: [tokenIn, WETH, tokenOut], fees: [500, 3000] };
+  if (!inIsStable && outIsStable) return { tokens: [tokenIn, WETH, tokenOut], fees: [3000, 500] };
+  return { tokens: [tokenIn, WETH, tokenOut], fees: [3000, 3000] };
+}
+
+// Encoded heuristic path — usable as swapPath with zero RPC calls.
+export function encodeHeuristicPath(tokenIn: string, tokenOut: string): string {
+  const c = heuristicCandidate(tokenIn, tokenOut);
+  return encodePath(c.tokens, c.fees);
+}
+
+export function getCachedRoute(tokenIn: string, tokenOut: string): CachedRoute | undefined {
+  return routeCache.get(pairKey(tokenIn, tokenOut));
+}
+
+// Fire-and-forget background refresh of the best route for a pair.
+// Never throws; deduplicates concurrent refreshes; throttles repeat attempts.
+export function scheduleRouteRefresh(
+  tokenIn:   string,
+  tokenOut:  string,
+  amountHint: bigint,
+  provider:  ethers.Provider,
+  force = false,
+): void {
+  const key = pairKey(tokenIn, tokenOut);
+  const now = Date.now();
+
+  const cached = routeCache.get(key);
+  if (!force && cached && now - cached.ts < ROUTE_REFRESH_MIN_INTERVAL_MS) return;
+  if (!force && !cached && now - (lastRefreshAttempt.get(key) ?? 0) < ROUTE_REFRESH_MIN_INTERVAL_MS) return;
+
+  const inflight = inflightRefreshes.get(key);
+  if (inflight) return;
+
+  lastRefreshAttempt.set(key, now);
+  const job = (async () => {
+    const result = await uniswapSwap(tokenIn, amountHint, tokenOut, "", 0, provider);
+    if (result) {
+      routeCache.set(key, {
+        path: result.swapPath,
+        desc: result.routeDesc,
+        out:  result.outputAmount,
+        gas:  result.gasEstimate,
+        ts:   Date.now(),
+      });
+      logger.debug(`routeCache: ${symOf(tokenIn)}→${symOf(tokenOut)} via ${result.routeDesc}`);
+    }
+  })()
+    .catch(e => { logger.debug(`routeCache refresh failed for ${key}: ${e?.message ?? e}`); })
+    .finally(() => inflightRefreshes.delete(key));
+  inflightRefreshes.set(key, job);
+}
+
+// True if the cached route for this pair exists but is stale enough to warrant a
+// background refresh (does not block — caller uses the stale route meanwhile).
+export function routeNeedsRefresh(tokenIn: string, tokenOut: string): boolean {
+  const cached = routeCache.get(pairKey(tokenIn, tokenOut));
+  return !!cached && Date.now() - cached.ts > ROUTE_TTL_MS;
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     p,
@@ -140,44 +264,68 @@ export async function uniswapSwap(
   slippageBps: number,
   provider:    ethers.Provider,
 ): Promise<UniswapQuoteResult | null> {
-  const quoter     = getQuoter(provider);  // FIX: use cached contract
   const candidates = candidatePaths(tokenIn, tokenOut);
 
-  // Quote all candidates in parallel, each with a timeout
-  const quoteResults = await Promise.allSettled(
-    candidates.map(async ({ tokens, fees }) => {
-      const path = encodePath(tokens, fees);
-      const desc = tokens.map((t, i) =>
-        i < fees.length ? `${symOf(t)}-[${fees[i]}]` : symOf(t)
-      ).join("→");
-
-      const [amountOut, , , gasEstimate] = await withTimeout(
-        quoter.quoteExactInput.staticCall(path, amountIn),
-        QUOTE_TIMEOUT_MS,
-      );
-      return {
-        path,
-        desc,
-        out:  amountOut as bigint,
-        gas:  Number(gasEstimate as bigint),
-      };
-    })
-  );
+  const encoded = candidates.map(({ tokens, fees }) => ({
+    path: encodePath(tokens, fees),
+    desc: tokens.map((t, i) => (i < fees.length ? `${symOf(t)}-[${fees[i]}]` : symOf(t))).join("→"),
+  }));
 
   let bestOut  = 0n;
   let bestPath = "";
   let bestGas  = 350_000;
   let bestDesc = "";
 
-  for (const result of quoteResults) {
-    if (result.status !== "fulfilled") continue;
-    const { path, desc, out, gas } = result.value;
+  const consider = (path: string, desc: string, out: bigint, gas: number) => {
     logger.debug(`  Uni ${desc}: out=${out} gas=${gas}`);
-    if (out > bestOut) {
-      bestOut  = out;
-      bestPath = path;
-      bestGas  = gas;
-      bestDesc = desc;
+    if (out > bestOut) { bestOut = out; bestPath = path; bestGas = gas; bestDesc = desc; }
+  };
+
+  // Every candidate path in ONE eth_call via Multicall3 instead of up to ten
+  // separate QuoterV2 staticCalls. Each of those went through the shared rate
+  // limiter, so a single route refresh could consume seconds of budget — and
+  // route refreshes fire per collateral/debt pair.
+  //
+  // quoteExactInput is non-view on QuoterV2, but tryAggregate is invoked here as
+  // an eth_call, so the state it touches is discarded exactly as with staticCall.
+  // requireSuccess=false absorbs the revert QuoterV2 throws for a missing pool.
+  try {
+    const mc = getMulticall(provider);
+    const results: Array<{ success: boolean; returnData: string }> = await withTimeout(
+      mc.tryAggregate.staticCall(
+        false,
+        encoded.map(e => ({
+          target:   UNISWAP_QUOTER,
+          callData: QUOTER_IFACE.encodeFunctionData("quoteExactInput", [e.path, amountIn]),
+        })),
+      ),
+      QUOTE_TIMEOUT_MS,
+    );
+    for (let i = 0; i < encoded.length; i++) {
+      const r = results[i];
+      if (!r?.success || r.returnData === "0x") continue;
+      try {
+        const d = QUOTER_IFACE.decodeFunctionResult("quoteExactInput", r.returnData);
+        consider(encoded[i]!.path, encoded[i]!.desc, d[0] as bigint, Number(d[3] as bigint));
+      } catch { /* unquotable path */ }
+    }
+  } catch (e: any) {
+    // Multicall unavailable or timed out — fall back to individual quotes.
+    logger.debug(`uniswapSwap: batched quote failed (${e?.message ?? e}) — individual quotes`);
+    const quoter = getQuoter(provider);
+    const quoteResults = await Promise.allSettled(
+      encoded.map(async ({ path, desc }) => {
+        const [amountOut, , , gasEstimate] = await withTimeout(
+          quoter.quoteExactInput.staticCall(path, amountIn),
+          QUOTE_TIMEOUT_MS,
+        );
+        return { path, desc, out: amountOut as bigint, gas: Number(gasEstimate as bigint) };
+      })
+    );
+    for (const result of quoteResults) {
+      if (result.status !== "fulfilled") continue;
+      const { path, desc, out, gas } = result.value;
+      consider(path, desc, out, gas);
     }
   }
 
