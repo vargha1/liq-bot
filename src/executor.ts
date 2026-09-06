@@ -292,21 +292,24 @@ export class Executor {
           : { gasPrice: maxFee }),
       };
 
-      // Pre-flight: the node rejects outright if the balance cannot cover
-      // gasLimit × maxFeePerGas for every in-flight transaction. Checking here
-      // yields a precise, actionable message instead of an opaque provider
-      // error, and avoids burning a nonce on a doomed submission.
-      const reservePerTx = gasLimit * maxFee;
-      const needed       = reservePerTx * BigInt(this.inFlight.size || 1);
-      const balance      = await this.cachedBalance();
-      if (balance !== null && balance < needed) {
-        logger.error(
-          `Executor: insufficient ETH — need ${ethers.formatEther(needed)} ETH for ` +
-          `${this.inFlight.size || 1} in-flight tx (gasLimit=${gasLimit} @ ` +
-          `${Number(maxFee) / 1e9} gwei), wallet holds ${ethers.formatEther(balance)}. Top up.`
-        );
-        return null;
-      }
+      // No local balance pre-flight. The node performs exactly this check when
+      // it validates the transaction — balance >= gasLimit × maxFeePerGas —
+      // and it is the authority, so a copy here can only ever be wrong in the
+      // direction that costs money.
+      //
+      // It was wrong in two ways. `needed` multiplied THIS transaction's
+      // reservation by the in-flight count, charging every concurrent
+      // liquidation at the most expensive one's gas limit and fee, when the node
+      // only requires the sum of what each actually reserves. And the balance it
+      // compared against was up to 15 seconds stale, so a figure from before a
+      // confirmation could block a submission the chain would have accepted. On
+      // a thin balance both errors push the same way: refusing valid work.
+      //
+      // A rejected broadcast is not expensive. Every endpoint declining leaves
+      // acked empty, the reserved nonce is released by resetting it to -1 so the
+      // next attempt resyncs, and the catch below logs the provider's real
+      // reason — "insufficient funds for gas * price + value" — through
+      // describeRpcError, which is more precise than anything computed here.
       logger.debug(`Gas: est=${gasUnits} limit=${gasLimit} maxFee=${Number(maxFee) / 1e9}gwei (${hops} hops)`);
 
       // ── OPT 3: Nonce management for parallel submissions ───────────────────
@@ -431,7 +434,6 @@ export class Executor {
         this.nonce = -1;
         logger.warn(`Executor: nonce error — reset. ${detail}`);
       } else {
-        if (/insufficient funds/i.test(detail)) this.invalidateBalance();
         logger.error(`Executor: ${detail}`);
       }
       return null;
@@ -481,25 +483,6 @@ export class Executor {
     }
     if (this.nonce < 0) throw new Error("could not determine account nonce");
     return this.nonce++;   // synchronous — no interleaving after this point
-  }
-
-  // Wallet ETH balance, cached briefly so the pre-flight check never becomes a
-  // per-liquidation round-trip on the hot path. Returns null when unavailable,
-  // in which case the caller skips the check rather than blocking on it.
-  private _balance: { wei: bigint; ts: number } | null = null;
-  private static readonly BALANCE_CACHE_MS = 15_000;
-
-  private invalidateBalance(): void { this._balance = null; }
-
-  private async cachedBalance(): Promise<bigint | null> {
-    if (this._balance && Date.now() - this._balance.ts < Executor.BALANCE_CACHE_MS) return this._balance.wei;
-    const provider = this.fallbackProvider ?? this.wallet.provider;
-    if (!provider) return null;
-    try {
-      const wei = await provider.getBalance(this.wallet.address);
-      this._balance = { wei, ts: Date.now() };
-      return wei;
-    } catch { return null; }
   }
 
   // getFeeData against the WS provider throws while it is being replaced, which
