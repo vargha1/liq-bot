@@ -1197,7 +1197,56 @@ export class PositionTracker {
   private reserveFilter: ethers.Filter | null = null;
   private activeWsProvider: ethers.WebSocketProvider | null = null;
 
-  async startEventMonitoring(wsProvider: ethers.WebSocketProvider, onSubId: (id: string) => void): Promise<void> {
+  // Ceiling on how many positions a single gap recovery will re-read. The active
+  // set is a few hundred in steady state; this only guards the pathological case
+  // where a reconnect lands before the startup prune has finished.
+  private static readonly GAP_RECOVERY_MAX = 2_000;
+
+  // Called when a gap could not be replayed from logs. Aave events are what
+  // invalidate the model and the breakdown cache, so an unreplayed gap leaves
+  // both silently stale for any borrower who transacted during it — a wrong
+  // health factor computed with total confidence, which is the worst shape of
+  // error this bot can hold.
+  //
+  // The state is REFRESHED rather than dropped. Dropping would blind
+  // findLocalCandidates until the background fill caught up, which is a real
+  // detection hole; refreshUserStates overwrites in place, so the trigger keeps
+  // working throughout and simply becomes correct again once it returns.
+  //
+  // Only the ACTIVE set is covered. Refreshing the ~16k dormant positions would
+  // cost minutes of call budget, and they are healthy by construction — one that
+  // turned dangerous during the gap is picked up by the dormant recheck cycle.
+  private recoverFromUnrecoveredGap(): void {
+    const active = [...this.positions.keys()];
+    if (active.length === 0) return;
+    if (active.length > PositionTracker.GAP_RECOVERY_MAX) {
+      logger.warn(
+        `Gap recovery: ${active.length} active positions exceeds the ${PositionTracker.GAP_RECOVERY_MAX} ` +
+        `cap — skipping bulk refresh (startup prune has probably not finished; the sweep will re-read them)`
+      );
+      return;
+    }
+    for (const addr of active) {
+      this.breakdownCache.delete(addr);
+      this.priorityQueue.add(addr);
+    }
+    this.markDangerDirty();
+    logger.warn(`Gap recovery: re-reading model state for ${active.length} active positions`);
+    // Fire-and-forget: this must not delay re-subscribing to the new socket.
+    this.refreshUserStates(active)
+      .then(n => logger.info(`Gap recovery: refreshed ${n}/${active.length} model entries`))
+      .catch(e => logger.warn(`Gap recovery refresh failed: ${e?.message ?? e}`));
+  }
+
+  // `isReconnect` distinguishes a socket coming back from the initial startup
+  // call. It matters because the unrecovered-gap recovery below re-reads the
+  // active set, and at startup that set is the whole un-pruned seed (76k on this
+  // deployment) rather than the few hundred it settles at.
+  async startEventMonitoring(
+    wsProvider: ethers.WebSocketProvider,
+    onSubId: (id: string) => void,
+    isReconnect = false,
+  ): Promise<void> {
     // ── Gap-fill: catch events missed during disconnect ───────────────────
     // Reads go over the HTTP read provider, not the WebSocket: this is a bulk
     // query, and the whole point of the WS/HTTP split is to keep subscription
@@ -1218,6 +1267,15 @@ export class PositionTracker {
         // count (Chainstack rejects wide ranges outright), so one oversized
         // request would fail and silently drop the entire gap.
         let total = 0;
+        // Highest block confirmed actually READ, or null if nothing was. Null
+        // rather than `fromBlock - 1n`: when the 10k cap moves fromBlock forward,
+        // that expression sits ahead of the old watermark, so a total refusal
+        // would still advance it and claim coverage of blocks never fetched —
+        // the same lie this whole change exists to remove.
+        let coveredThrough: bigint | null = null;
+        let failedChunks   = 0;
+        let archiveBlocked = false;
+
         for (let from = fromBlock; from <= current; from += GAP_FILL_CHUNK) {
           const to = from + GAP_FILL_CHUNK - 1n <= current ? from + GAP_FILL_CHUNK - 1n : current;
           try {
@@ -1229,17 +1287,56 @@ export class PositionTracker {
             });
             for (const log of logs) this.handleRawLog(log, "gap-fill");
             total += logs.length;
+            // Only extends the covered watermark while nothing has failed yet;
+            // past a hole, later successes do not make the hole covered.
+            if (failedChunks === 0) coveredThrough = to;
           } catch (e: any) {
+            failedChunks++;
             if (isArchiveRestricted(e)) {
-              logger.warn(`  Gap-fill unavailable on this RPC plan (eth_getLogs is archive-gated) — skipping`);
+              archiveBlocked = true;
+              logger.warn(`  Gap-fill unavailable on this RPC plan (eth_getLogs is archive-gated)`);
               break;
             }
             logger.warn(`  Gap-fill chunk ${from}→${to} failed: ${e.message}`);
           }
         }
-        logger.info(`  Gap-fill: ${total} events`);
-        this.lastEventBlock = current;
-        this.currentBlock   = current;
+
+        if (failedChunks === 0) {
+          logger.info(`  Gap-fill: ${total} events`);
+          this.lastEventBlock = current;
+        } else {
+          // CRITICAL: the watermark used to be set to `current` unconditionally,
+          // even when every chunk had been refused. That marked the gap as
+          // covered when nothing had been read, so the missed events were lost
+          // permanently and the next gap-fill started after them. On a plan
+          // without eth_getLogs — this one — that happened on EVERY reconnect,
+          // and the only visible trace was a cheerful "Gap-fill: 0 events".
+          //
+          // Leaving the watermark behind means the next attempt retries the same
+          // range, which is the correct behaviour if the block range or the plan
+          // later allows it.
+          const uncoveredFrom = coveredThrough !== null ? coveredThrough + 1n : fromBlock;
+          if (coveredThrough !== null && coveredThrough > this.lastEventBlock) {
+            this.lastEventBlock = coveredThrough;
+          }
+          logger.warn(
+            `  Gap-fill INCOMPLETE: ${failedChunks} chunk(s) failed, ${total} events recovered, ` +
+            `blocks ${uncoveredFrom}→${current} NOT covered` +
+            (archiveBlocked ? " (eth_getLogs unavailable on this RPC plan)" : "")
+          );
+          // Events in the hole would have invalidated cached model and breakdown
+          // state for any borrower who transacted. That state cannot be replayed,
+          // so re-read it instead of trusting it.
+          if (isReconnect) this.recoverFromUnrecoveredGap();
+          else if (archiveBlocked) {
+            logger.warn(
+              "  New borrowers created while the socket was down cannot be discovered without " +
+              "eth_getLogs. Set THEGRAPH_API_KEY to seed from the subgraph, or use an RPC plan " +
+              "that permits it."
+            );
+          }
+        }
+        this.currentBlock = current;
       }
     } catch (e: any) { logger.warn(`Gap-fill failed: ${e.message}`); }
 

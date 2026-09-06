@@ -238,7 +238,10 @@ async function main(): Promise<void> {
       reconnecting = false;
       if (ready && tracker) {
         logger.info("Reconnected — gap-filling…");
-        try { await tracker.startEventMonitoring(p, () => {}); }
+        // isReconnect=true: a gap that cannot be replayed from logs leaves the
+        // model stale for anyone who transacted while the socket was down, so
+        // the tracker re-reads the active set instead of trusting it.
+        try { await tracker.startEventMonitoring(p, () => {}, true); }
         catch (e: any) { logger.warn(`Gap-fill failed: ${e.message}`); }
         // Re-subscribe the trigger engine's feed listeners on the fresh socket
         try { trigger?.attach(p); } catch { /* non-fatal */ }
