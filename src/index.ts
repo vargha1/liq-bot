@@ -8,7 +8,7 @@ import { Evaluator } from "./evaluator";
 import { Executor } from "./executor";
 import { TriggerEngine } from "./trigger";
 import { metrics, startMetricsReporter } from "./metrics";
-import { attachCallLimiter } from "./rpcLimiter";
+import { attachCallLimiter, type CallLimiterHandle } from "./rpcLimiter";
 import { ReserveRegistry, TOPIC_RESERVE_DATA_UPDATED } from "./reserveState";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -79,6 +79,16 @@ async function main(): Promise<void> {
     return cachedFeeData!;
   }
 
+  // Backpressure handle for the shared read provider's rate limiter. Assigned
+  // during startup, read by the cycle loop and the heartbeat.
+  let callLimiter: CallLimiterHandle | null = null;
+
+  // True once the wallet cannot fund even a single liquidation. Nothing the bot
+  // detects can be acted on in that state, so it must be loud rather than a
+  // warning buried between heartbeats — the observed run sat at 0.00054 ETH for
+  // hours while cheerfully reporting "liquidatable=17587 executed=0".
+  let gasStarved = false;
+
   // ── Services (initialised once, survive reconnects) ───────────────────────
   let tracker:   PositionTracker;
   let reserveRegistry: ReserveRegistry;
@@ -115,12 +125,19 @@ async function main(): Promise<void> {
     const dangerStr  = dangerInfo && dangerInfo.count > 0
       ? ` danger=${dangerInfo.count}[${dangerInfo.top3.map(p => `${p.addr}:${p.hf.toFixed(3)}`).join(" ")}]`
       : ` danger=${dangerInfo?.count ?? 0}`;
+    // RPC backpressure belongs in the heartbeat: a growing shed count is the
+    // single clearest signal that the bot is asking for more call budget than
+    // it has, which is what silently wrecked detection before.
+    const rpcStr = callLimiter
+      ? ` rpc=q${Math.round(callLimiter.queueDelayMs())}ms/shed${callLimiter.shedCount()}`
+      : "";
     logger.info(
       `📊 uptime=${upMin}m | cycles=${cycles} | liquidatable=${liquidatable} | ` +
       `executed=${executed} | profit=$${totalProfitUsd.toFixed(2)} | ` +
       `watching=${tracker?.size ?? 0} dormant=${tracker?.dormantSize ?? 0}` +
       (cov ? ` model=${cov.modelled}/${cov.total}` : "") +
-      dangerStr
+      dangerStr + rpcStr +
+      (gasStarved ? " | ⛔ GAS-STARVED: cannot execute" : "")
     );
   }, 300_000);
 
@@ -283,6 +300,16 @@ async function main(): Promise<void> {
   function requestCycle(bn: bigint, tEvent?: number): void {
     if (!ready || refreshing || pruning || shuttingDown || reconnecting) return;
 
+    // Backpressure: the sweep is the safety net, the trigger engine is the
+    // detection path that actually wins races. When the call budget is already
+    // spent, adding a 2-chunk sweep on top only pushes the trigger's price
+    // confirmations further back. Skip this one and let the queue drain.
+    const queued = callLimiter?.queueDelayMs() ?? 0;
+    if (queued > CONFIG.cycleSkipQueueMs) {
+      logger.debug(`Cycle skipped — RPC backlog ${Math.round(queued)}ms > ${CONFIG.cycleSkipQueueMs}ms`);
+      return;
+    }
+
     const waitMs = CONFIG.cycleMinIntervalMs - (Date.now() - lastCycleStartMs);
     if (waitMs <= 0) {
       runCycle(bn, tEvent).catch(e => logger.error(`Cycle error: ${e?.message ?? e}`));
@@ -342,11 +369,14 @@ async function main(): Promise<void> {
       logger.debug(`Cycle block=${bn} watching=${tracker.size}`);
 
       const stopScan = metrics.startTimer("cyc.scan");
-      const candidates = await tracker.refreshBatch(CONFIG.positionsPerCycle);
+      const candidates = await tracker.refreshBatch(CONFIG.positionsPerCycle, abortController.signal);
       stopScan();
 
       // Provider was replaced while we were awaiting — discard results and exit cleanly
       if (providerGeneration !== cycleGen) return;
+      // The safety timeout fired while the scan was outstanding. Everything from
+      // here on would be priced off data older than the timeout itself.
+      if (abortController.signal.aborted) return;
 
       if (candidates.length === 0) {
         logger.debug(`Block ${bn}: 0 liquidatable of ${tracker.size}`);
@@ -447,9 +477,12 @@ async function main(): Promise<void> {
       // 2 eth_calls total instead of 2 per candidate.
       logger.debug(`  Batched breakdown for ${actionable.length} candidates`);
       const stopBreakdown = metrics.startTimer("cyc.breakdown");
-      const breakdowns = await tracker.getAssetBreakdownBatch(actionable.map(p => p.address));
+      const breakdowns = await tracker.getAssetBreakdownBatch(
+        actionable.map(p => p.address), undefined, abortController.signal,
+      );
       stopBreakdown();
       if (providerGeneration !== cycleGen) return;
+      if (abortController.signal.aborted) return;
 
       // ── PERF: Parallel evaluate (includes Uniswap quote per candidate) ───
       const evalInputs: Array<{ pos: typeof actionable[0]; collaterals: any[]; debts: any[] }> = [];
@@ -605,7 +638,7 @@ async function main(): Promise<void> {
   // stream to correlate responses on), which is the standard split for this
   // reason: WS for subscriptions, HTTP for bulk/concurrent reads. Stateless, so
   // no reconnect handling needed — created once, used for the process lifetime.
-  attachCallLimiter(httpProvider, CONFIG.rpcCallsPerSecond);
+  callLimiter = attachCallLimiter(httpProvider, CONFIG.rpcCallsPerSecond, CONFIG.rpcMaxQueueMs);
   const getReadProvider = (): ethers.JsonRpcProvider => httpProvider;
 
   try {
@@ -622,25 +655,48 @@ async function main(): Promise<void> {
   }
 
   const wallet = new ethers.Wallet(CONFIG.privateKey, provider);
-  const ethBal = await httpProvider.getBalance(wallet.address); // FIX: reuse existing provider, don't leak a new one
-  logger.info(`Wallet: ${wallet.address} | ETH: ${ethers.formatEther(ethBal)}`);
-  if (ethBal < ethers.parseEther("0.05")) {
-    logger.warn("⚠️  Low ETH balance — top up (need ≥0.05 ETH for gas)");
+
+  // The floor below which no liquidation can be submitted at all. The node
+  // reserves gasLimit × maxFeePerGas when it validates the transaction, so this
+  // mirrors the executor's own pre-flight arithmetic rather than guessing.
+  const worstCaseGasLimit = BigInt(CONFIG.gasLimitBuffer) + 265_000n + 120_000n * 3n;
+  const maxFeeCeiling     = BigInt(Math.round(CONFIG.maxGasGwei * 1e9));
+  const MIN_EXECUTABLE_WEI = worstCaseGasLimit * maxFeeCeiling;
+
+  function assessBalance(bal: bigint): void {
+    const wasStarved = gasStarved;
+    gasStarved = bal < MIN_EXECUTABLE_WEI;
+    if (gasStarved) {
+      // Escalated from warn to error. A bot that cannot pay for a transaction is
+      // not degraded, it is non-functional: every opportunity it finds is dropped
+      // at the executor's pre-flight check, which is exactly how a run reaches
+      // "liquidatable=17587 executed=0" without a single error in the log.
+      logger.error(
+        `⛔ ETH balance ${ethers.formatEther(bal)} is below the ${ethers.formatEther(MIN_EXECUTABLE_WEI)} ` +
+        `needed to fund one liquidation — NO liquidation can be submitted until you top up. ` +
+        `Detection continues; execution does not.`
+      );
+    } else if (bal < MIN_EXECUTABLE_WEI * 5n) {
+      logger.warn(`⚠️  ETH balance low: ${ethers.formatEther(bal)} ETH (${ethers.formatEther(MIN_EXECUTABLE_WEI)} per tx)`);
+    } else if (wasStarved) {
+      logger.info(`✅ ETH balance restored: ${ethers.formatEther(bal)} ETH — execution re-enabled`);
+    }
   }
 
+  const ethBal = await httpProvider.getBalance(wallet.address); // FIX: reuse existing provider, don't leak a new one
+  logger.info(`Wallet: ${wallet.address} | ETH: ${ethers.formatEther(ethBal)}`);
+  assessBalance(ethBal);
+
   // FIX: Periodic ETH balance check — startup check only fires once, but balance
-  // can drain over hours via failed txs or gas price spikes. Re-check every 15 min.
+  // can drain over hours via failed txs or gas price spikes.
+  // Shortened 15 min → 5 min so the gas-starved state is noticed within one
+  // heartbeat rather than three.
   setInterval(async () => {
     if (shuttingDown) return;
     try {
-      const bal = await httpProvider.getBalance(wallet.address);
-      if (bal < ethers.parseEther("0.02")) {
-        logger.warn(`⚠️  ETH balance critically low: ${ethers.formatEther(bal)} ETH — top up now`);
-      } else if (bal < ethers.parseEther("0.05")) {
-        logger.warn(`⚠️  ETH balance low: ${ethers.formatEther(bal)} ETH`);
-      }
+      assessBalance(await httpProvider.getBalance(wallet.address));
     } catch { /* ignore — provider may be reconnecting */ }
-  }, 15 * 60_000);
+  }, 5 * 60_000);
 
   // PositionTracker/AaveOracle/Evaluator do only reads (multicall, price fetches) —
   // route them through the HTTP provider. TriggerEngine below keeps the WS
@@ -769,7 +825,10 @@ async function main(): Promise<void> {
   const DORMANT_WAKE_INTERVAL_MS = 5 * 60 * 1000;
   setInterval(() => {
     if (shuttingDown) return;
-    tracker.wakeExpiredDormant();
+    // The interval is passed in so the wake budget can be sized against the
+    // recheck window instead of a fixed 500 that silently stopped honouring it
+    // once the dormant tier passed ~6 000 entries.
+    tracker.wakeExpiredDormant(DORMANT_WAKE_INTERVAL_MS);
   }, DORMANT_WAKE_INTERVAL_MS);
 
   await trigger.start().catch(e => logger.warn(`Trigger engine start failed: ${e?.message ?? e}`));

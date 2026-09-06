@@ -84,9 +84,19 @@ export class AaveOracle {
           priceCache.set(key, { price: prices[i]!, ts: now });
         }
       } catch (batchErr: any) {
-        // If provider was destroyed, serve stale prices immediately — don't fire N individual calls
-        if ((batchErr.code === 'UNSUPPORTED_OPERATION' || /provider destroyed|cancelled request/i.test(batchErr.message ?? ''))) {
-          logger.debug(`Oracle batch aborted (provider destroyed) — serving stale/zero prices`);
+        // If provider was destroyed, serve stale prices immediately — don't fire N individual calls.
+        //
+        // RPC_BACKPRESSURE belongs in the same branch, and its absence was an
+        // amplifier: the batch was shed precisely BECAUSE the call budget was
+        // exhausted, and the per-asset fallback answered that by queueing 15
+        // more calls — nearly four seconds of budget at 4 calls/sec — which
+        // deepened the backlog that shed the batch in the first place. The
+        // "Batch oracle failed for 15 assets" line in the logs always landed
+        // moments before a burst of cycle safety timeouts, which is that loop.
+        if (batchErr.code === "RPC_BACKPRESSURE"
+            || batchErr.code === 'UNSUPPORTED_OPERATION'
+            || /provider destroyed|cancelled request/i.test(batchErr.message ?? '')) {
+          logger.debug(`Oracle batch aborted (${batchErr.code ?? "provider destroyed"}) — serving stale/zero prices`);
           for (const addr of toFetch) {
             const stale = priceCache.get(addr);
             fresh.set(addr, stale?.price ?? 0n);
@@ -152,6 +162,25 @@ export class AaveOracle {
   private static readonly HISTORY_TTL_MS  = 16 * 60_000; // keep 16 min of history
   static readonly PRICE_DROP_THRESHOLD    = 0.02;         // 2% drop over any window triggers wake
 
+  // Latch per asset: the price a drop was last reported at.
+  //
+  // Without this, a drop stays "detected" for as long as its reference snapshot
+  // remains in the history window. A single 2.2% ARB move at 21:23 was therefore
+  // re-reported on every prefetch tick for the following 15 minutes — the log
+  // shows the identical "0.1248 → 0.1220" line five times in 64 seconds — and
+  // each report re-ran the full wake path, churning hundreds of dormant
+  // positions back into the active set over and over for one price move that had
+  // already been handled the first time.
+  //
+  // A drop is reported once. It is reported again only if the price makes a NEW
+  // low below the latched level (genuinely new information), or if the price has
+  // recovered above it, which re-arms the detector for the next move.
+  private _dropLatch = new Map<string, bigint>();
+  // Recovery band: the price must climb this far back above the latched low
+  // before the asset re-arms, so a price oscillating around the latch doesn't
+  // re-fire on every tick.
+  private static readonly DROP_REARM_BPS = 50n; // +0.5%
+
   // Returns assets that dropped >= threshold over ANY of the check windows.
   async prefetchAllPricesWithDropDetection(): Promise<{
     prices:        Map<string, bigint>;
@@ -191,6 +220,12 @@ export class AaveOracle {
         if (newPrice < ref.price) {
           const dropBps = Number((ref.price - newPrice) * 10_000n / ref.price);
           if (dropBps >= AaveOracle.PRICE_DROP_THRESHOLD * 10_000) {
+            // Already reported at or below this price — the wake for it has
+            // happened, and repeating it just churns the dormant tier.
+            const latched = this._dropLatch.get(key);
+            if (latched !== undefined && newPrice >= latched) break;
+
+            this._dropLatch.set(key, newPrice);
             droppedAssets.add(key);
             const windowMin = (windowMs / 60_000).toFixed(0);
             logger.info(
@@ -201,6 +236,14 @@ export class AaveOracle {
             break; // one window match is enough — no need to check longer windows
           }
         }
+      }
+
+      // Re-arm once the price has recovered clear of the latched low, so the
+      // next genuine drop is reported normally.
+      const latched = this._dropLatch.get(key);
+      if (latched !== undefined) {
+        const rearmAt = latched + (latched * AaveOracle.DROP_REARM_BPS) / 10_000n;
+        if (newPrice > rearmAt) this._dropLatch.delete(key);
       }
     }
 
