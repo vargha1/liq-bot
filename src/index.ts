@@ -83,12 +83,6 @@ async function main(): Promise<void> {
   // during startup, read by the cycle loop and the heartbeat.
   let callLimiter: CallLimiterHandle | null = null;
 
-  // True once the wallet cannot fund even a single liquidation. Nothing the bot
-  // detects can be acted on in that state, so it must be loud rather than a
-  // warning buried between heartbeats — the observed run sat at 0.00054 ETH for
-  // hours while cheerfully reporting "liquidatable=17587 executed=0".
-  let gasStarved = false;
-
   // ── Services (initialised once, survive reconnects) ───────────────────────
   let tracker:   PositionTracker;
   let reserveRegistry: ReserveRegistry;
@@ -136,8 +130,7 @@ async function main(): Promise<void> {
       `executed=${executed} | profit=$${totalProfitUsd.toFixed(2)} | ` +
       `watching=${tracker?.size ?? 0} dormant=${tracker?.dormantSize ?? 0}` +
       (cov ? ` model=${cov.modelled}/${cov.total}` : "") +
-      dangerStr + rpcStr +
-      (gasStarved ? " | ⛔ GAS-STARVED: cannot execute" : "")
+      dangerStr + rpcStr
     );
     // Measured model-vs-chain drift. This is the number the fire/confirm
     // decision is derived from, so it belongs where an operator will see it
@@ -660,47 +653,29 @@ async function main(): Promise<void> {
 
   const wallet = new ethers.Wallet(CONFIG.privateKey, provider);
 
-  // The floor below which no liquidation can be submitted at all. The node
-  // reserves gasLimit × maxFeePerGas when it validates the transaction, so this
-  // mirrors the executor's own pre-flight arithmetic rather than guessing.
-  const worstCaseGasLimit = BigInt(CONFIG.gasLimitBuffer) + 265_000n + 120_000n * 3n;
-  const maxFeeCeiling     = BigInt(Math.round(CONFIG.maxGasGwei * 1e9));
-  const MIN_EXECUTABLE_WEI = worstCaseGasLimit * maxFeeCeiling;
-
-  function assessBalance(bal: bigint): void {
-    const wasStarved = gasStarved;
-    gasStarved = bal < MIN_EXECUTABLE_WEI;
-    if (gasStarved) {
-      // Escalated from warn to error. A bot that cannot pay for a transaction is
-      // not degraded, it is non-functional: every opportunity it finds is dropped
-      // at the executor's pre-flight check, which is exactly how a run reaches
-      // "liquidatable=17587 executed=0" without a single error in the log.
-      logger.error(
-        `⛔ ETH balance ${ethers.formatEther(bal)} is below the ${ethers.formatEther(MIN_EXECUTABLE_WEI)} ` +
-        `needed to fund one liquidation — NO liquidation can be submitted until you top up. ` +
-        `Detection continues; execution does not.`
-      );
-    } else if (bal < MIN_EXECUTABLE_WEI * 5n) {
-      logger.warn(`⚠️  ETH balance low: ${ethers.formatEther(bal)} ETH (${ethers.formatEther(MIN_EXECUTABLE_WEI)} per tx)`);
-    } else if (wasStarved) {
-      logger.info(`✅ ETH balance restored: ${ethers.formatEther(bal)} ETH — execution re-enabled`);
-    }
-  }
-
   const ethBal = await httpProvider.getBalance(wallet.address); // FIX: reuse existing provider, don't leak a new one
   logger.info(`Wallet: ${wallet.address} | ETH: ${ethers.formatEther(ethBal)}`);
-  assessBalance(ethBal);
 
-  // FIX: Periodic ETH balance check — startup check only fires once, but balance
-  // can drain over hours via failed txs or gas price spikes.
-  // Shortened 15 min → 5 min so the gas-starved state is noticed within one
-  // heartbeat rather than three.
-  setInterval(async () => {
-    if (shuttingDown) return;
-    try {
-      assessBalance(await httpProvider.getBalance(wallet.address));
-    } catch { /* ignore — provider may be reconnecting */ }
-  }, 5 * 60_000);
+  // No balance threshold is checked here, deliberately.
+  //
+  // Every version of this warning has been wrong about Arbitrum. The original
+  // used 0.05/0.02 ETH — figures borrowed from mainnet, where they are sane and
+  // here are roughly $125/$50 for a transaction that costs two or three cents.
+  // It was then replaced with gasLimit × CONFIG.maxGasGwei, which is worse in a
+  // subtler way: maxGasGwei is the 2 gwei SANITY CAP used to reject bogus
+  // L1-style estimates (see sanitizeGasPrice), not a fee anyone actually pays.
+  // Arbitrum runs at 0.01-0.1 gwei, so that priced the floor 20-200x too high
+  // and declared a perfectly fundable wallet unable to execute.
+  //
+  // Any constant here is a guess about a number the executor already knows
+  // exactly. Executor._executeOne reserves gasLimit × the LIVE maxFeePerGas for
+  // each in-flight transaction and refuses to submit when the balance cannot
+  // cover it, logging the real requirement and the real balance at error level.
+  // That check runs at submission time with actual values, so it cannot be
+  // miscalibrated — and it is the only place the answer matters.
+  if (ethBal === 0n) {
+    logger.warn("Wallet holds no ETH — the executor will refuse every submission until it is funded.");
+  }
 
   // PositionTracker/AaveOracle/Evaluator do only reads (multicall, price fetches) —
   // route them through the HTTP provider. TriggerEngine below keeps the WS
