@@ -2,16 +2,26 @@
 //
 //   npx tsx src/checkModel.ts <rpcUrl> <borrower> [borrower...]
 //
-// For each borrower it computes the health factor from the model — scaled
-// balances × reserve indices, e-mode aware — and compares it to
-// Pool.getUserAccountData(). They should agree to well under a basis point.
+// For each borrower it computes the health factor through the SAME code path the
+// trigger engine fires on — PositionTracker.evaluateUserState, reached via
+// evaluateStateForDiagnostics — and compares it to Pool.getUserAccountData().
 //
-// The model is what the trigger engine fires on, so a drift here is a wrong
-// liquidation decision. Run this after any Aave upgrade.
+// This previously re-implemented the health-factor formula inline. That made it
+// a second opinion rather than a test: the copy could agree with Aave perfectly
+// while the code that actually commits gas disagreed, and any fix applied to one
+// silently left the other behind. Both now share one implementation, so a clean
+// run here is evidence about the real fire path.
+//
+// Prices are read authoritatively from the oracle, so this isolates ARITHMETIC
+// drift. It deliberately says nothing about the hot path's price snapshot, which
+// mixes ratio estimates with TTL-stale entries — that error is measured live and
+// continuously by ModelErrorTracker instead. If this reports ~0 bps and the
+// trigger still sees disagreement, the difference is prices, not maths.
 import { ethers } from "ethers";
 import { AAVE_POOL, AAVE_POOL_ABI, UI_POOL_DATA_PROVIDER, UI_POOL_DATA_PROVIDER_ABI,
          POOL_ADDRESSES_PROVIDER, AAVE_ORACLE, ORACLE_ABI } from "./config";
-import { ReserveRegistry, RAY } from "./reserveState";
+import { ReserveRegistry } from "./reserveState";
+import { PositionTracker, type UserReserveSnapshot } from "./positions";
 
 async function main() {
   const rpcUrl = process.argv[2];
@@ -29,10 +39,14 @@ async function main() {
   const ui     = new ethers.Contract(UI_POOL_DATA_PROVIDER, UI_POOL_DATA_PROVIDER_ABI, provider);
   const oracle = new ethers.Contract(AAVE_ORACLE, ORACLE_ABI, provider);
 
+  // The production evaluator lives on PositionTracker; construct one purely to
+  // reach it. No seeding, no event monitoring — nothing but the model maths.
+  const tracker = new PositionTracker(() => provider, registry);
+
   const addrs = registry.addresses();
   const rawPrices: bigint[] = await oracle.getAssetsPrices(addrs);
   const prices = new Map<string, bigint>();
-  for (let i = 0; i < addrs.length; i++) prices.set(addrs[i]!, rawPrices[i]!);
+  for (let i = 0; i < addrs.length; i++) prices.set(addrs[i]!.toLowerCase(), rawPrices[i]!);
 
   let worstDriftBps = 0;
 
@@ -41,50 +55,67 @@ async function main() {
     const emodeId = Number(emodeIdRaw);
     await registry.ensureEModes([emodeId]);
 
-    const nowSec = Math.floor(Date.now() / 1000);
-    let num = 0n, den = 0n;
-    const lines: string[] = [];
-
+    // Build exactly the state refreshUserStates would have stored.
+    const snapshots: UserReserveSnapshot[] = [];
     for (const ur of userReserves) {
-      const asset = (ur.underlyingAsset as string).toLowerCase();
-      const rs = registry.get(asset);
-      if (!rs) continue;
-      const price = prices.get(asset) ?? 0n;
-      const unit  = BigInt(10 ** rs.decimals);
-
-      if (ur.usageAsCollateralEnabledOnUser && (ur.scaledATokenBalance as bigint) > 0n) {
-        const bal  = ((ur.scaledATokenBalance as bigint) * registry.normalizedIncome(rs, nowSec)) / RAY;
-        const usd8 = (price * bal) / unit;
-        const lt   = BigInt(registry.effectiveLiquidationThreshold(rs, emodeId));
-        num += usd8 * lt;
-        lines.push(`    col  ${rs.symbol.padEnd(7)} $${(Number(usd8) / 1e8).toFixed(2).padStart(12)}  LT=${lt}`);
-      }
-      if ((ur.scaledVariableDebt as bigint) > 0n) {
-        const bal  = ((ur.scaledVariableDebt as bigint) * registry.normalizedVariableDebt(rs, nowSec)) / RAY;
-        const usd8 = (price * bal) / unit;
-        den += usd8;
-        lines.push(`    debt ${rs.symbol.padEnd(7)} $${(Number(usd8) / 1e8).toFixed(2).padStart(12)}`);
-      }
+      const scaledATokenBalance = ur.scaledATokenBalance as bigint;
+      const scaledVariableDebt  = ur.scaledVariableDebt as bigint;
+      if (scaledATokenBalance === 0n && scaledVariableDebt === 0n) continue;
+      snapshots.push({
+        asset:             (ur.underlyingAsset as string).toLowerCase(),
+        scaledATokenBalance,
+        usageAsCollateral: ur.usageAsCollateralEnabledOnUser as boolean,
+        scaledVariableDebt,
+      });
     }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const evaluated = tracker.evaluateStateForDiagnostics(
+      { reserves: snapshots, emodeId, fetchedAt: Date.now() },
+      prices,
+      nowSec,
+    );
 
     const acct = await pool.getUserAccountData(borrower);
     const chainHf = acct.healthFactor as bigint;
 
     console.log(`\n${borrower}  (e-mode ${emodeId})`);
-    for (const l of lines) console.log(l);
 
-    if (den === 0n) { console.log(`    model: no debt — nothing to compare`); continue; }
-    const modelHf = (num * 10n ** 18n) / (den * 10_000n);
+    if (!evaluated) {
+      console.log(`    model: not evaluable (missing price, unknown reserve, or no debt)`);
+      continue;
+    }
 
+    for (const c of evaluated.collaterals) {
+      const rs = registry.get(c.address);
+      const price = prices.get(c.address.toLowerCase()) ?? 0n;
+      const usd8 = (price * c.balance) / BigInt(10 ** c.decimals);
+      const lt = rs ? registry.effectiveLiquidationThreshold(rs, emodeId) : 0;
+      console.log(`    col  ${c.symbol.padEnd(7)} $${(Number(usd8) / 1e8).toFixed(2).padStart(12)}  LT=${lt}`);
+    }
+    for (const d of evaluated.debts) {
+      const price = prices.get(d.address.toLowerCase()) ?? 0n;
+      const usd8 = (price * d.balance) / BigInt(10 ** d.decimals);
+      console.log(`    debt ${d.symbol.padEnd(7)} $${(Number(usd8) / 1e8).toFixed(2).padStart(12)}`);
+    }
+
+    const modelHf = evaluated.hfE18;
     const chainNum = Number(chainHf) / 1e18;
     const modelNum = Number(modelHf) / 1e18;
     const driftBps = chainNum > 0 ? Math.abs(modelNum - chainNum) / chainNum * 10_000 : 0;
     worstDriftBps = Math.max(worstDriftBps, driftBps);
 
-    const verdict = driftBps < 5 ? "OK" : driftBps < 50 ? "CLOSE" : "MISMATCH";
+    const verdict = driftBps < 0.1 ? "EXACT" : driftBps < 5 ? "OK" : driftBps < 50 ? "CLOSE" : "MISMATCH";
     console.log(
-      `    model HF = ${modelNum.toFixed(6)}   chain HF = ${chainNum.toFixed(6)}   ` +
-      `drift = ${driftBps.toFixed(3)} bps   ${verdict}`
+      `    model HF = ${modelNum.toFixed(8)}   chain HF = ${chainNum.toFixed(8)}   ` +
+      `drift = ${driftBps.toFixed(4)} bps   ${verdict}`
+    );
+    // Totals are a sharper diagnostic than the health factor alone: a
+    // collateral or debt mismatch points at balances or prices, while matching
+    // totals with a drifting HF points at the threshold/rounding step.
+    console.log(
+      `    model collateral=$${(Number(evaluated.collateralUsd8) / 1e8).toFixed(2)} ` +
+      `debt=$${(Number(evaluated.debtUsd8) / 1e8).toFixed(2)}`
     );
     console.log(
       `    chain collateral=$${(Number(acct.totalCollateralBase) / 1e8).toFixed(2)} ` +
@@ -93,10 +124,14 @@ async function main() {
     );
   }
 
-  console.log(`\nworst drift: ${worstDriftBps.toFixed(3)} bps`);
-  console.log(worstDriftBps < 50
-    ? "Model agrees with Aave."
-    : "MODEL DIVERGES — investigate before trusting the trigger engine.");
+  console.log(`\nworst drift: ${worstDriftBps.toFixed(4)} bps`);
+  // The arithmetic is now a faithful replica of GenericLogic, so anything above
+  // rounding noise is a real defect rather than an accepted approximation.
+  console.log(worstDriftBps < 0.1
+    ? "Model is bit-exact with Aave (given identical prices)."
+    : worstDriftBps < 50
+      ? "Model agrees, but not exactly — investigate the residual."
+      : "MODEL DIVERGES — investigate before trusting the trigger engine.");
   process.exit(0);
 }
 

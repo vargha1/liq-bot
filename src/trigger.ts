@@ -46,6 +46,7 @@ import type { Evaluator } from "./evaluator";
 import type { Executor } from "./executor";
 import { metrics } from "./metrics";
 import { SequencerFeedWatcher, type FeedHint } from "./sequencerFeed";
+import { ModelErrorTracker } from "./modelError";
 
 // Chainlink AggregatorInterface — roundId is uint256, NOT int256. The canonical
 // signature decides the topic hash, so getting this wrong silently matches zero
@@ -77,8 +78,9 @@ const FEED_RERESOLVE_MS = 6 * 60 * 60_000;  // 6 hours
 // submit at "the first plausible crossing". That reasoning belonged to the old
 // model, which used stale cached breakdowns and static thresholds. The current
 // model reads scaled balances against live indices and e-mode categories and
-// agrees with getUserAccountData to 0.000 bps, so anything at or above 1.0 is
-// simply not liquidatable: Aave reverts with HealthFactorNotBelowThreshold()
+// agrees with getUserAccountData exactly given the same prices, so anything at
+// or above 1.0 is simply not liquidatable: Aave reverts with
+// HealthFactorNotBelowThreshold()
 // after burning ~350k gas on the flashloan. Every fire in the first live run
 // (HF 1.0007 … 1.0075) was a guaranteed revert for this reason.
 //
@@ -94,6 +96,13 @@ const FIRE_DEDUPE_MS = 2_000;
 interface BuiltOpp {
   key:     string;
   hfLocal: number;
+  // The exact model health factor, captured at BUILD time. Two reasons it is
+  // carried rather than derived from hfLocal: the confidence comparison used to
+  // round-trip an exact bigint through a float and back, and confirmHealthFactors
+  // overwrites pos.healthFactor in place, so by the time a confirmation returns
+  // the original model value is gone — which is precisely the value the error
+  // measurement needs.
+  hfE18:   bigint;
   opp:     ReturnType<Evaluator["buildFromLocal"]>;
 }
 
@@ -106,6 +115,10 @@ export class TriggerEngine {
   // matching log. The gap between the two IS the pre-block lead (trig.feedLead).
   private feedSeenAt   = new Map<string, number>();
   private refreshThrottle = new Map<string, number>();// asset → last forced-refresh ts
+
+  // Measured model-vs-chain disagreement, fed by every confirmation. Replaces
+  // the hardcoded TRIGGER_CONFIRM_HF as the basis for the fire decision.
+  readonly modelError = new ModelErrorTracker();
 
   private activeProvider: ethers.Provider | null = null;
   private logFilter: ethers.Filter | null = null;
@@ -472,28 +485,38 @@ export class TriggerEngine {
         const lastFire = this.firedAt.get(key);
         if (lastFire && now - lastFire < FIRE_DEDUPE_MS) continue;  // dedupe multi-feed bursts
 
+        // Captured before buildFromLocal or any later confirmation can mutate it.
+        const hfE18 = cand.pos.healthFactor;
+
         const opp = this.evaluator.buildFromLocal(
           cand.pos, cand.collaterals, cand.debts, prices, gasPrice, ethPrice,
         );
         if (!opp) continue;
-        built.push({ key, hfLocal: cand.hfLocal, opp });
+        built.push({ key, hfLocal: cand.hfLocal, hfE18, opp });
       }
       built.sort((a, b) => b.opp!.netProfitUsd - a.opp!.netProfitUsd);
 
-      // Split by confidence. The local HF is computed from a price snapshot that
-      // mixes ratio estimates with TTL-stale entries, so it carries low tens of
-      // bps of error. Well below 1.0 that error cannot change the answer and we
-      // fire immediately — the whole point of the engine. Close to 1.0 it can,
-      // and did: two fires at 0.9997/0.9992 met a real 1.0010/1.0014 and both
-      // reverted. Those get one authoritative multicall first, which costs
-      // ~50-100ms on positions that have been sitting near the threshold for
-      // minutes.
-      const confidentCut = BigInt(Math.round(CONFIG.triggerConfirmHf * 1e18));
-      const confident = built.filter(b => BigInt(Math.round(b.hfLocal * 1e18)) < confidentCut);
-      const marginal  = built.filter(b => BigInt(Math.round(b.hfLocal * 1e18)) >= confidentCut);
+      // Split by confidence — see shouldFireBlind for the decision rule. The
+      // old split was a single hardcoded health-factor cut applied to every
+      // candidate regardless of what it was worth; a $954 opportunity and a
+      // $0.89 one were treated identically even though a revert costs the same
+      // couple of cents in both cases.
+      const confident: BuiltOpp[] = [];
+      const marginal:  BuiltOpp[] = [];
+      for (const b of built) (this.shouldFireBlind(b) ? confident : marginal).push(b);
 
       const fired = this.fireAll(confident, now);
       if (marginal.length > 0) this.confirmThenFire(marginal, now);
+
+      // Samples only ever arrive from the marginal band, so the measured
+      // distribution describes the region near 1.0 and says nothing about the
+      // region the engine actually fires blind in. Confirm a small random slice
+      // of confident fires purely to observe them — the fire already went out
+      // above, so this costs one batched read and no latency, and it is what
+      // keeps the distribution from being silently censored.
+      if (confident.length > 0 && Math.random() < CONFIG.triggerAuditRate) {
+        this.auditSample(confident);
+      }
 
       this.pruneFiredAt(now);
       logger.debug(
@@ -503,6 +526,70 @@ export class TriggerEngine {
     } finally {
       stop();
     }
+  }
+
+  // Should this opportunity be fired without an authoritative confirmation?
+  //
+  // Two quantities decide it, and neither is a fixed health-factor cut.
+  //
+  // 1. How likely the fire is to LAND. A blind fire at localHF succeeds exactly
+  //    when localHF·(1+e) < 1, i.e. when the model error e is below the headroom
+  //    1/localHF − 1. ModelErrorTracker holds the empirical distribution of e
+  //    measured from real confirmations, so that probability is read directly
+  //    rather than assumed.
+  //
+  // 2. What a miss actually costs. On Arbitrum a revert is ~350k gas — cents —
+  //    against bonuses in dollars, so on pure expected value a large opportunity
+  //    is worth firing at surprisingly low confidence. What makes reverts
+  //    genuinely expensive is not the gas but the executor slot: with only
+  //    maxConcurrentExecutions in flight, a reverting transaction during a
+  //    cascade displaces a real liquidation. That cost is zero when the executor
+  //    is idle and severe when it is saturated, so it is priced from live
+  //    occupancy instead of being baked into a constant.
+  //
+  // Fire blind when P(land) clears the break-even probability
+  //     cost / (net + cost),  cost = gas + slotPressure·net
+  // which collapses to "almost always" for a valuable opportunity on an idle
+  // executor, and to "confirm first" for a marginal one when slots are scarce.
+  private shouldFireBlind(b: BuiltOpp): boolean {
+    const hfLocal = b.hfLocal;
+    if (!(hfLocal > 0) || hfLocal >= 1) return false;
+
+    // Absolute rail, independent of statistics. A degenerate sample window
+    // (every observation identical, say) must not be able to authorise a fire
+    // arbitrarily close to the threshold.
+    if (hfLocal > CONFIG.triggerBlindMaxHf) return false;
+
+    const headroom = 1 / hfLocal - 1;
+    const pLand = this.modelError.cdf(headroom);
+    if (pLand === null) {
+      // Too few samples to trust the distribution — fall back to the static
+      // threshold this mechanism replaces.
+      return hfLocal < CONFIG.triggerConfirmHf;
+    }
+
+    const net = Math.max(b.opp!.netProfitUsd, 0);
+    if (net <= 0) return false;
+    const gas = Math.max(b.opp!.gasCostUsd, 0.01);
+    const slotPressure = CONFIG.maxConcurrentExecutions > 0
+      ? Math.min(1, this.executor.inFlightCount / CONFIG.maxConcurrentExecutions)
+      : 0;
+    const costOfRevert = gas + slotPressure * net;
+    const breakEvenP   = costOfRevert / (net + costOfRevert);
+
+    return pLand >= breakEvenP;
+  }
+
+  // Confirm a slice of already-fired candidates purely to record error samples.
+  // Never fires anything: the opportunities went out before this ran.
+  private auditSample(confident: BuiltOpp[]): void {
+    const pick = confident[Math.floor(Math.random() * confident.length)]!;
+    this.tracker.confirmHealthFactors([pick.key])
+      .then(confirmed => {
+        const hf = confirmed.get(pick.key);
+        if (hf !== undefined) this.modelError.record(pick.hfE18, hf);
+      })
+      .catch(() => { /* sampling is best-effort */ });
   }
 
   // Dispatch a pre-sorted list, respecting executor capacity.
@@ -541,6 +628,25 @@ export class TriggerEngine {
     const addresses = marginal.map(m => m.key);
     this.tracker.confirmHealthFactors(addresses)
       .then(confirmed => {
+        // Every confirmation is a free, perfectly-matched observation of how far
+        // the model was from the chain. This is the only place such pairs exist,
+        // and they used to be discarded the moment the fire/skip decision was made.
+        for (const m of marginal) {
+          const hf = confirmed.get(m.key);
+          if (hf !== undefined) this.modelError.record(m.hfE18, hf);
+        }
+
+        // An empty result means the multicall failed, not that every candidate
+        // is healthy. Silently dropping the whole batch at debug level hid that
+        // completely — and RPC backpressure makes it reachable during exactly
+        // the load spike a cascade produces.
+        if (confirmed.size === 0 && marginal.length > 0) {
+          logger.warn(
+            `trigger: confirmation returned nothing for ${marginal.length} marginal ` +
+            `candidate(s) — dropping them unfired (RPC failure or shed call)`
+          );
+          return;
+        }
         if (!this.canFire()) return;
         const survivors: BuiltOpp[] = [];
         for (const m of marginal) {

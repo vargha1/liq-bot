@@ -154,12 +154,28 @@ export const CONFIG = {
   // correctness. Turn it on once you have watched the logs confirm it matching.
   sequencerFeedEnabled: opt("SEQUENCER_FEED_ENABLED", "false") === "true",
   sequencerFeedUrl:     opt("SEQUENCER_FEED_URL", "wss://arb1.arbitrum.io/feed"),
-  // Local health factor below which the trigger fires WITHOUT an authoritative
-  // check. The hot-path price snapshot mixes ratio estimates with TTL-stale
-  // entries, so the local figure carries low tens of bps of error; below this
-  // cut that cannot change the verdict. At or above it, one getUserAccountData
-  // multicall confirms before any gas is committed.
+  // FALLBACK ONLY, used until the bot has measured its own model error.
+  //
+  // This was the sole basis for the fire/confirm decision: fire blind below it,
+  // confirm above it. Two problems. It was calibrated from two observed failures
+  // in calm conditions, and it expresses the answer in health-factor units when
+  // the underlying error is a PRICE error whose health-factor impact depends on
+  // the position — for a single-collateral, single-debt borrower the gain is
+  // 1.0, undamped, so no single constant fits every position or every regime.
+  //
+  // The decision now comes from ModelErrorTracker's measured distribution plus
+  // the opportunity's own economics (see TriggerEngine.shouldFireBlind). This
+  // value only applies before minSamples confirmations have accumulated.
   triggerConfirmHf:     parseFloat(opt("TRIGGER_CONFIRM_HF", "0.995")),
+  // Absolute rail: never fire without confirmation above this local health
+  // factor, whatever the measured distribution says. Guards against a
+  // degenerate sample window authorising a fire arbitrarily close to 1.0.
+  triggerBlindMaxHf:    parseFloat(opt("TRIGGER_BLIND_MAX_HF", "0.999")),
+  // Probability that a dispatch which fired blind also issues a confirmation
+  // purely to record an error sample. Without it the measured distribution is
+  // censored — it would only ever see the marginal band it was used to gate,
+  // and never the region where fires actually happen. Costs one batched read.
+  triggerAuditRate:     parseFloat(opt("TRIGGER_AUDIT_RATE", "0.02")),
 } as const;
 
 // ─── Aave V3 Arbitrum core addresses ─────────────────────────────────────────
