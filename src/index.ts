@@ -139,6 +139,10 @@ async function main(): Promise<void> {
       dangerStr + rpcStr +
       (gasStarved ? " | ⛔ GAS-STARVED: cannot execute" : "")
     );
+    // Measured model-vs-chain drift. This is the number the fire/confirm
+    // decision is derived from, so it belongs where an operator will see it
+    // rather than only inside the decision that consumes it.
+    trigger?.modelError.logSummary();
   }, 300_000);
 
   // ════════════════════════════════════════════════════════════════════════════

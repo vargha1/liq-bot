@@ -10,7 +10,7 @@ import {
   CONFIG,
 } from "./config";
 import type { BorrowerPosition, AssetPosition } from "./types";
-import { ReserveRegistry, RAY, TOPIC_RESERVE_DATA_UPDATED } from "./reserveState";
+import { ReserveRegistry, RAY, TOPIC_RESERVE_DATA_UPDATED, rayMul, healthFactorExact } from "./reserveState";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const HF_ONE   = 10n ** 18n;
@@ -199,14 +199,14 @@ interface BreakdownEntry {
 // This is what lets the trigger engine recompute health factors for the entire
 // watchlist, from memory, on every price tick — with no RPC and no dependence on
 // a per-position breakdown having been pre-warmed.
-interface UserReserveSnapshot {
+export interface UserReserveSnapshot {
   asset:               string;   // lowercase
   scaledATokenBalance: bigint;
   usageAsCollateral:   boolean;
   scaledVariableDebt:  bigint;
 }
 
-interface UserState {
+export interface UserState {
   reserves:  UserReserveSnapshot[];  // only reserves the user actually touches
   emodeId:   number;
   fetchedAt: number;                 // ms — for staleness reporting only
@@ -2190,8 +2190,8 @@ export class PositionTracker {
   } | null {
     const collaterals: AssetPosition[] = [];
     const debts:       AssetPosition[] = [];
-    let num = 0n;  // Σ collateralValue(USD8) × liquidationThreshold(bps)
-    let den = 0n;  // Σ debtValue(USD8)
+    let ltAccum = 0n;  // Σ collateralValue(USD8) × liquidationThreshold(bps)
+    let den     = 0n;  // Σ debtValue(USD8)
     let colUsd8Total = 0n;
 
     for (const r of state.reserves) {
@@ -2202,15 +2202,19 @@ export class PositionTracker {
       const unit = BigInt(10 ** reserve.decimals);
 
       if (r.usageAsCollateral && r.scaledATokenBalance > 0n) {
-        const balance = (r.scaledATokenBalance * this.reserves.normalizedIncome(reserve, nowSec)) / RAY;
+        // rayMul, matching _getUserBalanceInBaseCurrency's scaledBalance.rayMul(index).
+        const balance = rayMul(r.scaledATokenBalance, this.reserves.normalizedIncome(reserve, nowSec));
         if (balance > 0n) {
           const usd8 = (price * balance) / unit;
           colUsd8Total += usd8;
-          // E-mode aware: a position in a category uses the CATEGORY threshold,
-          // and only for assets inside that category's collateral bitmap —
-          // everything else contributes zero, exactly as on-chain.
+          // E-mode aware. A position in a category uses the CATEGORY threshold
+          // for assets inside that category's collateral bitmap; assets OUTSIDE
+          // it keep their own reserve threshold and still count as collateral.
+          // (Aave 3.2 "liquid e-mode" — the previous comment here claimed such
+          // assets contribute zero, which is neither what Aave does nor what
+          // effectiveLiquidationThreshold returns.)
           const lt = BigInt(this.reserves.effectiveLiquidationThreshold(reserve, state.emodeId));
-          num += usd8 * lt;
+          ltAccum += usd8 * lt;
           collaterals.push({
             symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals,
             balance, balanceUsd: 0,
@@ -2218,8 +2222,13 @@ export class PositionTracker {
         }
       }
 
+      // Stable debt is deliberately absent: the deployed UiPoolDataProvider's
+      // UserReserveData carries no stable fields (Aave 3.2 removed stable rate
+      // borrowing), which is also why the 4-field tuple in UI_POOL_DATA_PROVIDER_ABI
+      // decodes correctly. If a future upgrade reintroduces them this must be
+      // revisited, because omitted debt overstates the health factor.
       if (r.scaledVariableDebt > 0n) {
-        const balance = (r.scaledVariableDebt * this.reserves.normalizedVariableDebt(reserve, nowSec)) / RAY;
+        const balance = rayMul(r.scaledVariableDebt, this.reserves.normalizedVariableDebt(reserve, nowSec));
         if (balance > 0n) {
           den += (price * balance) / unit;
           debts.push({
@@ -2231,11 +2240,11 @@ export class PositionTracker {
     }
 
     if (den === 0n) return null;
-    // liquidationThreshold is in bps, so num carries an extra 1e4 that must be
-    // divided out.
     return {
       collaterals, debts,
-      hfE18: (num * HF_ONE) / (den * 10_000n),
+      // Bit-exact with GenericLogic: truncate the average threshold to whole
+      // bps first, then percentMul and wadDiv with half-up rounding.
+      hfE18: healthFactorExact(colUsd8Total, ltAccum, den),
       collateralUsd8: colUsd8Total,
       debtUsd8: den,
     };
@@ -2243,14 +2252,21 @@ export class PositionTracker {
 
   // Authoritative health factors for a handful of addresses, in one multicall.
   //
-  // The model is exact given exact prices (checkModel measures 0.000 bps drift),
-  // but the trigger's hot path feeds it snapshotAllPrices(), which mixes
-  // ratio-ESTIMATED prices with ones up to the cache TTL old, while Aave values
-  // every asset at one instant. In practice that is worth low tens of bps — two
-  // live fires computed 0.9997 and 0.9992 against a real 1.0010 and 1.0014, and
-  // both reverted with HealthFactorNotBelowThreshold(). Enough margin to matter
-  // only when the local figure is already close to 1.0, which is exactly when
-  // this is called.
+  // The model's ARITHMETIC is now a faithful replica of GenericLogic — Aave's
+  // rounding, the truncated average liquidation threshold, compounded debt
+  // interest — so given identical prices it agrees bit-for-bit and checkModel
+  // reports EXACT.
+  //
+  // What remains is the price input, not the maths. The trigger's hot path feeds
+  // the model snapshotAllPrices(), which mixes ratio-ESTIMATED prices with ones
+  // up to the cache TTL old, while Aave values every asset at one instant. Two
+  // live fires computed 0.9997 and 0.9992 against a real 1.0010 and 1.0014 and
+  // both reverted with HealthFactorNotBelowThreshold(); that is a ~13-22 bps
+  // price disagreement, far larger than any arithmetic term.
+  //
+  // Every call here therefore does double duty: it gates the fire, and it yields
+  // a matched (model, chain) pair that ModelErrorTracker uses to measure that
+  // residual rather than assume a constant for it.
   async confirmHealthFactors(addresses: string[]): Promise<Map<string, bigint>> {
     const out = new Map<string, bigint>();
     const targets = [...new Set(addresses.map(a => a.toLowerCase()))];
@@ -2284,6 +2300,22 @@ export class PositionTracker {
       logger.debug(`confirmHealthFactors failed: ${e?.message ?? e}`);
     }
     return out;
+  }
+
+  // Evaluate an arbitrary user state through the PRODUCTION health-factor path.
+  //
+  // Exposed for checkModel.ts, which previously re-implemented the formula
+  // inline. A validator that reimplements the thing it validates can agree with
+  // Aave perfectly while the code that actually fires disagrees — it was
+  // measuring a second opinion, not the model. Routing it through here means a
+  // clean checkModel run is evidence about the real fire path.
+  evaluateStateForDiagnostics(
+    state:  UserState,
+    prices: Map<string, bigint>,
+    nowSec: number = Math.floor(Date.now() / 1000),
+  ): { hfE18: bigint; collateralUsd8: bigint; debtUsd8: bigint;
+       collaterals: AssetPosition[]; debts: AssetPosition[] } | null {
+    return this.evaluateUserState(state, prices, nowSec);
   }
 
   // Health factor for one address straight from the model, or null if it can't

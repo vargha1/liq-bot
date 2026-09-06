@@ -26,6 +26,73 @@ import { AAVE_POOL, MULTICALL3, MULTICALL3_ABI, ADDRESS_TO_SYMBOL } from "./conf
 export const RAY = 10n ** 27n;
 const SECONDS_PER_YEAR = 31_536_000n;   // Aave's constant
 
+// ── Aave fixed-point primitives, replicated exactly ─────────────────────────
+// The model is only as trustworthy as its agreement with the chain, and the
+// chain rounds. Aave's WadRayMath and PercentageMath round HALF-UP; plain
+// TypeScript `/` on bigint truncates. Every place the two differ is a small
+// systematic bias in the model's favour or against it, and those biases are
+// exactly what a confidence margin is forced to absorb. Replicating the
+// operations removes them as a source of drift entirely, so any residual
+// disagreement with getUserAccountData is provably a price-input difference
+// rather than arithmetic.
+export const WAD                      = 10n ** 18n;
+const HALF_RAY                        = RAY / 2n;
+const PERCENTAGE_FACTOR               = 10_000n;
+const HALF_PERCENTAGE_FACTOR          = 5_000n;
+
+/** WadRayMath.rayMul — (a·b + HALF_RAY) / RAY */
+export function rayMul(a: bigint, b: bigint): bigint { return (a * b + HALF_RAY) / RAY; }
+/** PercentageMath.percentMul — (value·bps + 0.5e4) / 1e4 */
+export function percentMul(value: bigint, bps: bigint): bigint {
+  return (value * bps + HALF_PERCENTAGE_FACTOR) / PERCENTAGE_FACTOR;
+}
+/** WadRayMath.wadDiv — (a·WAD + b/2) / b */
+export function wadDiv(a: bigint, b: bigint): bigint { return (a * WAD + b / 2n) / b; }
+
+// MathUtils.calculateLinearInterest — used by getNormalizedIncome only.
+function calculateLinearInterest(rate: bigint, dt: bigint): bigint {
+  return RAY + (rate * dt) / SECONDS_PER_YEAR;
+}
+
+// MathUtils.calculateCompoundedInterest — the three-term binomial expansion
+// Aave uses for DEBT. Not interchangeable with the linear form above: debt
+// compounds, income does not. The bot previously applied the linear form to
+// both, which understates debt and therefore overstates every borrower's
+// health factor. The gap is small at typical rates and update frequencies, but
+// it is a one-directional bias on the exact quantity the fire decision reads,
+// and "small" is not a property worth trusting when it is this cheap to be
+// exact.
+function calculateCompoundedInterest(rate: bigint, dt: bigint): bigint {
+  if (dt === 0n) return RAY;
+  const expMinusOne = dt - 1n;
+  const expMinusTwo = dt > 2n ? dt - 2n : 0n;
+  const basePowerTwo   = rayMul(rate, rate) / (SECONDS_PER_YEAR * SECONDS_PER_YEAR);
+  const basePowerThree = rayMul(basePowerTwo, rate) / SECONDS_PER_YEAR;
+  const secondTerm = (dt * expMinusOne * basePowerTwo) / 2n;
+  const thirdTerm  = (dt * expMinusOne * expMinusTwo * basePowerThree) / 6n;
+  return RAY + (rate * dt) / SECONDS_PER_YEAR + secondTerm + thirdTerm;
+}
+
+// GenericLogic.calculateUserAccountData's final step, replicated exactly.
+//
+// Two details matter and neither is reproducible by a single division:
+//   1. avgLiquidationThreshold is computed as an integer division of the
+//      LT-weighted collateral sum by total collateral, so it TRUNCATES to whole
+//      basis points before being applied. Collapsing the whole expression into
+//      one fraction silently keeps that precision and yields a health factor
+//      slightly above the chain's.
+//   2. percentMul and wadDiv both round half-up.
+// `ltAccum` is Σ(collateralUsd8ᵢ × liquidationThresholdᵢ) in bps.
+export function healthFactorExact(
+  collateralUsd8: bigint,
+  ltAccum:        bigint,
+  debtUsd8:       bigint,
+): bigint {
+  if (debtUsd8 === 0n) return 2n ** 256n - 1n;   // Aave returns type(uint256).max
+  const avgLt = collateralUsd8 !== 0n ? ltAccum / collateralUsd8 : 0n;
+  return wadDiv(percentMul(collateralUsd8, avgLt), debtUsd8);
+}
+
 // Pool.getReserveData returns the full ReserveData struct. The configuration
 // bitmap inside it carries LT/bonus/decimals/flags, so this single call replaces
 // a separate getReserveConfigurationData round-trip per asset.
@@ -196,18 +263,21 @@ export class ReserveRegistry {
   // minutes gap between index refreshes the difference is ~1e-9 relative, far
   // below the margin of the 1.01 trigger ceiling — and it very slightly
   // UNDERSTATES debt, so it errs toward not firing rather than firing wrongly.
+  // ReserveLogic.getNormalizedIncome — LINEAR interest, then rayMul (half-up),
+  // not a truncating divide.
   normalizedIncome(state: ReserveState, nowSec: number): bigint {
     const dt = BigInt(Math.max(0, nowSec - state.lastUpdateTimestamp));
     if (dt === 0n) return state.liquidityIndex;
-    const linear = RAY + (state.liquidityRate * dt) / SECONDS_PER_YEAR;
-    return (linear * state.liquidityIndex) / RAY;
+    return rayMul(calculateLinearInterest(state.liquidityRate, dt), state.liquidityIndex);
   }
 
+  // ReserveLogic.getNormalizedDebt — COMPOUNDED interest. This used the linear
+  // form, which is the formula for income, not debt. See
+  // calculateCompoundedInterest above for why that direction of error matters.
   normalizedVariableDebt(state: ReserveState, nowSec: number): bigint {
     const dt = BigInt(Math.max(0, nowSec - state.lastUpdateTimestamp));
     if (dt === 0n) return state.variableBorrowIndex;
-    const linear = RAY + (state.variableBorrowRate * dt) / SECONDS_PER_YEAR;
-    return (linear * state.variableBorrowIndex) / RAY;
+    return rayMul(calculateCompoundedInterest(state.variableBorrowRate, dt), state.variableBorrowIndex);
   }
 
   // ── E-mode ─────────────────────────────────────────────────────────────────
