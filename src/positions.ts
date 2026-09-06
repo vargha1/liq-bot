@@ -505,6 +505,9 @@ export class PositionTracker {
 
   private setUserState(address: string, state: UserState): void {
     this.clearAssetIndex(address);
+    // Balances changed, so any cached health factor for this address describes a
+    // position that no longer exists. The skip bound must never be applied to it.
+    this.localHfCache.delete(address);
     this.userStates.set(address, state);
     for (const r of state.reserves) {
       let set = this.assetIndex.get(r.asset);
@@ -525,6 +528,7 @@ export class PositionTracker {
   private dropUserState(address: string): void {
     this.clearAssetIndex(address);
     this.userStates.delete(address);
+    this.localHfCache.delete(address);
   }
 
   // Bounded write path for the legacy breakdown cache. It previously had no
@@ -2215,6 +2219,8 @@ export class PositionTracker {
     if (candidates.size === 0) return out;
 
     const nowSec = Math.floor(Date.now() / 1000);
+    const nowMs  = Date.now();
+    let skipped = 0, evaluated_ = 0;
 
     for (const address of candidates) {
       if (this.badDebtDenylist.has(address)) continue;
@@ -2226,8 +2232,27 @@ export class PositionTracker {
       const isDormant = !this.positions.has(address);
       if (isDormant && !this.dormant.has(address)) continue;  // evicted entirely
 
+      // Cheap provable skip. This loop used to run a full health-factor
+      // recomputation for EVERY holder of the moved asset on EVERY price tick,
+      // and once the model reached full coverage that was ~16.8k positions —
+      // ETH/USD alone backs six reserves. Measured at 30ms p50 and 70ms max,
+      // synchronous, on the single event-loop thread that also handles blocks,
+      // WS heartbeats and receipt polling.
+      //
+      // The bound below is exact, not heuristic. With HF = N/D over collateral
+      // value N and debt value D, scaling each price by rᵢ gives
+      //   N' >= N · min(r over collateral)   and   D' <= D · max(r over debt)
+      // so HF' >= HF · min(r_collateral) / max(r_debt). If that floor is still
+      // at or above the ceiling, the position provably cannot have crossed and
+      // the recomputation would only confirm it.
+      if (this.canSkipLocalEval(address, state, prices, ceiling, nowMs)) { skipped++; continue; }
+
+      evaluated_++;
       const evaluated = this.evaluateUserState(state, prices, nowSec);
       if (!evaluated) continue;
+      // Cache the result against the prices that produced it, so the next tick
+      // can bound this position instead of recomputing it.
+      this.rememberLocalHf(address, state, prices, evaluated.hfE18, nowMs);
       const { collaterals, debts, hfE18, collateralUsd8, debtUsd8 } = evaluated;
       // Exclusive: Aave liquidates only when healthFactor < 1e18, so a position
       // exactly at the ceiling is not liquidatable either.
@@ -2270,8 +2295,78 @@ export class PositionTracker {
       out.push({ pos, collaterals, debts, hfLocal: Number(hfE18) / 1e18 });
     }
 
+    if (skipped > 0) {
+      logger.debug(`findLocalCandidates: ${evaluated_} evaluated, ${skipped} skipped by bound`);
+    }
     out.sort((a, b) => a.hfLocal - b.hfLocal);
     return out.slice(0, maxResults);
+  }
+
+  // ── Local-HF skip bound ────────────────────────────────────────────────────
+  // Cached health factor per address, together with the prices it was computed
+  // from. Cleared whenever the model entry changes (setUserState/dropUserState),
+  // because a balance change invalidates the health factor outright.
+  private localHfCache = new Map<string, { hf: bigint; prices: bigint[]; at: number }>();
+  // A cached entry is only trusted briefly. Interest accrual moves the health
+  // factor without any price moving, and while that drift is tiny — even at a
+  // 300% borrow rate it is under 0.03 bps over 30s — the bound must stay sound
+  // rather than approximately sound.
+  private static readonly LOCAL_HF_CACHE_MS = 30_000;
+  // Slack applied to the bound to absorb that accrual plus float rounding in the
+  // ratio arithmetic. One basis point is orders of magnitude more than needed.
+  private static readonly LOCAL_HF_BOUND_SLACK = 0.9999;
+
+  private rememberLocalHf(
+    address: string, state: UserState, prices: Map<string, bigint>, hf: bigint, nowMs: number,
+  ): void {
+    const snap: bigint[] = new Array(state.reserves.length);
+    for (let i = 0; i < state.reserves.length; i++) {
+      snap[i] = prices.get(state.reserves[i]!.asset) ?? 0n;
+    }
+    this.localHfCache.set(address, { hf, prices: snap, at: nowMs });
+  }
+
+  // True when the position provably cannot have crossed `ceiling` since its
+  // cached evaluation. Conservative in the only direction that matters: any
+  // uncertainty (missing price, stale cache, shape change) returns false and
+  // falls through to the full recomputation.
+  private canSkipLocalEval(
+    address: string,
+    state:   UserState,
+    prices:  Map<string, bigint>,
+    ceiling: bigint,
+    nowMs:   number,
+  ): boolean {
+    const c = this.localHfCache.get(address);
+    if (!c || c.hf <= 0n) return false;
+    if (nowMs - c.at > PositionTracker.LOCAL_HF_CACHE_MS) return false;
+    if (c.prices.length !== state.reserves.length) return false;   // model reshaped
+
+    // min price ratio across collateral, max across debt — the two that bound
+    // the health factor from below.
+    let minCollR = Infinity;
+    let maxDebtR = 0;
+    for (let i = 0; i < state.reserves.length; i++) {
+      const r = state.reserves[i]!;
+      const prev = c.prices[i]!;
+      if (prev <= 0n) return false;
+      const cur = prices.get(r.asset);
+      if (cur === undefined || cur <= 0n) return false;
+      const ratio = Number(cur) / Number(prev);
+      if (!Number.isFinite(ratio) || ratio <= 0) return false;
+
+      if (r.usageAsCollateral && r.scaledATokenBalance > 0n) {
+        if (ratio < minCollR) minCollR = ratio;
+      }
+      if (r.scaledVariableDebt > 0n) {
+        if (ratio > maxDebtR) maxDebtR = ratio;
+      }
+    }
+    // No collateral or no debt legs recorded — let the full path decide.
+    if (minCollR === Infinity || maxDebtR === 0) return false;
+
+    const floorHf = (Number(c.hf) / 1e18) * (minCollR / maxDebtR) * PositionTracker.LOCAL_HF_BOUND_SLACK;
+    return floorHf >= Number(ceiling) / 1e18;
   }
 
   // Turn a user's scaled balances into real ones and compute the health factor,
@@ -2448,6 +2543,12 @@ export class PositionTracker {
       if (this.positions.has(addr) || this.dormant.has(addr)) continue;
       this.dropUserState(addr);
       removed++;
+    }
+    // The skip-bound cache is keyed the same way and is cleared alongside the
+    // model on every normal path; this catches anything left for an address that
+    // is no longer modelled at all.
+    for (const addr of [...this.localHfCache.keys()]) {
+      if (!this.userStates.has(addr)) this.localHfCache.delete(addr);
     }
     if (removed > 0) {
       logger.debug(`model reconcile: dropped ${removed} entries for untracked addresses`);

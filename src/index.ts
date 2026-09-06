@@ -49,10 +49,23 @@ async function main(): Promise<void> {
   // PERF: lastEvaluatedHF is pruned every 500 cycles to prevent unbounded growth.
   // Positions that haven't been seen in 500 cycles are no longer in the danger tier
   // so their cached HF is stale anyway.
-  const lastEvaluatedHF          = new Map<string, { hf: bigint; block: bigint }>();
-  const EVAL_HF_CHANGE_THRESHOLD = 5n * 10n ** 15n; // 0.005 HF
-  const EVAL_BLOCK_REFRESH       = 10n;              // blocks
+  const lastEvaluatedHF          = new Map<string, { hf: bigint; block: bigint; cooldown: bigint }>();
+  const EVAL_HF_CHANGE_THRESHOLD = 5n * 10n ** 15n; // 0.005 HF — re-evaluate regardless of cooldown
   const EVAL_MAP_PRUNE_INTERVAL  = 500;              // cycles between map prune passes
+  // Cooldown applied after a candidate evaluates as unprofitable. It used to be
+  // no cooldown at all: the entry was DELETED on `!opp`, which is what the
+  // rate-limit check reads, so an unprofitable position was re-fetched and
+  // re-evaluated on every single cycle for as long as it stayed below HF 1.0 —
+  // a full breakdown fetch plus evaluation, forever, for an answer that had
+  // already been computed. Positions like that are exactly the ones that sit
+  // underwater for days.
+  //
+  // The cooldown is safe because it is not the only gate: a health factor that
+  // moves by more than EVAL_HF_CHANGE_THRESHOLD re-evaluates immediately
+  // regardless, so the case that actually matters — a price move making it
+  // profitable — is not delayed.
+  const EVAL_COOLDOWN_DEFAULT      = 2n;   // blocks — plain rate limit
+  const EVAL_COOLDOWN_UNPROFITABLE = 30n;  // blocks (~7.5s on Arbitrum)
 
   // Opt #26: Background price pre-fetch cache, populated by the interval set up
   // during startup. Declared here rather than beside that interval because
@@ -446,13 +459,18 @@ async function main(): Promise<void> {
           continue;
         }
 
-        // FIX: isConfirmedLiquidatable was always true (candidates are all HF < 1.0),
-        // making the unchanged-HF guard for borderline positions dead code. Simplified
-        // to a single rate-limit: skip if this address was evaluated less than 2 blocks ago.
+        // Rate limit, with a per-entry cooldown and a health-factor escape hatch.
+        // EVAL_HF_CHANGE_THRESHOLD was declared and never used; it is what makes
+        // the longer unprofitable cooldown safe, so it is wired up now.
         const lastEval = lastEvaluatedHF.get(pos.address);
-        if (lastEval && bn - lastEval.block < 2n) {
-          skippedUnchanged++;
-          continue;
+        if (lastEval && bn - lastEval.block < lastEval.cooldown) {
+          const moved = pos.healthFactor > lastEval.hf
+            ? pos.healthFactor - lastEval.hf
+            : lastEval.hf - pos.healthFactor;
+          if (moved < EVAL_HF_CHANGE_THRESHOLD) {
+            skippedUnchanged++;
+            continue;
+          }
         }
 
         actionable.push(pos);
@@ -525,7 +543,9 @@ async function main(): Promise<void> {
 
       for (let i = 0; i < evalInputs.length; i++) {
         const pos = evalInputs[i]!.pos;
-        lastEvaluatedHF.set(pos.address, { hf: pos.healthFactor, block: bn });
+        lastEvaluatedHF.set(pos.address, {
+          hf: pos.healthFactor, block: bn, cooldown: EVAL_COOLDOWN_DEFAULT,
+        });
 
         const er = evalResults[i]!;
         if (er.status !== "fulfilled") {
@@ -544,7 +564,13 @@ async function main(): Promise<void> {
 
         if (!opp) {
           skippedNotProfitable++;
-          lastEvaluatedHF.delete(pos.address);
+          // Hold the entry with a longer cooldown instead of deleting it. Deleting
+          // removed the very record the rate limiter consults, so the next cycle
+          // paid for the same breakdown and the same evaluation to reach the same
+          // conclusion.
+          lastEvaluatedHF.set(pos.address, {
+            hf: pos.healthFactor, block: bn, cooldown: EVAL_COOLDOWN_UNPROFITABLE,
+          });
           continue;
         }
 

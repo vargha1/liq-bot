@@ -506,7 +506,18 @@ export class TriggerEngine {
       for (const b of built) (this.shouldFireBlind(b) ? confident : marginal).push(b);
 
       const fired = this.fireAll(confident, now);
-      if (marginal.length > 0) this.confirmThenFire(marginal, now);
+      if (marginal.length > 0) {
+        // Claim the dedupe window BEFORE the confirmation round-trip. firedAt is
+        // documented as "last dispatch ts", but only fireAll was writing it, so a
+        // borrower sent for confirmation stayed unmarked for the whole ~50-100ms
+        // the multicall took. Any feed event arriving in that window rebuilt the
+        // same candidate and issued a second confirmation for it — observed live
+        // as the identical LINK/LINK evaluation twice, 31ms apart. Marking here
+        // costs nothing when the candidate survives, since fireAll refreshes the
+        // timestamp on the way out.
+        for (const m of marginal) this.firedAt.set(m.key, now);
+        this.confirmThenFire(marginal, now);
+      }
 
       // Samples only ever arrive from the marginal band, so the measured
       // distribution describes the region near 1.0 and says nothing about the
