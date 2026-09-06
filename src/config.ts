@@ -21,7 +21,16 @@ export const CONFIG = {
   // requireSuccess=false, since that failure happens before Multicall3's own
   // per-call error handling runs. Lowered default + made tunable so this can be
   // fixed via env instead of a code change if your provider is one of those.
-  mcSubchunk:        parseInt(opt("MC_SUBCHUNK",            "50"),   10),
+  //
+  // Raised 50 → 150. At 50 a 300-position sweep cost 6 eth_calls once a second,
+  // which alone is 6 req/s against RPC_CALLS_PER_SECOND=4 — the sweep could not
+  // fit in its own budget, so the limiter queue grew without bound (see
+  // rpcLimiter.ts). The chunk size does not change how much data is read, only
+  // how many requests carry it, so this is the cheapest lever by far: the same
+  // sweep is now 2 calls. 150 × ~200k gas ≈ 30M gas per eth_call, comfortably
+  // under the 300 this file's own refreshBatch comment calls safe. Drop back to
+  // 50 if your provider returns "missing revert data" on the larger request.
+  mcSubchunk:        parseInt(opt("MC_SUBCHUNK",            "150"),  10),
   // Global cap on NEW eth_call requests started per second on the shared
   // provider (see rpcLimiter.ts). Restricted RPC plans typically enforce a
   // requests-per-second ceiling, not a concurrency ceiling — a concurrency cap
@@ -31,6 +40,19 @@ export const CONFIG = {
   // (8-wide waves resolving in ~2.1s ≈ ~4 req/s). Lower further (2-3) if
   // "missing revert data" errors persist; raise if your provider tolerates more.
   rpcCallsPerSecond: parseInt(opt("RPC_CALLS_PER_SECOND",   "4"),    10),
+  // Hard ceiling on how long a queued eth_call may wait for its rate-limit slot.
+  // Past this the call is rejected immediately instead of being queued (see
+  // rpcLimiter.ts). This is what makes the limiter self-correcting: without a
+  // cap, any sustained overload compounds forever — production saw a single
+  // refreshBatch wait 300707 ms, five minutes, for data that goes stale in one
+  // block. Anything above a few seconds is already useless to a liquidation
+  // bot, so shedding is strictly better than waiting.
+  rpcMaxQueueMs:     parseInt(opt("RPC_MAX_QUEUE_MS",       "5000"), 10),
+  // Skip a polling sweep when the limiter backlog is already deeper than this.
+  // The sweep is a safety net; the event-driven trigger is the detection path
+  // that matters, and it needs call budget to confirm prices. Letting the sweep
+  // queue behind its own backlog starves exactly the wrong thing.
+  cycleSkipQueueMs:  parseInt(opt("CYCLE_SKIP_QUEUE_MS",    "2500"), 10),
   // Prune performance: the bottleneck is number of waves, not concurrency.
   // Each multicall round-trip takes ~2.9s regardless of concurrent count.
   // getUserAccountData is gas-heavy (iterates all Aave reserves internally).

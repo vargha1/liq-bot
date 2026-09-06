@@ -102,6 +102,9 @@ export class TriggerEngine {
   private feeds        = new Map<string, Set<string>>();
   private lastAnswers  = new Map<string, bigint>();   // feed → last raw answer (baseline for ratio)
   private firedAt      = new Map<string, number>();   // borrower → last dispatch ts (dedupe window)
+  // feed → performance.now() when the sequencer feed reported it, cleared by the
+  // matching log. The gap between the two IS the pre-block lead (trig.feedLead).
+  private feedSeenAt   = new Map<string, number>();
   private refreshThrottle = new Map<string, number>();// asset → last forced-refresh ts
 
   private activeProvider: ethers.Provider | null = null;
@@ -180,7 +183,13 @@ export class TriggerEngine {
         }
         this.lastAnswers.set(hint.feed, hint.answer);
         if (touched.size > 0) {
-          metrics.record("trig.feedLead", 1);
+          // Was `metrics.record("trig.feedLead", 1)` — a constant, so the
+          // reporter dutifully printed p50=1ms p95=1ms max=1ms forever and told
+          // us nothing about the one thing this metric exists to measure: how
+          // far ahead of the block the sequencer feed actually saw the price.
+          // That lead is what justifies the whole sequencer-feed path, so
+          // record the real figure and let it be judged.
+          this.feedSeenAt.set(hint.feed, performance.now());
           logger.debug(`⚡⚡ Sequencer feed: pre-block price for ${hint.feed.slice(0, 10)}… — dispatching early`);
           this.dispatch(touched);
           return;
@@ -343,6 +352,14 @@ export class TriggerEngine {
       const feed   = log.address.toLowerCase();
       const assets = this.feeds.get(feed);
       if (!assets || assets.size === 0) return;
+
+      // The authoritative log for a price the sequencer feed already gave us:
+      // the elapsed time is exactly how much head start that path bought.
+      const seenAt = this.feedSeenAt.get(feed);
+      if (seenAt !== undefined) {
+        metrics.record("trig.feedLead", performance.now() - seenAt);
+        this.feedSeenAt.delete(feed);
+      }
 
       const parsed = ANSWER_UPDATED_IFACE.parseLog({ topics: log.topics as string[], data: log.data });
       if (!parsed) return;

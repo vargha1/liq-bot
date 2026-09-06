@@ -279,9 +279,14 @@ export class PositionTracker {
 
   // FIX: max positions to wake per 5-min interval — prevents thundering-herd
   // when thousands of positions were parked simultaneously (e.g. after prune).
-  // With ~16k dormant and a 1-hour window, steady-state wakes are ~22/interval.
-  // Cap at 500 to absorb any burst while still making forward progress.
+  // This is now the FLOOR of an adaptive budget, not a hard cap — see
+  // wakeBudget(). As a hard cap it silently broke the recheck window it was
+  // supposed to serve as soon as the dormant tier passed ~6 000 entries.
   private static readonly MAX_DORMANT_WAKE_PER_INTERVAL = 500;
+  // Upper bound on the adaptive budget — see wakeBudget(). Large enough that a
+  // 100k-position watchlist still meets its recheck window, small enough that a
+  // single tick can't dump the entire dormant set into the active rotation.
+  private static readonly MAX_DORMANT_WAKE_CEILING = 5_000;
 
   // Move a healthy position (HF > HF_WATCH) from active to dormant.
   // It will be re-activated either by a live event or after DORMANT_RECHECK_MS.
@@ -397,11 +402,37 @@ export class PositionTracker {
   // FIX: Capped at MAX_DORMANT_WAKE_PER_INTERVAL per call to prevent thundering
   // herds when thousands of positions all expire at the same time (e.g. post-prune).
   // Remaining expired entries are processed in the next interval(s).
-  wakeExpiredDormant(): void {
+  // `intervalMs` is how often the caller invokes this. The cap must be derived
+  // from it, not fixed: with 16 081 dormant positions and a flat 500 per 5-minute
+  // tick, only 6 000 could be rechecked per hour against a DORMANT_RECHECK_MS of
+  // one hour, so the effective blind window was ~2.7 hours — nearly three times
+  // what the constant claims, and permanently growing with the dormant set. The
+  // log said "woke 500 … 15 581 still dormant" on every single tick, which is the
+  // cap binding forever rather than a burst being smoothed.
+  //
+  // Waking more is cheap: a wake is a map move, and the sweep that follows is
+  // already bounded by positionsPerCycle. The cap's real job is absorbing a
+  // post-prune spike, so keep a ceiling — just one high enough to satisfy the
+  // window it advertises.
+  private wakeBudget(intervalMs: number): number {
+    const ticksPerWindow = Math.max(1, Math.floor(PositionTracker.DORMANT_RECHECK_MS / intervalMs));
+    const needed = Math.ceil(this.dormant.size / ticksPerWindow);
+    return Math.min(
+      Math.max(PositionTracker.MAX_DORMANT_WAKE_PER_INTERVAL, needed),
+      PositionTracker.MAX_DORMANT_WAKE_CEILING,
+    );
+  }
+
+  wakeExpiredDormant(intervalMs = 5 * 60_000): void {
     const now = Date.now();
+    const budget = this.wakeBudget(intervalMs);
     let woke = 0;
+    let overdue = 0;
+    for (const entry of this.dormant.values()) {
+      if (now - entry.dormantSince >= PositionTracker.DORMANT_RECHECK_MS) overdue++;
+    }
     for (const [addr, entry] of this.dormant) {
-      if (woke >= PositionTracker.MAX_DORMANT_WAKE_PER_INTERVAL) break;
+      if (woke >= budget) break;
       if (now - entry.dormantSince >= PositionTracker.DORMANT_RECHECK_MS) {
         if (!this.badDebtDenylist.has(addr)) {
           this.positions.set(addr, {
@@ -421,7 +452,11 @@ export class PositionTracker {
       }
     }
     if (woke > 0) {
-      logger.info(`dormant: woke ${woke} positions for recheck (${this.dormant.size} still dormant, ${this.positions.size} active)`);
+      const stalled = overdue > woke ? ` — ${overdue - woke} still overdue` : "";
+      logger.info(
+        `dormant: woke ${woke}/${budget} positions for recheck ` +
+        `(${this.dormant.size} still dormant, ${this.positions.size} active)${stalled}`
+      );
     }
   }
 
@@ -1295,7 +1330,12 @@ export class PositionTracker {
   private static readonly DANGER_CAP_PCT    = 0.70;  // danger tier can use at most 70% of remaining slots
   private static readonly ROTATION_FLOOR    = 0.30;  // rotation always gets at least 30% of batchSize
 
-  async refreshBatch(batchSize: number): Promise<BorrowerPosition[]> {
+  // `signal` is the owning cycle's abort signal. The cycle safety timeout used
+  // to call abort() on a controller that was wired to nothing, so an overrunning
+  // sweep kept running — and kept holding rate-limiter slots — long after the
+  // cycle that started it had given up and a new one had begun. Honouring it
+  // here is what makes "aborting in-flight ops" in that log line true.
+  async refreshBatch(batchSize: number, signal?: AbortSignal): Promise<BorrowerPosition[]> {
     const all = this.getRotationList();
     if (all.length === 0) return [];
 
@@ -1450,8 +1490,28 @@ export class PositionTracker {
         e?.code === 'UNSUPPORTED_OPERATION' || /provider destroyed|cancelled request/i.test(e?.message ?? "");
 
       const settled = await Promise.allSettled(chunks.map(decodeChunk));
+      // The cycle that owns this sweep gave up while we were awaiting. Its
+      // results are stale by definition and applying them would overwrite fresh
+      // state written by the cycle that succeeded it.
+      if (signal?.aborted) return [];
       for (const r of settled) {
         if (r.status === "rejected" && isProviderDestroyed(r.reason)) return liquidatable;
+      }
+      // Chunk rejections are absorbed by allSettled, so a shed chunk never
+      // reaches the catch below as a typed error — it arrives as the generic
+      // "all multicall chunks failed", which would then trigger the individual-
+      // call fallback and pour `batch.length` more calls into a queue that is
+      // already full. Detect it here, where the reason objects still exist.
+      if (settled.some(r => r.status === "rejected" && (r.reason as any)?.code === "RPC_BACKPRESSURE")) {
+        const shedChunks = settled.filter(r => r.status === "rejected").length;
+        logger.warn(
+          `refreshBatch: ${shedChunks}/${chunks.length} chunks shed by rate limiter — ` +
+          `sweep skipped this cycle (no individual-call fallback)`
+        );
+        applyResults(
+          settled.flatMap(r => (r.status === "fulfilled" ? r.value : [])),
+        );
+        return liquidatable;
       }
 
       const pairs: Array<{ addr: string; decoded: ReturnType<ethers.Interface["decodeFunctionResult"]> }> = [];
@@ -1472,15 +1532,26 @@ export class PositionTracker {
         logger.warn(`refreshBatch: ${failedChunks}/${chunks.length} multicall chunks failed (${pairs.length} results applied)`);
       }
     } catch (e: any) {
-      // Multicall unavailable — fall back to individual parallel calls in chunks of 25
-      logger.warn(`Multicall failed (${e.message}), falling back to individual calls`);
       // If the provider itself was destroyed (reconnect in progress), abort immediately
       // rather than hammering N individual calls that will all fail the same way.
       if (e.code === 'UNSUPPORTED_OPERATION' || /provider destroyed|cancelled request/i.test(e.message)) {
         return liquidatable;
       }
+      // Backpressure is the one failure this fallback must never answer. The
+      // multicall chunks were shed because the call budget is already spent;
+      // replacing 2 shed calls with `batch.length` individual ones is the exact
+      // opposite of what the limiter asked for, and it is how a transient
+      // overload used to turn into a self-sustaining one.
+      if (e.code === "RPC_BACKPRESSURE") {
+        logger.warn(`refreshBatch shed by rate limiter (${e.message}) — skipping sweep, not falling back`);
+        return liquidatable;
+      }
+      if (signal?.aborted) return [];
+      // Multicall unavailable — fall back to individual parallel calls in chunks of 25
+      logger.warn(`Multicall failed (${e.message}), falling back to individual calls`);
       const CHUNK = 25;
       for (let i = 0; i < batch.length; i += CHUNK) {
+        if (signal?.aborted) return liquidatable;
         const results = await Promise.allSettled(batch.slice(i, i + CHUNK).map(addr => this.refreshOne(addr)));
         for (const r of results) {
           if (r.status !== "fulfilled" || !r.value) continue;
@@ -1589,7 +1660,9 @@ export class PositionTracker {
   async getAssetBreakdownBatch(
     addresses: string[],
     minDebtUsd8 = MIN_DEBT_FOR_BREAKDOWN_USD8,
+    signal?: AbortSignal,
   ): Promise<Map<string, { collaterals: AssetPosition[]; debts: AssetPosition[] }>> {
+    if (signal?.aborted) return new Map();
     const out = new Map<string, { collaterals: AssetPosition[]; debts: AssetPosition[] }>();
     const wanted: string[] = [];
 
@@ -1622,6 +1695,7 @@ export class PositionTracker {
       logger.debug(`breakdownBatch: ${fallback.length}/${wanted.length} addresses need the per-address path`);
       const FALLBACK_CONCURRENCY = 4;
       for (let i = 0; i < fallback.length; i += FALLBACK_CONCURRENCY) {
+        if (signal?.aborted) break;
         const slice = fallback.slice(i, i + FALLBACK_CONCURRENCY);
         const settled = await Promise.allSettled(slice.map(a => this.getAssetBreakdown(a, minDebtUsd8)));
         for (let j = 0; j < slice.length; j++) {
@@ -1804,8 +1878,12 @@ export class PositionTracker {
         return empty;
 
       } catch (e: any) {
-        // Provider destroyed: abort immediately, don't try Step 3
-        if (e.code === 'UNSUPPORTED_OPERATION' || /provider destroyed|cancelled request/i.test(e.message)) {
+        // Provider destroyed: abort immediately, don't try Step 3.
+        // Backpressure too — Step 3 is a ~4-chunk sweep over every reserve, so
+        // answering a shed call with it is the wrong direction entirely.
+        if (e.code === "RPC_BACKPRESSURE"
+            || e.code === 'UNSUPPORTED_OPERATION'
+            || /provider destroyed|cancelled request/i.test(e.message)) {
           return { collaterals: [], debts: [] };
         }
         logger.warn(`Multicall breakdown failed for ${address.slice(0,10)}: ${e.message} — full fallback`);
@@ -1859,8 +1937,12 @@ export class PositionTracker {
       } catch (e: any) {
         // If the provider was destroyed (reconnect in progress), abort immediately.
         // Spawning individual calls against a dead socket just hangs for 45s each.
-        if (e.code === 'UNSUPPORTED_OPERATION' || /provider destroyed|cancelled request/i.test(e.message)) {
-          logger.debug(`Full fallback aborted (provider destroyed) for ${address.slice(0,10)}`);
+        // Under backpressure the individual calls would be shed anyway, after
+        // taking slots the live path needs.
+        if (e.code === "RPC_BACKPRESSURE"
+            || e.code === 'UNSUPPORTED_OPERATION'
+            || /provider destroyed|cancelled request/i.test(e.message)) {
+          logger.debug(`Full fallback aborted (${e.code ?? "provider destroyed"}) for ${address.slice(0,10)}`);
           return { collaterals: [], debts: [] };
         }
         // Last resort for THIS chunk only: individual calls, not all ~19 reserves.
@@ -1896,6 +1978,12 @@ export class PositionTracker {
       this.breakdownCache.delete(key);
       this.lastDangerHF.delete(key);
     }
+    // The model entry outlives the position unless it is dropped here. That is
+    // why the heartbeat reported model=17195/16738 — more modelled users than
+    // tracked ones, which is not a coverage figure at all, plus a map that only
+    // ever grows. An evicted address is never evaluated again, so nothing needs
+    // its scaled balances.
+    this.dropUserState(key);
     this.badDebtDenylist.add(key);
     saveDenylist(this.badDebtDenylist);
   }
@@ -1973,6 +2061,10 @@ export class PositionTracker {
     // Bug #7 fix: also remove from dormant map so wakeExpiredDormant doesn't
     // re-add a dust position that was just evicted.
     this.dormant.delete(key);
+    // Same leak as evict() — an address that is in neither positions nor dormant
+    // must not keep a model entry, or modelCoverage() reports more modelled
+    // users than tracked ones and the map grows without bound.
+    this.dropUserState(key);
     // No denylist — any subsequent Borrow/Supply/etc event re-admits naturally
   }
 
