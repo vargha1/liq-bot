@@ -994,6 +994,7 @@ export class PositionTracker {
             const hf   = d.healthFactor as bigint;
             if (debt < MIN_DEBT_USD8) {
               this.positions.delete(addr);
+              this.dropUserState(addr);   // else the model outlives the position
               this.markRotationDirty();
               this.markDangerDirty(); // FIX: addr may be in dangerList
               chunkPruned++;
@@ -1525,6 +1526,7 @@ export class PositionTracker {
             // Skip re-insertion if this address was evicted as bad debt
             if (this.badDebtDenylist.has(pos.address)) {
               this.positions.delete(pos.address);
+              this.dropUserState(pos.address);   // else the model outlives the position
               this.markRotationDirty();
               this.markDangerDirty(); // FIX: addr may still be in dangerList
               this.lastDangerHF.delete(addr);
@@ -1655,6 +1657,7 @@ export class PositionTracker {
           const pos = r.value;
           if (this.badDebtDenylist.has(pos.address)) {
             this.positions.delete(pos.address);
+            this.dropUserState(pos.address);   // else the model outlives the position
             this.markRotationDirty();
             this.markDangerDirty(); // FIX: addr may be in dangerList
           } else {
@@ -1699,6 +1702,7 @@ export class PositionTracker {
       logger.info(`Bad debt evicted: ${address} (HF=0, col=$0, debt=$${(Number(debt)/1e8).toFixed(2)}) -- no collateral to liquidate`);
       this.positions.delete(address);
       this.dormant.delete(address);
+      this.dropUserState(address);   // else the model outlives the position
       this.markRotationDirty();
       this.markDangerDirty(); // FIX: danger list may contain this address — mark stale
       // FIX: add to denylist so this address is blocked on re-seed/re-scan.
@@ -1711,6 +1715,7 @@ export class PositionTracker {
 
     if (debt < MIN_DEBT_USD8) {
       this.positions.delete(address);
+      this.dropUserState(address);   // else the model outlives the position
       this.markRotationDirty();
       this.markDangerDirty(); // FIX: danger list may contain this address — mark stale
       return null;
@@ -2426,6 +2431,29 @@ export class PositionTracker {
 
   get size(): number { return this.positions.size; }
   get dormantSize(): number { return this.dormant.size; }
+
+  // Reconcile the model against the tracked set.
+  //
+  // Every call site that removes a position now drops its model entry too, so in
+  // steady state this finds nothing. It exists for the race those fixes cannot
+  // close: refreshUserStates is asynchronous, and an address evicted while its
+  // multicall was in flight has its entry written back after the eviction that
+  // was supposed to remove it. One stray entry per such race is harmless in
+  // isolation, but it accumulates and it makes modelCoverage report more
+  // modelled users than tracked ones — a coverage figure above 100%, which is
+  // not a number an operator should ever have to interpret.
+  pruneModel(): number {
+    let removed = 0;
+    for (const addr of [...this.userStates.keys()]) {
+      if (this.positions.has(addr) || this.dormant.has(addr)) continue;
+      this.dropUserState(addr);
+      removed++;
+    }
+    if (removed > 0) {
+      logger.debug(`model reconcile: dropped ${removed} entries for untracked addresses`);
+    }
+    return removed;
+  }
 
   // Bug #12 fix: periodically prune the full borrower cache to prevent unbounded growth.
   // After months of running, the full cache can contain 200k+ addresses (most long-repaid).

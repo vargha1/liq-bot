@@ -752,7 +752,14 @@ async function main(): Promise<void> {
   // Bug #12 fix: periodically prune the full borrower cache to prevent unbounded growth
   setInterval(() => {
     if (!shuttingDown) tracker.pruneFullCache();
-  }, 6 * 60 * 60_000);  // every 6 hours
+  }, 6 * 60 * 60_000);
+
+  // Reconcile the model against the tracked set. Cheap (one pass over a map that
+  // is the size of the watchlist) so it runs often enough that the heartbeat's
+  // model=modelled/total never drifts visibly above 100%.
+  setInterval(() => {
+    if (!shuttingDown && ready) tracker.pruneModel();
+  }, 10 * 60_000);  // every 6 hours
 
   // Reserve thresholds and bonuses no longer need their own refresh job — the
   // ReserveRegistry owns them and is refreshed below, e-mode included.
