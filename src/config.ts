@@ -171,11 +171,16 @@ export const CONFIG = {
   // factor, whatever the measured distribution says. Guards against a
   // degenerate sample window authorising a fire arbitrarily close to 1.0.
   triggerBlindMaxHf:    parseFloat(opt("TRIGGER_BLIND_MAX_HF", "0.999")),
-  // Probability that a dispatch which fired blind also issues a confirmation
-  // purely to record an error sample. Without it the measured distribution is
-  // censored — it would only ever see the marginal band it was used to gate,
-  // and never the region where fires actually happen. Costs one batched read.
-  triggerAuditRate:     parseFloat(opt("TRIGGER_AUDIT_RATE", "0.02")),
+  // Probability that a dispatch confirms one near-threshold position against the
+  // chain purely to record an error sample.
+  //
+  // This is the ONLY source of samples for the distribution that gates blind
+  // firing, so the rate has to be high enough to actually reach minSamples.
+  // At 0.02, with dispatches arriving a few times a minute, it produced one
+  // sample in thirteen hours and the decision stayed pinned to the fallback
+  // constant. At 0.25 the distribution becomes usable inside an hour, for well
+  // under one extra multicall per minute.
+  triggerAuditRate:     parseFloat(opt("TRIGGER_AUDIT_RATE", "0.25")),
 } as const;
 
 // ─── Aave V3 Arbitrum core addresses ─────────────────────────────────────────

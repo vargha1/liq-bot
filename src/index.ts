@@ -145,10 +145,16 @@ async function main(): Promise<void> {
       (cov ? ` model=${cov.modelled}/${cov.total}` : "") +
       dangerStr + rpcStr
     );
-    // Measured model-vs-chain drift. This is the number the fire/confirm
-    // decision is derived from, so it belongs where an operator will see it
-    // rather than only inside the decision that consumes it.
-    trigger?.modelError.logSummary();
+    // Two distinct measurements, deliberately reported separately.
+    // model-err is the trigger's own price-path error and is what the
+    // fire/confirm decision reads. arith-err is the sweep's arithmetic check
+    // against fresh prices; it should sit near zero and drifting off zero means
+    // the model has diverged from GenericLogic, not that the trigger is risky.
+    if (trigger) {
+      trigger.modelError.logSummary();
+      const a = trigger.arithmeticError;
+      if (a.count > 0) logger.info(`📐 arith-${a.summary().replace(/^model-err /, "")}`);
+    }
   }, 300_000);
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -403,19 +409,25 @@ async function main(): Promise<void> {
       // here on would be priced off data older than the timeout itself.
       if (abortController.signal.aborted) return;
 
-      // Free model-error samples. The sweep just read authoritative health
-      // factors; comparing a few against what the model would have computed
-      // costs no RPC and is the only way the measured distribution reaches a
-      // usable sample count — confirmations alone produced ONE sample in
-      // thirteen hours of live running, so the fire decision stayed pinned to
-      // the fallback constant.
+      // Arithmetic regression check, NOT an input to the fire decision.
       //
-      // Deliberately uses the oracle's own snapshot, which is what the trigger
-      // reads, rather than the cycle's freshly-fetched prices. Measuring against
-      // fresh prices would understate the error the trigger actually makes.
+      // The intent was to feed the fire decision cheaply, and mechanically it
+      // worked — 500 samples within five minutes against one in thirteen hours.
+      // But it measures the wrong quantity. The background prefetch keeps the
+      // oracle cache authoritative, so by the time the cycle samples, the
+      // snapshot is fresh on both sides and the comparison reduces to arithmetic
+      // agreement: it reported 0.0 bps p50 where the trigger's live errors were
+      // 11.5 and 4.1 bps. Feeding that into shouldFireBlind would license firing
+      // a hair under 1.0 on evidence that does not cover the price staleness the
+      // trigger actually faces.
+      //
+      // It stays because near-zero here is a genuine, continuous confirmation
+      // that the bit-exact GenericLogic replication holds against live chain
+      // data. The fire decision is fed from the trigger's own dispatch path
+      // instead — see TriggerEngine.auditSample.
       if (trigger && oracle) {
         for (const [local, chain] of tracker.sampleModelError(oracle.snapshotAllPrices(), 5)) {
-          trigger.modelError.record(local, chain);
+          trigger.arithmeticError.record(local, chain);
         }
       }
 

@@ -127,6 +127,20 @@ export class TriggerEngine {
   // the hardcoded TRIGGER_CONFIRM_HF as the basis for the fire decision.
   readonly modelError = new ModelErrorTracker();
 
+  // Model-vs-chain error measured from the POLLING SWEEP, where the model is fed
+  // prices the cycle has just refreshed authoritatively.
+  //
+  // Kept strictly apart from modelError and deliberately NOT used by
+  // shouldFireBlind. It reads near zero — 0.0 bps p50, under 1.2 bps worst —
+  // because with fresh prices on both sides it measures arithmetic agreement,
+  // which the bit-exact GenericLogic work already made near-perfect. The
+  // trigger's real exposure is 4-11.5 bps, all of it price-path: staleness and
+  // ratio estimates in the snapshot dispatch reads. Feeding these optimistic
+  // samples into the fire decision would tell it that firing a hair under 1.0 is
+  // safe when it is not, producing exactly the reverts confirmation exists to
+  // prevent. Useful as a regression check on the arithmetic, nothing more.
+  readonly arithmeticError = new ModelErrorTracker();
+
   private activeProvider: ethers.Provider | null = null;
   private logFilter: ethers.Filter | null = null;
   private reresolveTimer: ReturnType<typeof setInterval> | null = null;
@@ -547,8 +561,8 @@ export class TriggerEngine {
       // of confident fires purely to observe them — the fire already went out
       // above, so this costs one batched read and no latency, and it is what
       // keeps the distribution from being silently censored.
-      if (confident.length > 0 && Math.random() < CONFIG.triggerAuditRate) {
-        this.auditSample(confident);
+      if (Math.random() < CONFIG.triggerAuditRate) {
+        this.auditSample();
       }
 
       this.pruneFiredAt(now);
@@ -613,14 +627,27 @@ export class TriggerEngine {
     return pLand >= breakEvenP;
   }
 
-  // Confirm a slice of already-fired candidates purely to record error samples.
-  // Never fires anything: the opportunities went out before this ran.
-  private auditSample(confident: BuiltOpp[]): void {
-    const pick = confident[Math.floor(Math.random() * confident.length)]!;
-    this.tracker.confirmHealthFactors([pick.key])
+  // Confirm one near-threshold position purely to record an error sample.
+  // Never fires anything.
+  //
+  // This used to sample only from candidates that had just been fired blind,
+  // which sounds right and is useless in practice: firing requires crossing 1.0,
+  // that is rare, and the result was ONE sample in thirteen hours of live
+  // running — far short of the 30 the distribution needs before it may be
+  // trusted, so the engine stayed pinned to the fallback constant forever.
+  //
+  // It now samples the closest-to-threshold positions the dispatch evaluated,
+  // whether or not any of them crossed. Those are computed from the same price
+  // snapshot the fire decision reads, so they measure the right quantity, and
+  // they exist on every dispatch rather than only on the rare ones that fire.
+  private auditSample(): void {
+    const pool = this.tracker.takeLocalEvalSamples();
+    if (pool.length === 0) return;
+    const pick = pool[Math.floor(Math.random() * pool.length)]!;
+    this.tracker.confirmHealthFactors([pick.addr])
       .then(confirmed => {
-        const hf = confirmed.get(pick.key);
-        if (hf !== undefined) this.modelError.record(pick.hfE18, hf);
+        const hf = confirmed.get(pick.addr);
+        if (hf !== undefined) this.modelError.record(pick.hf, hf);
       })
       .catch(() => { /* sampling is best-effort */ });
   }

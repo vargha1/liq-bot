@@ -2253,6 +2253,12 @@ export class PositionTracker {
       evaluated_++;
       const evaluated = this.evaluateUserState(state, prices, nowSec);
       if (!evaluated) continue;
+      // Keep the closest-to-threshold positions this dispatch actually computed,
+      // so the trigger can audit one against the chain. These are the only
+      // health factors anywhere in the bot derived from the SAME price snapshot
+      // the fire decision uses, which makes them the only valid basis for
+      // measuring how wrong that decision can be.
+      this.noteLocalEval(address, evaluated.hfE18);
       // Cache the result against the prices that produced it, so the next tick
       // can bound this position instead of recomputing it.
       this.rememberLocalHf(address, state, prices, evaluated.hfE18, nowMs);
@@ -2524,6 +2530,42 @@ export class PositionTracker {
   // Addresses whose authoritative health factor was written by the most recent
   // refreshBatch. Used only for error sampling — see sampleModelError.
   private lastSwept: string[] = [];
+
+  // Lowest-health-factor positions evaluated by the most recent
+  // findLocalCandidates pass, with the model figure that pass computed.
+  //
+  // Separate from lastSwept and NOT interchangeable with it. These come from the
+  // trigger's own price snapshot — ratio estimates, TTL-stale entries and all —
+  // so they carry the error the fire decision is actually exposed to. lastSwept
+  // carries prices the cycle had just refreshed authoritatively, which measures
+  // something quite different. Conflating the two is exactly the mistake that
+  // made the measured error read 0.0 bps against a real 11.5.
+  private lastLocalEval: Array<{ addr: string; hf: bigint }> = [];
+  private static readonly LOCAL_EVAL_SAMPLE_MAX = 8;
+
+  private noteLocalEval(addr: string, hf: bigint): void {
+    if (hf <= 0n) return;
+    const arr = this.lastLocalEval;
+    if (arr.length < PositionTracker.LOCAL_EVAL_SAMPLE_MAX) {
+      arr.push({ addr, hf });
+      arr.sort((a, b) => (a.hf < b.hf ? -1 : a.hf > b.hf ? 1 : 0));
+      return;
+    }
+    // Keep the closest to the threshold — those are where a model error can
+    // actually change the verdict.
+    const worst = arr[arr.length - 1]!;
+    if (hf < worst.hf) {
+      arr[arr.length - 1] = { addr, hf };
+      arr.sort((a, b) => (a.hf < b.hf ? -1 : a.hf > b.hf ? 1 : 0));
+    }
+  }
+
+  /** Drain the near-threshold model evaluations from the last dispatch. */
+  takeLocalEvalSamples(): Array<{ addr: string; hf: bigint }> {
+    const out = this.lastLocalEval;
+    this.lastLocalEval = [];
+    return out;
+  }
 
   // Pairs of (model health factor, chain health factor) for a few addresses the
   // sweep just read authoritatively.
