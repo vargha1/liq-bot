@@ -138,12 +138,19 @@ async function main(): Promise<void> {
     const rpcStr = callLimiter
       ? ` rpc=q${Math.round(callLimiter.queueDelayMs())}ms/shed${callLimiter.shedCount()}`
       : "";
+    // Skip-bound hit rate. Without this the bound's effect is unobservable at
+    // info level, so a slow trig.dispatch cannot be told apart from a bound that
+    // never engages.
+    const bs = tracker?.boundStats();
+    const boundStr = bs && bs.evaluated + bs.skipped > 0
+      ? ` bound=${bs.pct.toFixed(1)}%(${bs.skipped}/${bs.skipped + bs.evaluated})`
+      : "";
     logger.info(
       `📊 uptime=${upMin}m | cycles=${cycles} | liquidatable=${liquidatable} | ` +
       `executed=${executed} | profit=$${totalProfitUsd.toFixed(2)} | ` +
       `watching=${tracker?.size ?? 0} dormant=${tracker?.dormantSize ?? 0}` +
       (cov ? ` model=${cov.modelled}/${cov.total}` : "") +
-      dangerStr + rpcStr
+      dangerStr + rpcStr + boundStr
     );
     // Two distinct measurements, deliberately reported separately.
     // model-err is the trigger's own price-path error and is what the

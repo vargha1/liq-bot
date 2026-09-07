@@ -500,6 +500,17 @@ export class TriggerEngine {
       // pricing six reserves, that churned thousands of positions back into the
       // active set for nothing and defeated the dormant tier outright.
       const candidates = this.tracker.findLocalCandidates(assetsLower, prices, TRIGGER_HF_CEILING, 10);
+
+      // Audit BEFORE the early return below. This sits here and not further down
+      // for a reason that cost a whole run to learn: findLocalCandidates only
+      // returns positions already under 1.0, so on a healthy book it returns
+      // nothing and dispatch exits immediately. Placed after that return, the
+      // audit was unreachable on exactly the days when nothing is liquidatable —
+      // which is most of them — and model-err stayed at zero samples while
+      // arith-err filled to 500. The measurement that gates blind firing must not
+      // depend on there being something to fire at.
+      if (Math.random() < CONFIG.triggerAuditRate) this.auditSample();
+
       if (candidates.length === 0) return;
 
       const gasPrice = this.getGasPrice();
@@ -555,15 +566,6 @@ export class TriggerEngine {
         this.confirmThenFire(marginal, now);
       }
 
-      // Samples only ever arrive from the marginal band, so the measured
-      // distribution describes the region near 1.0 and says nothing about the
-      // region the engine actually fires blind in. Confirm a small random slice
-      // of confident fires purely to observe them — the fire already went out
-      // above, so this costs one batched read and no latency, and it is what
-      // keeps the distribution from being silently censored.
-      if (Math.random() < CONFIG.triggerAuditRate) {
-        this.auditSample();
-      }
 
       this.pruneFiredAt(now);
       logger.debug(

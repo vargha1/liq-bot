@@ -2304,6 +2304,8 @@ export class PositionTracker {
       out.push({ pos, collaterals, debts, hfLocal: Number(hfE18) / 1e18 });
     }
 
+    this.boundSkipped   += skipped;
+    this.boundEvaluated += evaluated_;
     if (skipped > 0) {
       logger.debug(`findLocalCandidates: ${evaluated_} evaluated, ${skipped} skipped by bound`);
     }
@@ -2542,6 +2544,24 @@ export class PositionTracker {
   // made the measured error read 0.0 bps against a real 11.5.
   private lastLocalEval: Array<{ addr: string; hf: bigint }> = [];
   private static readonly LOCAL_EVAL_SAMPLE_MAX = 8;
+
+  // Cumulative effectiveness of the skip bound. Reported in the heartbeat
+  // because the bound is only worth its complexity if it actually fires, and
+  // that was invisible: its own log line is at debug, so a run could not show
+  // whether trig.dispatch was fast because the bound worked or slow because it
+  // silently never engaged.
+  private boundSkipped   = 0;
+  private boundEvaluated = 0;
+
+  /** Skip-bound hit rate since process start, for the heartbeat. */
+  boundStats(): { skipped: number; evaluated: number; pct: number } {
+    const total = this.boundSkipped + this.boundEvaluated;
+    return {
+      skipped: this.boundSkipped,
+      evaluated: this.boundEvaluated,
+      pct: total > 0 ? (this.boundSkipped / total) * 100 : 0,
+    };
+  }
 
   private noteLocalEval(addr: string, hf: bigint): void {
     if (hf <= 0n) return;
