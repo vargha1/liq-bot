@@ -1523,6 +1523,9 @@ export class PositionTracker {
     const applyResults = (
       pairs: Array<{ addr: string; decoded: ReturnType<ethers.Interface["decodeFunctionResult"]> }>,
     ): void => {
+      // Remember what this pass read authoritatively, so sampleModelError can
+      // compare a few of them against the model for free.
+      this.lastSwept = pairs.map(pr => pr.addr);
       for (const { addr, decoded } of pairs) {
         try {
           const pos = this.processAccountData(addr, decoded);
@@ -2307,14 +2310,27 @@ export class PositionTracker {
   // from. Cleared whenever the model entry changes (setUserState/dropUserState),
   // because a balance change invalidates the health factor outright.
   private localHfCache = new Map<string, { hf: bigint; prices: bigint[]; at: number }>();
-  // A cached entry is only trusted briefly. Interest accrual moves the health
-  // factor without any price moving, and while that drift is tiny — even at a
-  // 300% borrow rate it is under 0.03 bps over 30s — the bound must stay sound
-  // rather than approximately sound.
-  private static readonly LOCAL_HF_CACHE_MS = 30_000;
-  // Slack applied to the bound to absorb that accrual plus float rounding in the
-  // ratio arithmetic. One basis point is orders of magnitude more than needed.
-  private static readonly LOCAL_HF_BOUND_SLACK = 0.9999;
+  // How long a cached health factor may be used as a skip basis.
+  //
+  // This was 30s, which would have made the whole bound nearly useless in
+  // production: Chainlink feeds update on deviation or heartbeat, and ETH/USD
+  // ticks roughly once a minute, so a position's cache would routinely expire
+  // before the next event that touches it and every evaluation would fall
+  // through to the full recomputation anyway.
+  //
+  // The limit exists because interest accrual moves the health factor with no
+  // price change, but that drift is tiny and — importantly — BOUNDED and known,
+  // so it can be priced into the slack instead of forcing a short expiry. Ten
+  // minutes at the conservative rate below costs 0.6 bps of headroom.
+  private static readonly LOCAL_HF_CACHE_MS = 10 * 60_000;
+  // Upper bound on how fast accrual can move a health factor, per second,
+  // relative. Aave variable borrow rates spike but stay far under 100% APR
+  // (3.2e-8/s); 1e-7 is roughly a 300% APR position and is used purely as a
+  // ceiling, not an estimate.
+  private static readonly LOCAL_HF_DRIFT_PER_SEC = 1e-7;
+  // Floor slack covering float rounding in the ratio arithmetic, applied on top
+  // of the age-scaled accrual allowance.
+  private static readonly LOCAL_HF_BOUND_SLACK = 0.99999;
 
   private rememberLocalHf(
     address: string, state: UserState, prices: Map<string, bigint>, hf: bigint, nowMs: number,
@@ -2365,7 +2381,13 @@ export class PositionTracker {
     // No collateral or no debt legs recorded — let the full path decide.
     if (minCollR === Infinity || maxDebtR === 0) return false;
 
-    const floorHf = (Number(c.hf) / 1e18) * (minCollR / maxDebtR) * PositionTracker.LOCAL_HF_BOUND_SLACK;
+    // Accrual allowance scales with how old the cached figure is, so a long-lived
+    // entry is held to a proportionally stricter bound instead of being trusted
+    // as much as a fresh one.
+    const ageSec  = Math.max(0, (nowMs - c.at) / 1000);
+    const accrual = 1 - PositionTracker.LOCAL_HF_DRIFT_PER_SEC * ageSec;
+    const floorHf = (Number(c.hf) / 1e18) * (minCollR / maxDebtR)
+                  * accrual * PositionTracker.LOCAL_HF_BOUND_SLACK;
     return floorHf >= Number(ceiling) / 1e18;
   }
 
@@ -2496,6 +2518,45 @@ export class PositionTracker {
     } catch (e: any) {
       logger.debug(`confirmHealthFactors failed: ${e?.message ?? e}`);
     }
+    return out;
+  }
+
+  // Addresses whose authoritative health factor was written by the most recent
+  // refreshBatch. Used only for error sampling — see sampleModelError.
+  private lastSwept: string[] = [];
+
+  // Pairs of (model health factor, chain health factor) for a few addresses the
+  // sweep just read authoritatively.
+  //
+  // The trigger's fire decision rests on how far the model can be from the
+  // chain, and the only source of matched pairs used to be the confirmations it
+  // performs on marginal candidates. Those are rare — one sample in thirteen
+  // hours of live running — so the measured distribution could not reach the
+  // threshold where it becomes usable, and the engine stayed on the fallback
+  // constant indefinitely.
+  //
+  // The sweep already pays for authoritative health factors on hundreds of
+  // positions a cycle. Comparing a handful of them against the model costs
+  // nothing extra in RPC and samples the whole health-factor range rather than
+  // just the marginal band.
+  //
+  // `prices` MUST be the trigger's own snapshot, not the cycle's freshly-fetched
+  // map: the quantity worth measuring is the error the trigger would actually
+  // have made, which includes the staleness and ratio estimates in that snapshot.
+  // Sampling against fresh prices would understate it and make the engine fire
+  // blind more readily than the evidence supports.
+  sampleModelError(prices: Map<string, bigint>, max = 5): Array<[bigint, bigint]> {
+    const out: Array<[bigint, bigint]> = [];
+    if (this.lastSwept.length === 0) return out;
+    for (let i = 0; i < this.lastSwept.length && out.length < max; i++) {
+      const addr = this.lastSwept[i]!;
+      const pos = this.positions.get(addr);
+      if (!pos || pos.healthFactor <= 0n) continue;
+      const local = this.localHealthFactor(addr, prices);
+      if (local === null || local <= 0n) continue;
+      out.push([local, pos.healthFactor]);
+    }
+    this.lastSwept = [];
     return out;
   }
 

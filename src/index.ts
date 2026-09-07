@@ -171,8 +171,19 @@ async function main(): Promise<void> {
     // 5-second blind spot from a surprise 1006 close.
     const PROACTIVE_RECONNECT_MS = 55 * 60_000;
 
+    // Both timers below belong to THIS provider and must do nothing once it has
+    // been replaced. Two proactive reconnects fired five seconds apart in
+    // production — a self-perpetuating pair of providers, each spawning a
+    // replacement every 55 minutes and each triggering a full gap recovery
+    // (679 model refreshes) for nothing. The origin is any path that drops a
+    // provider without running its clearTimers(); rather than hunt every such
+    // path, an orphaned timer now cancels itself the first time it fires, which
+    // closes the whole class.
+    const isCurrent = () => provider === p;
+
     healthTimerId = setInterval(() => {
       if (shuttingDown) { clearTimers(); return; }
+      if (!isCurrent()) { clearTimers(); return; }   // orphan — self-cancel
       const silentMs = Date.now() - lastBlockMs;
       if (silentMs > HEALTH_TIMEOUT_MS) {
         logger.warn(`No block for ${(silentMs/1000).toFixed(0)}s — reconnecting`);
@@ -183,6 +194,7 @@ async function main(): Promise<void> {
 
     proactiveTimerId = setTimeout(() => {
       if (shuttingDown || reconnecting) return;
+      if (!isCurrent()) { clearTimers(); return; }   // orphan — self-cancel
       logger.info("Proactive WS reconnect (55 min) — pre-empting server timeout");
       clearTimers();
       scheduleReconnect(0);
@@ -390,6 +402,22 @@ async function main(): Promise<void> {
       // The safety timeout fired while the scan was outstanding. Everything from
       // here on would be priced off data older than the timeout itself.
       if (abortController.signal.aborted) return;
+
+      // Free model-error samples. The sweep just read authoritative health
+      // factors; comparing a few against what the model would have computed
+      // costs no RPC and is the only way the measured distribution reaches a
+      // usable sample count — confirmations alone produced ONE sample in
+      // thirteen hours of live running, so the fire decision stayed pinned to
+      // the fallback constant.
+      //
+      // Deliberately uses the oracle's own snapshot, which is what the trigger
+      // reads, rather than the cycle's freshly-fetched prices. Measuring against
+      // fresh prices would understate the error the trigger actually makes.
+      if (trigger && oracle) {
+        for (const [local, chain] of tracker.sampleModelError(oracle.snapshotAllPrices(), 5)) {
+          trigger.modelError.record(local, chain);
+        }
+      }
 
       if (candidates.length === 0) {
         logger.debug(`Block ${bn}: 0 liquidatable of ${tracker.size}`);

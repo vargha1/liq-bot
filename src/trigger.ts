@@ -93,6 +93,13 @@ const TRIGGER_HF_CEILING = 10n ** 18n; // 1.0 — findLocalCandidates treats thi
 // events in the same block.
 const FIRE_DEDUPE_MS = 2_000;
 
+// Ceiling on a credible sequencer-feed head start. The feed sees a transmit as
+// it is sequenced, so the lead is bounded by how long that takes to appear in a
+// published block — a couple of Arbitrum blocks at most. Anything larger is a
+// hint that never got its log, not a lead. Also bounds how long an unmatched
+// hint may sit in feedSeenAt before it is discarded.
+const MAX_PLAUSIBLE_FEED_LEAD_MS = 3_000;
+
 interface BuiltOpp {
   key:     string;
   hfLocal: number;
@@ -202,7 +209,13 @@ export class TriggerEngine {
           // far ahead of the block the sequencer feed actually saw the price.
           // That lead is what justifies the whole sequencer-feed path, so
           // record the real figure and let it be judged.
-          this.feedSeenAt.set(hint.feed, performance.now());
+          const seenNow = performance.now();
+          // Drop hints whose log never arrived, so they cannot be paired with a
+          // much later one and reported as an implausible lead.
+          for (const [f, t] of this.feedSeenAt) {
+            if (seenNow - t > MAX_PLAUSIBLE_FEED_LEAD_MS) this.feedSeenAt.delete(f);
+          }
+          this.feedSeenAt.set(hint.feed, seenNow);
           logger.debug(`⚡⚡ Sequencer feed: pre-block price for ${hint.feed.slice(0, 10)}… — dispatching early`);
           this.dispatch(touched);
           return;
@@ -368,10 +381,19 @@ export class TriggerEngine {
 
       // The authoritative log for a price the sequencer feed already gave us:
       // the elapsed time is exactly how much head start that path bought.
+      //
+      // Only if the two genuinely correspond. A hint whose transmit never landed
+      // — dropped, re-orged, or a decode that did not match — leaves an entry
+      // that the NEXT log for that feed then pairs with, minutes later. That is
+      // how this metric reported max=89784ms: a 90-second "head start" on a
+      // chain with 250ms blocks, which is not a lead, it is a stale entry. A
+      // real pre-block lead cannot exceed a block time by much, so anything
+      // past the ceiling is discarded rather than recorded.
       const seenAt = this.feedSeenAt.get(feed);
       if (seenAt !== undefined) {
-        metrics.record("trig.feedLead", performance.now() - seenAt);
+        const lead = performance.now() - seenAt;
         this.feedSeenAt.delete(feed);
+        if (lead <= MAX_PLAUSIBLE_FEED_LEAD_MS) metrics.record("trig.feedLead", lead);
       }
 
       const parsed = ANSWER_UPDATED_IFACE.parseLog({ topics: log.topics as string[], data: log.data });
