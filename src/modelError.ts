@@ -54,6 +54,10 @@ export interface ModelErrorStats {
   p95:    number;
   p999:   number;
   worst:  number;
+  /** 0.1th percentile — the NEGATIVE tail. */
+  p001:   number;
+  /** Most negative observation. */
+  best:   number;
   /** Fraction of samples where the chain disagreed about liquidatability. */
   flipRate: number;
 }
@@ -146,6 +150,8 @@ export class ModelErrorTracker {
       p95:      q(0.95),
       p999:     q(0.999),
       worst:    s.length ? s[s.length - 1]! : 0,
+      p001:     q(0.001),
+      best:     s.length ? s[0]! : 0,
       flipRate: this.total > 0 ? this.flips / this.total : 0,
     };
   }
@@ -157,7 +163,13 @@ export class ModelErrorTracker {
     const bps = (v: number) => (v * 10_000).toFixed(1);
     return (
       `model-err n=${st.count} p50=${bps(st.p50)}bps p95=${bps(st.p95)}bps ` +
-      `p99.9=${bps(st.p999)}bps worst=${bps(st.worst)}bps flip=${(st.flipRate * 100).toFixed(1)}%`
+      `p99.9=${bps(st.p999)}bps worst=${bps(st.worst)}bps ` +
+      // The negative tail is the one that costs opportunities rather than gas:
+      // when the model reads a health factor HIGHER than the chain's, a position
+      // that really is liquidatable is filtered out before anything can act on
+      // it. Reporting only the positive tail made that failure mode invisible.
+      `neg(p0.1=${bps(st.p001)}bps min=${bps(st.best)}bps) ` +
+      `flip=${(st.flipRate * 100).toFixed(1)}%`
     );
   }
 

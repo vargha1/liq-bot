@@ -2273,6 +2273,25 @@ export class PositionTracker {
       if (debtUsd8 < MIN_DEBT_USD8) continue;
 
       let pos = this.positions.get(address);
+      // Only reactivate a dormant position that is genuinely below 1.0. The
+      // caller's ceiling now reaches slightly ABOVE 1.0 so the model's negative
+      // error cannot hide a liquidatable borrower, but a position merely near
+      // the threshold is not a reason to pull it out of the dormant tier — that
+      // would put the churn back that the tier exists to prevent.
+      if (!pos && hfE18 >= HF_ONE) {
+        out.push({
+          pos: {
+            address,
+            healthFactor: hfE18,
+            healthFactorNum: Number(hfE18) / 1e18,
+            totalCollateralBase: collateralUsd8,
+            totalDebtBase: debtUsd8,
+            userEmodeCategoryId: state.emodeId,
+          },
+          collaterals, debts, hfLocal: Number(hfE18) / 1e18,
+        });
+        continue;
+      }
       if (!pos) {
         // Crossed the ceiling while parked — pull it back into the active set
         // now that it actually matters, instead of waking every dormant holder

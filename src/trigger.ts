@@ -499,7 +499,14 @@ export class TriggerEngine {
       // feed update, up or down. With ETH/USD updating about once a minute and
       // pricing six reserves, that churned thousands of positions back into the
       // active set for nothing and defeated the dormant tier outright.
-      const candidates = this.tracker.findLocalCandidates(assetsLower, prices, TRIGGER_HF_CEILING, 10);
+      // Scan ABOVE 1.0 deliberately. The model's error runs in both directions,
+      // so a borrower genuinely under 1.0 can be modelled just above it; cutting
+      // candidate generation at exactly 1.0 discarded those before anything
+      // could look at them. Everything between 1.0 and the scan ceiling is
+      // routed to confirmation — shouldFireBlind rejects anything at or above
+      // 1.0 outright — so only an authoritative chain read gets one through.
+      const scanCeiling = BigInt(Math.round(Math.max(1, CONFIG.triggerScanCeiling) * 1e18));
+      const candidates = this.tracker.findLocalCandidates(assetsLower, prices, scanCeiling, 10);
 
       // Audit BEFORE the early return below. This sits here and not further down
       // for a reason that cost a whole run to learn: findLocalCandidates only
@@ -602,7 +609,11 @@ export class TriggerEngine {
   // executor, and to "confirm first" for a marginal one when slots are scarce.
   private shouldFireBlind(b: BuiltOpp): boolean {
     const hfLocal = b.hfLocal;
-    if (!(hfLocal > 0) || hfLocal >= 1) return false;
+    // At or above Aave's own threshold nothing is liquidatable, so a blind fire
+    // is a guaranteed revert. Candidates up here exist only because the scan
+    // ceiling deliberately reaches past 1.0 to catch positions the model reads
+    // high; they belong to the confirmation path, never to this one.
+    if (!(hfLocal > 0) || b.hfE18 >= TRIGGER_HF_CEILING) return false;
 
     // Absolute rail, independent of statistics. A degenerate sample window
     // (every observation identical, say) must not be able to authorise a fire

@@ -167,6 +167,26 @@ export const CONFIG = {
   // the opportunity's own economics (see TriggerEngine.shouldFireBlind). This
   // value only applies before minSamples confirmations have accumulated.
   triggerConfirmHf:     parseFloat(opt("TRIGGER_CONFIRM_HF", "0.995")),
+  // Health factor up to which the trigger will CONSIDER a position, as opposed to
+  // fire on one. Must be >= 1.0.
+  //
+  // Candidate generation used to stop dead at 1.0, which quietly threw away the
+  // other half of the model's error. The measured distribution is symmetric
+  // enough to matter: the model reads a position's health factor with roughly
+  // ten basis points of spread in BOTH directions, so a borrower genuinely at
+  // 0.9995 can be modelled at 1.0005 and be dropped before anything looks at it.
+  // Nothing downstream could recover it, because it never became a candidate.
+  //
+  // The positive tail has always been handled — that is what confirmation is
+  // for. This is the negative tail, and it costs opportunities rather than gas.
+  // Positions between 1.0 and this ceiling are never fired blind
+  // (shouldFireBlind rejects anything at or above 1.0 outright); they go to the
+  // confirmation path, and only an authoritative chain read below 1.0 lets one
+  // through. The cost is a few extra confirmations, all of them cheap reads.
+  //
+  // Set to 1.0 to restore the old behaviour. Sized against the measured
+  // p99.9 of ~11.7 bps.
+  triggerScanCeiling:   parseFloat(opt("TRIGGER_SCAN_CEILING", "1.0015")),
   // Absolute rail: never fire without confirmation above this local health
   // factor, whatever the measured distribution says. Guards against a
   // degenerate sample window authorising a fire arbitrarily close to 1.0.
