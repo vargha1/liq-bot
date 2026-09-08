@@ -100,6 +100,13 @@ const FIRE_DEDUPE_MS = 2_000;
 // hint may sit in feedSeenAt before it is discarded.
 const MAX_PLAUSIBLE_FEED_LEAD_MS = 3_000;
 
+// How long to trust a "not liquidatable" verdict from the chain, and how far the
+// model health factor must move to override it early. 5 bps is well under the
+// ~13 bps these positions would have to travel to cross, so a genuine move
+// always re-confirms while a stationary one costs nothing.
+const NOT_LIQUIDATABLE_COOLDOWN_MS = 30_000;
+const NOT_LIQUIDATABLE_HF_DELTA    = 5n * 10n ** 14n;   // 0.0005 HF
+
 interface BuiltOpp {
   key:     string;
   hfLocal: number;
@@ -122,6 +129,9 @@ export class TriggerEngine {
   // matching log. The gap between the two IS the pre-block lead (trig.feedLead).
   private feedSeenAt   = new Map<string, number>();
   private refreshThrottle = new Map<string, number>();// asset → last forced-refresh ts
+  // borrower → the chain said "not liquidatable" at this model health factor,
+  // hold off re-confirming until this time unless the model figure moves.
+  private notLiquidatable = new Map<string, { until: number; hf: bigint }>();
 
   // Measured model-vs-chain disagreement, fed by every confirmation. Replaces
   // the hardcoded TRIGGER_CONFIRM_HF as the basis for the fire decision.
@@ -539,6 +549,29 @@ export class TriggerEngine {
         const lastFire = this.firedAt.get(key);
         if (lastFire && now - lastFire < FIRE_DEDUPE_MS) continue;  // dedupe multi-feed bursts
 
+        // Skip borrowers the chain recently reported as not liquidatable, unless
+        // their model health factor has actually moved since. The escape hatch is
+        // what makes this safe: prices moving is the only way one of these can
+        // cross, and that necessarily changes the model figure.
+        const nl = this.notLiquidatable.get(key);
+        if (nl) {
+          if (now >= nl.until) {
+            this.notLiquidatable.delete(key);
+          } else if (cand.pos.healthFactor >= TRIGGER_HF_CEILING) {
+            // Only a position the model still puts AT OR ABOVE the threshold may
+            // be suppressed. Gating on movement alone was wrong and a brute-force
+            // check caught it: a borrower recorded at 1.0000 that falls to 0.9996
+            // has moved four basis points — under any sane delta — yet it has
+            // crossed, and suppressing it would discard the exact event this
+            // engine exists to catch. Anything the model now reads below 1.0 goes
+            // to confirmation regardless of how little it moved.
+            const moved = cand.pos.healthFactor > nl.hf
+              ? cand.pos.healthFactor - nl.hf
+              : nl.hf - cand.pos.healthFactor;
+            if (moved < NOT_LIQUIDATABLE_HF_DELTA) continue;
+          }
+        }
+
         // Captured before buildFromLocal or any later confirmation can mutate it.
         const hfE18 = cand.pos.healthFactor;
 
@@ -726,12 +759,21 @@ export class TriggerEngine {
           const hf = confirmed.get(m.key);
           if (hf === undefined) continue;             // unknown — do not gamble gas
           if (hf >= 10n ** 18n) {
+            // Remember the verdict. These positions are not transient: a live
+            // run showed the same four borrowers at chain HF 1.0002-1.0014
+            // being re-confirmed on every dispatch that touched their assets,
+            // for ten minutes straight, each one costing a multicall to reach
+            // the answer already known. A health factor only moves when prices
+            // move or interest accrues, so an unchanged model figure cannot
+            // have crossed.
+            this.notLiquidatable.set(m.key, { until: Date.now() + NOT_LIQUIDATABLE_COOLDOWN_MS, hf: m.hfE18 });
             logger.debug(
               `  trigger: ${m.key.slice(0,10)}… localHF=${m.hfLocal.toFixed(4)} but chain HF=` +
               `${(Number(hf) / 1e18).toFixed(6)} — not liquidatable, skipping`
             );
             continue;
           }
+          this.notLiquidatable.delete(m.key);
           survivors.push(m);
         }
         if (survivors.length > 0) this.fireAll(survivors, Date.now());
@@ -742,6 +784,11 @@ export class TriggerEngine {
   // firedAt only exists to dedupe within FIRE_DEDUPE_MS; without this it grows
   // one entry per borrower ever triggered and never shrinks.
   private pruneFiredAt(now: number): void {
+    // The not-liquidatable map is keyed the same way and expires on its own
+    // schedule; sweep it here so it cannot grow one entry per borrower ever seen.
+    for (const [k, v] of this.notLiquidatable) {
+      if (now >= v.until) this.notLiquidatable.delete(k);
+    }
     if (this.firedAt.size < 512) return;
     for (const [k, ts] of this.firedAt) {
       if (now - ts > FIRE_DEDUPE_MS * 10) this.firedAt.delete(k);

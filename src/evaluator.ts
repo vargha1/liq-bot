@@ -452,13 +452,24 @@ export class Evaluator {
 
     // An opportunity below the profit floor is routine, not a warning — during a
     // crash there can be hundreds per second. Keep the profitable ones at info.
-    const logFn = finalNetProfit >= CONFIG.minProfitUsd ? logger.info.bind(logger) : logger.debug.bind(logger);
+    //
+    // "Profitable" is not the same as "actionable". Since candidate generation
+    // deliberately reaches above 1.0 to catch positions the model reads high,
+    // most of what arrives here sits just over Aave's threshold and cannot be
+    // liquidated at all. Logging those at info claimed the bot had found money
+    // and done nothing about it — a live run printed the same USDC.e position at
+    // "net=$27.91 PROFITABLE" every thirty seconds for ten minutes while it was
+    // never once liquidatable. Only a genuinely liquidatable, genuinely
+    // profitable opportunity earns info.
+    const liquidatable = best.healthFactor < 1;
+    const profitable   = finalNetProfit >= CONFIG.minProfitUsd;
+    const logFn = (profitable && liquidatable) ? logger.info.bind(logger) : logger.debug.bind(logger);
     logFn(
       `  eval ${best.collateralSymbol}/${best.debtSymbol} | ` +
       `HF=${best.healthFactor.toFixed(4)} debt=$${best.debtToCoverUsd.toFixed(2)} ` +
       `bonus=$${best.expectedBonusUsd.toFixed(2)} gas=$${finalGasCostUsd.toFixed(2)} ` +
       `net=$${finalNetProfit.toFixed(2)} ` +
-      `${finalNetProfit >= CONFIG.minProfitUsd ? "PROFITABLE" : "below min"}`
+      `${!profitable ? "below min" : liquidatable ? "PROFITABLE" : "profitable but HF>=1 — needs confirmation"}`
     );
 
     if (finalNetProfit < CONFIG.minProfitUsd) {
