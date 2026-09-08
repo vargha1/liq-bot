@@ -166,12 +166,19 @@ async function main(): Promise<void> {
     const boundStr = bs && bs.evaluated + bs.skipped > 0
       ? ` bound=${bs.pct.toFixed(1)}%(${bs.skipped}/${bs.skipped + bs.evaluated})`
       : "";
+    // What the trigger has actually seen. `liquidatable` above is the polling
+    // cycle's counter and reads zero forever in trigger-only mode, so on its own
+    // it cannot distinguish a working engine from a dead one.
+    const ts = trigger?.triggerStats();
+    const trigStr = ts
+      ? ` trig=cand${ts.candidates}/rej${ts.rejected}/fired${ts.fired}`
+      : "";
     logger.info(
       `📊 uptime=${upMin}m | cycles=${cycles} | liquidatable=${liquidatable} | ` +
       `executed=${executed} | profit=$${totalProfitUsd.toFixed(2)} | ` +
       `watching=${tracker?.size ?? 0} dormant=${tracker?.dormantSize ?? 0}` +
       (cov ? ` model=${cov.modelled}/${cov.total}` : "") +
-      dangerStr + rpcStr + boundStr +
+      dangerStr + rpcStr + boundStr + trigStr +
       (CONFIG.sweepEnabled ? "" : " | trigger-only")
     );
     // Two distinct measurements, deliberately reported separately.
@@ -923,6 +930,17 @@ async function main(): Promise<void> {
     // once the dormant tier passed ~6 000 entries.
     tracker.wakeExpiredDormant(DORMANT_WAKE_INTERVAL_MS);
   }, DORMANT_WAKE_INTERVAL_MS);
+
+  // Trigger-only mode: nothing else returns a healthy position to the dormant
+  // tier, and live Aave events keep promoting them out of it. Pure computation
+  // over the active set — no RPC — so it can run often and cheaply.
+  if (!CONFIG.sweepEnabled) {
+    setInterval(() => {
+      if (shuttingDown || !ready || pruning) return;
+      try { tracker.reparkHealthy(oracle.snapshotAllPrices()); }
+      catch (e: any) { logger.debug(`repark failed: ${e?.message ?? e}`); }
+    }, 60_000);
+  }
 
   // Trigger-only mode: the sweep is no longer providing authoritative health
   // factors, so this walks the watchlist in a rotation at one multicall per tick

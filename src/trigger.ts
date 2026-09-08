@@ -133,6 +133,19 @@ export class TriggerEngine {
   // hold off re-confirming until this time unless the model figure moves.
   private notLiquidatable = new Map<string, { until: number; hf: bigint }>();
 
+  // What the engine has actually seen. In trigger-only mode the heartbeat's
+  // `liquidatable` counter is permanently zero — it is incremented by the
+  // polling cycle, which no longer runs — so without these there is no way to
+  // tell a trigger that is finding and correctly rejecting near-threshold
+  // borrowers from one that has silently stopped looking.
+  private statCandidates = 0;   // model put them under 1.0
+  private statConfirmRejected = 0;  // chain disagreed
+  private statFired = 0;
+
+  triggerStats(): { candidates: number; rejected: number; fired: number } {
+    return { candidates: this.statCandidates, rejected: this.statConfirmRejected, fired: this.statFired };
+  }
+
   // Measured model-vs-chain disagreement, fed by every confirmation. Replaces
   // the hardcoded TRIGGER_CONFIRM_HF as the basis for the fire decision.
   readonly modelError = new ModelErrorTracker();
@@ -530,6 +543,10 @@ export class TriggerEngine {
 
       if (candidates.length === 0) return;
 
+      for (const c of candidates) {
+        if (c.pos.healthFactor < TRIGGER_HF_CEILING) this.statCandidates++;
+      }
+
       const gasPrice = this.getGasPrice();
       const ethPrice = this.evaluator.ethPriceCached() || 3000; // gas-cost input only
 
@@ -715,6 +732,7 @@ export class TriggerEngine {
         }
         this.firedAt.set(key, now);
         fired++;
+        this.statFired++;
         logger.info(
           `⚡ Trigger: ${key.slice(0,10)}… localHF=${hfLocal.toFixed(4)} ` +
           `${opp!.collateralSymbol}->>${opp!.debtSymbol} net=$${opp!.netProfitUsd.toFixed(2)} — firing`
@@ -766,6 +784,7 @@ export class TriggerEngine {
             // the answer already known. A health factor only moves when prices
             // move or interest accrues, so an unchanged model figure cannot
             // have crossed.
+            this.statConfirmRejected++;
             this.notLiquidatable.set(m.key, { until: Date.now() + NOT_LIQUIDATABLE_COOLDOWN_MS, hf: m.hfE18 });
             logger.debug(
               `  trigger: ${m.key.slice(0,10)}… localHF=${m.hfLocal.toFixed(4)} but chain HF=` +

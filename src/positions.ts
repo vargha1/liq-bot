@@ -2641,6 +2641,40 @@ export class PositionTracker {
     return out;
   }
 
+  // Re-park active positions the model says are healthy, using no RPC at all.
+  //
+  // Required by trigger-only mode. Live Aave events call upsert(), which pulls a
+  // dormant borrower back into the active set on the theory that a transaction
+  // may have moved its health factor — and only the polling sweep ever parked it
+  // again. With the sweep off, that is a one-way door: a live run showed
+  // `watching` climbing 691 -> 737 over 45 minutes at roughly one position a
+  // minute while `danger` stayed pinned at 680, because these wake at their old
+  // healthy health factor and so never enter the danger tier at all. Left alone
+  // the entire dormant tier drains into the active set over a few days.
+  //
+  // The model already knows each position's health factor exactly, so this is
+  // pure computation over the active set — no authoritative read needed to
+  // decide that something above HF_WATCH belongs back in the dormant tier.
+  reparkHealthy(prices: Map<string, bigint>): number {
+    if (this.positions.size === 0 || !this.reserves.loaded) return 0;
+    const nowSec = Math.floor(Date.now() / 1000);
+    let parked = 0;
+    for (const addr of [...this.positions.keys()]) {
+      const state = this.userStates.get(addr);
+      if (!state) continue;                 // unmodelled — leave it alone
+      const r = this.evaluateUserState(state, prices, nowSec);
+      if (!r) continue;                     // missing price — cannot judge
+      if (r.debtUsd8 === 0n) continue;      // no debt; eviction is a separate concern
+      if (r.hfE18 <= HF_WATCH) continue;    // still worth watching
+      this.parkAsDormant(addr, r.hfE18);
+      parked++;
+    }
+    if (parked > 0) {
+      logger.debug(`repark: ${parked} healthy positions returned to dormant (${this.positions.size} active)`);
+    }
+    return parked;
+  }
+
   // Rotating authoritative verification of the model, for trigger-only operation.
   //
   // With the sweep disabled nothing else reads a health factor from the chain,
