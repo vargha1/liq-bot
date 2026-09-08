@@ -2641,6 +2641,46 @@ export class PositionTracker {
     return out;
   }
 
+  // Rotating authoritative verification of the model, for trigger-only operation.
+  //
+  // With the sweep disabled nothing else reads a health factor from the chain,
+  // so nothing would notice the model going wrong — an Aave upgrade, a reserve
+  // added, an e-mode category changed — and the trigger would keep committing
+  // gas against it with full confidence. This walks the whole watchlist in a
+  // rotation at one multicall per tick so that drift shows up as arith-err
+  // moving off zero, which is exactly the signal the sweep used to provide.
+  //
+  // The model figure is captured BEFORE confirmHealthFactors runs, because that
+  // writes the chain value straight into pos.healthFactor and would otherwise
+  // leave nothing to compare against.
+  private auditCursor = 0;
+
+  async auditModel(prices: Map<string, bigint>, n: number): Promise<Array<[bigint, bigint]>> {
+    if (n <= 0) return [];
+    const all = [...this.positions.keys(), ...this.dormant.keys()];
+    if (all.length === 0) return [];
+
+    const picks: string[] = [];
+    const take = Math.min(n, all.length);
+    for (let i = 0; i < take; i++) picks.push(all[(this.auditCursor + i) % all.length]!);
+    this.auditCursor = (this.auditCursor + take) % all.length;
+
+    const local = new Map<string, bigint>();
+    for (const a of picks) {
+      const h = this.localHealthFactor(a, prices);
+      if (h !== null && h > 0n) local.set(a, h);
+    }
+    if (local.size === 0) return [];
+
+    const chain = await this.confirmHealthFactors([...local.keys()]);
+    const out: Array<[bigint, bigint]> = [];
+    for (const [a, l] of local) {
+      const c = chain.get(a);
+      if (c !== undefined && c > 0n) out.push([l, c]);
+    }
+    return out;
+  }
+
   // Evaluate an arbitrary user state through the PRODUCTION health-factor path.
   //
   // Exposed for checkModel.ts, which previously re-implemented the formula

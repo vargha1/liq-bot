@@ -27,8 +27,25 @@ async function main(): Promise<void> {
   logger.info("═══════════════════════════════════════════════════════════");
   logger.info(`Contract   : ${CONFIG.contractAddress}`);
   logger.info(`Min profit : $${CONFIG.minProfitUsd}`);
-  logger.info(`Batch size : ${CONFIG.positionsPerCycle} positions/cycle`);
+  logger.info(CONFIG.sweepEnabled
+    ? `Batch size : ${CONFIG.positionsPerCycle} positions/cycle`
+    : `Mode       : TRIGGER-ONLY (polling sweep disabled)`);
   logger.info("═══════════════════════════════════════════════════════════");
+  if (!CONFIG.sweepEnabled) {
+    logger.warn(
+      "Polling sweep disabled — detection is entirely event-driven. Dormant " +
+      "re-parking, breakdown prewarm and dust eviction are off with it; the " +
+      "model is verified instead by MODEL_AUDIT_POSITIONS " +
+      `(${CONFIG.modelAuditPositions} every ${CONFIG.modelAuditIntervalMs}ms).`
+    );
+    if (CONFIG.modelAuditPositions <= 0) {
+      logger.error(
+        "MODEL_AUDIT_POSITIONS=0 with the sweep off: NOTHING will read an " +
+        "authoritative health factor, so model drift cannot be detected. " +
+        "Strongly consider setting it above zero."
+      );
+    }
+  }
 
   // ── Shared state ──────────────────────────────────────────────────────────
   let lastSeenBlock      = 0n;
@@ -117,6 +134,10 @@ async function main(): Promise<void> {
   setInterval(() => {
     // The block loop is deliberately paused for the duration of the startup
     // prune, so warning about it there is pure noise.
+    // lastCycleBlockMs is only written by runCycle, so with the sweep disabled it
+    // never advances and this would warn every 30s for the life of the process.
+    // There is no cycle loop to be stuck in trigger-only mode.
+    if (!CONFIG.sweepEnabled) return;
     if (ready && !shuttingDown && !pruning && Date.now() - lastCycleBlockMs > 60_000) {
       const silentSec = ((Date.now() - lastCycleBlockMs) / 1000).toFixed(0);
       logger.warn(`\u26A0\uFE0F  Watchdog: no cycle processed for ${silentSec}s — check for stuck operations`);
@@ -150,7 +171,8 @@ async function main(): Promise<void> {
       `executed=${executed} | profit=$${totalProfitUsd.toFixed(2)} | ` +
       `watching=${tracker?.size ?? 0} dormant=${tracker?.dormantSize ?? 0}` +
       (cov ? ` model=${cov.modelled}/${cov.total}` : "") +
-      dangerStr + rpcStr + boundStr
+      dangerStr + rpcStr + boundStr +
+      (CONFIG.sweepEnabled ? "" : " | trigger-only")
     );
     // Two distinct measurements, deliberately reported separately.
     // model-err is the trigger's own price-path error and is what the
@@ -318,7 +340,10 @@ async function main(): Promise<void> {
     // When a position crosses HF=1.0 its breakdown is already cached, saving
     // the breakdown round-trip on the hot path when it matters most. The
     // trigger engine also needs these cached breakdowns to compute local HF.
-    if (ready && !pruning && !reconnecting && bn % 30n === 0n) {  // every 30 blocks (~7.5s)
+    // Skipped entirely in trigger-only mode: findLocalCandidates reads the model
+    // directly and has not depended on the breakdown cache since it was rewritten,
+    // so this would be pure RPC spend for a cache nothing consults.
+    if (CONFIG.sweepEnabled && ready && !pruning && !reconnecting && bn % 30n === 0n) {
       tracker.prewarmDangerBreakdowns().catch(() => { /* silent */ });
     }
 
@@ -336,6 +361,7 @@ async function main(): Promise<void> {
   // it picks up the newest block at that point — requests in between collapse
   // into that single pending run rather than queueing.
   function requestCycle(bn: bigint, tEvent?: number): void {
+    if (!CONFIG.sweepEnabled) return;   // trigger-only mode
     if (!ready || refreshing || pruning || shuttingDown || reconnecting) return;
 
     // Backpressure: the sweep is the safety net, the trigger engine is the
@@ -887,11 +913,31 @@ async function main(): Promise<void> {
   const DORMANT_WAKE_INTERVAL_MS = 5 * 60 * 1000;
   setInterval(() => {
     if (shuttingDown) return;
+    // Only the sweep parks a woken position back into the dormant tier. With the
+    // sweep off, waking would drain all ~16k dormant entries into the active set
+    // over an hour and nothing would ever return them, so the tier is left
+    // alone — the model evaluates dormant positions in place regardless.
+    if (!CONFIG.sweepEnabled) return;
     // The interval is passed in so the wake budget can be sized against the
     // recheck window instead of a fixed 500 that silently stopped honouring it
     // once the dormant tier passed ~6 000 entries.
     tracker.wakeExpiredDormant(DORMANT_WAKE_INTERVAL_MS);
   }, DORMANT_WAKE_INTERVAL_MS);
+
+  // Trigger-only mode: the sweep is no longer providing authoritative health
+  // factors, so this walks the watchlist in a rotation at one multicall per tick
+  // purely so model drift still shows up in arith-err.
+  if (!CONFIG.sweepEnabled && CONFIG.modelAuditPositions > 0) {
+    setInterval(async () => {
+      if (shuttingDown || !ready || pruning || reconnecting) return;
+      try {
+        const pairs = await tracker.auditModel(
+          oracle.snapshotAllPrices(), CONFIG.modelAuditPositions,
+        );
+        for (const [local, chain] of pairs) trigger.arithmeticError.record(local, chain);
+      } catch { /* best-effort */ }
+    }, CONFIG.modelAuditIntervalMs);
+  }
 
   await trigger.start().catch(e => logger.warn(`Trigger engine start failed: ${e?.message ?? e}`));
 

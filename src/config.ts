@@ -91,6 +91,41 @@ export const CONFIG = {
   // fires on Chainlink events independently of this interval. Set to 0 to
   // restore the old every-block behaviour.
   cycleMinIntervalMs: parseInt(opt("CYCLE_MIN_INTERVAL_MS", "1000"), 10),
+  // Run the polling sweep at all. Set false for trigger-only operation.
+  //
+  // The sweep is the dominant RPC cost by a wide margin and almost all of it is
+  // redundant. POSITIONS_PER_CYCLE=300 at CYCLE_MIN_INTERVAL_MS=1000 is 300
+  // getUserAccountData reads per second — roughly 400/s as a provider counts it —
+  // spent re-deriving health factors the in-memory model already computes for
+  // free on every price tick, at full coverage, with arith-err measuring the
+  // agreement at 0.0 bps.
+  //
+  // Turning it off removes four things besides candidate detection, and the code
+  // compensates for each rather than leaving them silently broken:
+  //   - dormant re-parking. Only the sweep parks a healthy position back into
+  //     the dormant tier, so wakeExpiredDormant is disabled too; without that it
+  //     would drain the entire dormant tier into the active set over an hour and
+  //     accomplish nothing.
+  //   - breakdown prewarm, which is skipped: findLocalCandidates reads the model
+  //     directly and has not needed the breakdown cache since it was rewritten.
+  //   - dust and bad-debt eviction. findLocalCandidates already refuses to build
+  //     an opportunity below MIN_DEBT_USD8, so this costs tidiness, not safety.
+  //   - the arith-err drift check, which is the one that genuinely matters and
+  //     is replaced by MODEL_AUDIT_POSITIONS below.
+  //
+  // Detection latency is unaffected: the trigger fires on Chainlink events and
+  // never consulted the sweep.
+  sweepEnabled:      opt("SWEEP_ENABLED", "true") !== "false",
+  // Positions verified against the chain per audit tick when the sweep is off.
+  //
+  // With no sweep, NOTHING else reads an authoritative health factor, so a model
+  // that silently drifted — an Aave upgrade, a new reserve, an e-mode change —
+  // would never be caught, and the trigger would keep firing on it with total
+  // confidence. This is that safety net: one multicall per tick, feeding the
+  // same arith-err distribution the sweep used to. At the defaults it is ~0.7
+  // reads/sec against the sweep's ~300. Set 0 to disable (not recommended).
+  modelAuditPositions:  parseInt(opt("MODEL_AUDIT_POSITIONS", "20"), 10),
+  modelAuditIntervalMs: parseInt(opt("MODEL_AUDIT_INTERVAL_MS", "30000"), 10),
   // Head-room added to the estimated gas units. Arbitrum refunds unused L2 gas,
   // but the node reserves gasLimit × maxFeePerGas from the wallet balance when
   // validating a transaction — so an oversized buffer starves concurrent
