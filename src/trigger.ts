@@ -117,6 +117,10 @@ interface BuiltOpp {
   // the original model value is gone — which is precisely the value the error
   // measurement needs.
   hfE18:   bigint;
+  // True when ANY price feeding this position's health factor was inferred from
+  // a Chainlink answer ratio rather than read from Aave's oracle. Such a health
+  // factor is a prediction of what the chain will say, not a reading of it.
+  usedEstimate: boolean;
   opp:     ReturnType<Evaluator["buildFromLocal"]>;
 }
 
@@ -591,12 +595,16 @@ export class TriggerEngine {
 
         // Captured before buildFromLocal or any later confirmation can mutate it.
         const hfE18 = cand.pos.healthFactor;
+        const usedEstimate = this.oracle.anyEstimated([
+          ...cand.collaterals.map(c => c.address),
+          ...cand.debts.map(d => d.address),
+        ]);
 
         const opp = this.evaluator.buildFromLocal(
           cand.pos, cand.collaterals, cand.debts, prices, gasPrice, ethPrice,
         );
         if (!opp) continue;
-        built.push({ key, hfLocal: cand.hfLocal, hfE18, opp });
+        built.push({ key, hfLocal: cand.hfLocal, hfE18, usedEstimate, opp });
       }
       built.sort((a, b) => b.opp!.netProfitUsd - a.opp!.netProfitUsd);
 
@@ -664,6 +672,22 @@ export class TriggerEngine {
     // ceiling deliberately reaches past 1.0 to catch positions the model reads
     // high; they belong to the confirmation path, never to this one.
     if (!(hfLocal > 0) || b.hfE18 >= TRIGGER_HF_CEILING) return false;
+
+    // Never commit gas on a price the chain has not confirmed.
+    //
+    // The first live fire made this concrete. The model read HF 0.9971 from a
+    // ratio-estimated price and fired without confirming; the transaction landed
+    // at block 503713360 and reverted inside validateLiquidationCall, and a
+    // competitor liquidated the same borrower five blocks later. Being FIRST and
+    // still failing rules out losing a race: Aave's oracle simply had not crossed
+    // yet at our block. The estimate was a prediction of a price the chain did
+    // not hold, and liquidationCall is evaluated against the price it does hold.
+    //
+    // The estimate is confirmed within about a second by throttledRefreshMany, so
+    // this costs the blind path only on the very first tick after a feed moves —
+    // exactly the tick where the model is guessing. Everything after it still
+    // fires blind at full speed.
+    if (b.usedEstimate && CONFIG.triggerRequireConfirmedPrice) return false;
 
     // Absolute rail, independent of statistics. A degenerate sample window
     // (every observation identical, say) must not be able to authorise a fire

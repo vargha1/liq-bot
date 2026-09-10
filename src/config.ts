@@ -222,6 +222,21 @@ export const CONFIG = {
   // Set to 1.0 to restore the old behaviour. Sized against the measured
   // p99.9 of ~11.7 bps.
   triggerScanCeiling:   parseFloat(opt("TRIGGER_SCAN_CEILING", "1.0015")),
+  // Require an authoritative price before firing without confirmation.
+  //
+  // The trigger estimates Aave prices from Chainlink answer ratios so it can act
+  // on a feed event immediately. That estimate predicts what Aave's oracle will
+  // return; liquidationCall is evaluated against what it actually returns. When
+  // the two differ the transaction reverts inside validateLiquidationCall having
+  // spent the gas — which is exactly what the first live fire did, at model HF
+  // 0.9971, five blocks before a competitor liquidated the same borrower
+  // successfully.
+  //
+  // With this on, a candidate whose health factor depends on any estimated price
+  // goes to confirmation instead of firing blind. Estimates are replaced by an
+  // authoritative read within about a second, so only the first tick after a feed
+  // moves pays the confirmation; the rest of the fast path is unaffected.
+  triggerRequireConfirmedPrice: opt("TRIGGER_REQUIRE_CONFIRMED_PRICE", "true") !== "false",
   // Absolute rail: never fire without confirmation above this local health
   // factor, whatever the measured distribution says. Guards against a
   // degenerate sample window authorising a fire arbitrarily close to 1.0.

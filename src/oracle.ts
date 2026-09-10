@@ -4,7 +4,16 @@ import { AAVE_ORACLE, ORACLE_ABI, RESERVES } from "./config";
 
 const CACHE_TTL = 15_000;
 
-const priceCache   = new Map<string, { price: bigint; ts: number }>();
+// `estimated` marks a price the bot INFERRED rather than read from the chain —
+// pokePrice writes these from a Chainlink answer ratio when a feed event or a
+// sequencer-feed hint arrives, ahead of any authoritative getAssetPrice.
+//
+// The distinction decides whether gas may be committed without confirmation. An
+// estimated price is a guess about what Aave's oracle will say; the liquidation
+// executes against what it ACTUALLY says. Firing on the guess is how a genuine
+// crossing at model HF 0.9971 met a chain that had not crossed yet and reverted
+// inside validateLiquidationCall.
+const priceCache   = new Map<string, { price: bigint; ts: number; estimated?: boolean }>();
 // Permanently dead feeds — never retry after the first confirmed revert.
 // Populated at runtime when getAssetPrice reverts with no stale fallback.
 // BUG FIX: Added TTL (10 min) so feeds re-enabled upstream are eventually retried.
@@ -261,7 +270,18 @@ export class AaveOracle {
   }
 
   pokePrice(tokenAddress: string, price: bigint): void {
-    priceCache.set(tokenAddress.toLowerCase(), { price, ts: Date.now() });
+    priceCache.set(tokenAddress.toLowerCase(), { price, ts: Date.now(), estimated: true });
+  }
+
+  /** True when the cached price for this asset was inferred, not read on-chain. */
+  isEstimated(tokenAddress: string): boolean {
+    return priceCache.get(tokenAddress.toLowerCase())?.estimated === true;
+  }
+
+  /** True if ANY of these assets is currently priced from an estimate. */
+  anyEstimated(addresses: Iterable<string>): boolean {
+    for (const a of addresses) if (this.isEstimated(a)) return true;
+    return false;
   }
 
   // Force-fetch past the cache TTL — used to establish an authoritative baseline
