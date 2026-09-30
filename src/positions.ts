@@ -2930,6 +2930,10 @@ export class PositionTracker {
 
     const local = new Map<string, bigint>();
     for (const a of picks) {
+      // A borrower with a pending refresh has a knowingly stale model entry;
+      // comparing it to the chain measures the refresh delay, not model drift
+      // (one such sample read -5041 bps and polluted the distribution).
+      if (this.dirtyUsers.has(a)) continue;
       const h = this.localHealthFactor(a, prices);
       if (h !== null && h > 0n) local.set(a, h);
     }

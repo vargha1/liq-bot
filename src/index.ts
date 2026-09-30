@@ -875,6 +875,10 @@ async function main(): Promise<void> {
       .finally(() => {
         pruning = false;
         logger.info("Prune complete — block loop resumed");
+        // Drop the ~60k long-repaid addresses from the persisted borrower list,
+        // otherwise every restart re-sweeps them all (~110s and ~150 heavy calls).
+        // Only debt-free addresses go; a new Borrow event re-admits any of them.
+        try { tracker.pruneFullCache(); } catch { /* non-fatal */ }
         if (!shuttingDown && latestPendingBlock > 0n) {
           onNewBlock(latestPendingBlock);
         }
