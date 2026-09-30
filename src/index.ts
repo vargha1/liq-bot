@@ -7,6 +7,7 @@ import { AaveOracle } from "./oracle";
 import { Evaluator } from "./evaluator";
 import { Executor } from "./executor";
 import { TriggerEngine } from "./trigger";
+import { SvrBidder } from "./svrBidder";
 import { metrics, startMetricsReporter } from "./metrics";
 import { attachCallLimiter, type CallLimiterHandle } from "./rpcLimiter";
 import { ReserveRegistry, TOPIC_RESERVE_DATA_UPDATED } from "./reserveState";
@@ -125,6 +126,7 @@ async function main(): Promise<void> {
   let evaluator: Evaluator;
   let executor:  Executor;
   let trigger:   TriggerEngine;
+  let svr:       SvrBidder | null = null;
 
   // Stage-timing reporter — logs p50/p95/max per stage every 3 minutes.
   startMetricsReporter();
@@ -196,6 +198,7 @@ async function main(): Promise<void> {
       const a = trigger.arithmeticError;
       if (a.count > 0) logger.info(`📐 arith-${a.summary().replace(/^model-err /, "")}`);
     }
+    if (svr) logger.info(`🎯 ${svr.summary()}`);
   }, 300_000);
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -997,6 +1000,23 @@ async function main(): Promise<void> {
     .catch(e => logger.debug(`route warm-up failed: ${e?.message ?? e}`));
 
   await trigger.start().catch(e => logger.warn(`Trigger engine start failed: ${e?.message ?? e}`));
+
+  // Chainlink SVR bidding. The trigger engine above reacts to price updates that
+  // land publicly; Aave's SVR feeds update inside the auction winner's own
+  // transaction, so those positions can only be reached by winning the auction.
+  // Off by default, and dry-run (log only) until SVR_DRY_RUN=false.
+  if (CONFIG.svrEnabled) {
+    svr = new SvrBidder({
+      trigger,
+      wallet,
+      getReadProvider,
+      canBid: () => ready && !pruning && !reconnecting && !shuttingDown,
+    });
+    await svr.start().catch(e => {
+      logger.error(`SVR bidder start failed: ${e?.message ?? e}`);
+      svr = null;
+    });
+  }
 
   ready = true;
   logger.info("Bot ready — watching for blocks");

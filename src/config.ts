@@ -258,6 +258,44 @@ export const CONFIG = {
   // ahead of — or shed — the calls that gate a fire. Defaults to RPC_URL.
   hotRpcUrl:            opt("HOT_RPC_URL", ""),
   hotRpcCallsPerSecond: parseInt(opt("HOT_RPC_CALLS_PER_SECOND", "20"), 10),
+
+  // ── Chainlink SVR / Atlas bidding ──────────────────────────────────────────
+  // Aave's Arbitrum oracle reads SVR feeds, whose price updates are sold to the
+  // searcher who bids most for the right to liquidate behind them. Without
+  // bidding, this bot never sees those positions become liquidatable: the price
+  // lands inside the winner's own transaction. See svrBidder.ts.
+  //
+  // Off unless asked for. Even when on it only LOGS what it would bid until
+  // SVR_DRY_RUN=false, so turning it on risks nothing.
+  svrEnabled:         opt("SVR_ENABLED", "false") === "true",
+  svrDryRun:          opt("SVR_DRY_RUN", "true") !== "false",
+  svrWsUrl:           opt("SVR_WS_URL", "wss://svr-bid-endpoint.chain.link/ws/solver"),
+  // The deployed AaveSvrSolver (SvrSolver.sol). Required for live bidding only.
+  svrSolverAddress:   opt("SVR_SOLVER_ADDRESS", ""),
+  // Share of the estimated net profit offered as the bid. The winner is whoever
+  // bids most, so this is the whole competitive lever: higher wins more auctions
+  // and keeps less of each. Observed winning bids sit very close to break-even.
+  svrBidFraction:     parseFloat(opt("SVR_BID_FRACTION", "0.90")),
+  // Skip an auction unless the profit left after the bid clears this, in USD.
+  svrMinNetUsd:       parseFloat(opt("SVR_MIN_NET_USD", "0.05")),
+  // Upper bound on the gas limit signed into a solver operation (the bot signs
+  // for what the chosen liquidations need, never more). Atlas sizes the required
+  // bond from the limit plus the oracle update's own gas, so a tight cap keeps
+  // the bond small. One liquidation costs about 0.85M gas, so 2.0M fits two. The
+  // DappControl's own ceiling is 6,000,000.
+  svrSolverGas:       BigInt(opt("SVR_SOLVER_GAS", "2000000")),
+  // Liquidations bundled into one operation, most profitable first.
+  svrMaxItems:        parseInt(opt("SVR_MAX_ITEMS", "3"), 10),
+  // Health factor up to which a position is included as a BONUS item. Items below
+  // 1.0 are the ones the bid is sized on; ones in [1.0, ceiling) ride along and
+  // are skipped on-chain if they turn out not to be liquidatable. Operations that
+  // fail the gateway's simulation never land on-chain, so over-including is free.
+  svrScanCeiling:     parseFloat(opt("SVR_SCAN_CEILING", "1.002")),
+  // Estimated gas beyond the three limits Atlas counts: metacall bookkeeping and
+  // calldata. Only used to size the bond check.
+  svrOverheadGas:     BigInt(opt("SVR_OVERHEAD_GAS", "700000")),
+  // Flat allowance, in USD, for the L1 data fee Atlas bills on the operation.
+  svrExtraCostUsd:    parseFloat(opt("SVR_EXTRA_COST_USD", "0.03")),
 } as const;
 
 // ─── Aave V3 Arbitrum core addresses ─────────────────────────────────────────

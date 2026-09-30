@@ -9,6 +9,8 @@
     "diag-excel": "tsx src/diagnose.ts --excel",
     "check-feeds": "tsx src/checkFeeds.ts",
     "check-feed": "tsx src/checkSequencerFeed.ts",
+    "svr": "tsx src/svrTool.ts",
+    "svr-selftest": "tsx src/svrSelftest.ts",
     "build": "tsc",
     "start": "node dist/index.js"
   },
@@ -23,6 +25,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
+    "solc": "^0.8.28",
     "tsx": "^4.15.0",
     "typescript": "^5.4.5"
   }

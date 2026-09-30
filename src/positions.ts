@@ -2351,11 +2351,18 @@ export class PositionTracker {
   // Only positions the moved assets can actually affect are scanned, via
   // assetIndex, so cost scales with holders-of-that-asset rather than watchlist
   // size.
+  //
+  // `hypothetical` evaluates against prices that are NOT on-chain yet (an SVR
+  // auction's pending update). Nothing it computes may leak into live state: no
+  // model-error sample, no cached local HF, no published figures on the tracked
+  // position and no reactivation of a dormant one. Candidates carry a detached
+  // copy of the position instead.
   findLocalCandidates(
     assetsLower: Set<string>,
     prices: Map<string, bigint>,
     ceiling: bigint,
     maxResults = 10,
+    hypothetical = false,
   ): LocalCandidate[] {
     const out: LocalCandidate[] = [];
     if (assetsLower.size === 0 || !this.reserves.loaded) return out;
@@ -2407,10 +2414,13 @@ export class PositionTracker {
       // health factors anywhere in the bot derived from the SAME price snapshot
       // the fire decision uses, which makes them the only valid basis for
       // measuring how wrong that decision can be.
-      this.noteLocalEval(address, evaluated.hfE18);
+      // A hypothetical pass must feed neither of these: one is a sample of the
+      // model against the CHAIN, the other is a skip basis valid only for prices
+      // the chain actually holds.
+      if (!hypothetical) this.noteLocalEval(address, evaluated.hfE18);
       // Cache the result against the prices that produced it, so the next tick
       // can bound this position instead of recomputing it.
-      this.rememberLocalHf(address, state, prices, evaluated.hfE18, nowMs);
+      if (!hypothetical) this.rememberLocalHf(address, state, prices, evaluated.hfE18, nowMs);
       const { hfE18, collateralUsd8, debtUsd8 } = evaluated;
       // Exclusive: Aave liquidates only when healthFactor < 1e18, so a position
       // exactly at the ceiling is not liquidatable either.
@@ -2422,6 +2432,22 @@ export class PositionTracker {
       // Per-asset balances are only needed now, for the handful that crossed.
       const { collaterals, debts } = this.materialiseState(state, ctxOf);
       if (collaterals.length === 0 || debts.length === 0) continue;
+
+      if (hypothetical) {
+        // Detached copy: the tracked position keeps describing the chain.
+        out.push({
+          pos: {
+            address,
+            healthFactor: hfE18,
+            healthFactorNum: Number(hfE18) / 1e18,
+            totalCollateralBase: collateralUsd8,
+            totalDebtBase: debtUsd8,
+            userEmodeCategoryId: state.emodeId,
+          },
+          collaterals, debts, hfLocal: Number(hfE18) / 1e18, debtUsd8,
+        });
+        continue;
+      }
 
       let pos = this.positions.get(address);
       // Only reactivate a dormant position that is genuinely below 1.0. The

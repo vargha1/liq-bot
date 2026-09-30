@@ -47,6 +47,8 @@ import type { Executor } from "./executor";
 import { metrics } from "./metrics";
 import { SequencerFeedWatcher, type FeedHint } from "./sequencerFeed";
 import { ModelErrorTracker } from "./modelError";
+import { SVR_ROUND_TOPIC } from "./svrAtlas";
+import type { LiquidationOpportunity } from "./types";
 
 // Chainlink AggregatorInterface — roundId is uint256, NOT int256. The canonical
 // signature decides the topic hash, so getting this wrong silently matches zero
@@ -107,6 +109,25 @@ const MAX_PLAUSIBLE_FEED_LEAD_MS = 3_000;
 const NOT_LIQUIDATABLE_COOLDOWN_MS = 30_000;
 const NOT_LIQUIDATABLE_HF_DELTA    = 5n * 10n ** 14n;   // 0.0005 HF
 
+// How long an SVR auction's announced price may stand in for the answer of the
+// secondary-transmit log that follows it. The update lands within a block or two
+// of the auction closing (about 2s), so anything older is some other update.
+const SVR_HINT_MAX_AGE_MS = 10_000;
+
+// Re-anchor the price estimates against the chain this often. SVR feeds emit no
+// AnswerUpdated, so nothing else keeps the (price, answer) pair fresh between
+// updates, and an anchor older than BASIS_MAX_AGE_MS is refused.
+const BASIS_RESEED_MS = 4 * 60_000;
+
+// One liquidation the bot would bundle into an SVR bid.
+export interface SvrCandidate {
+  opp:     LiquidationOpportunity;
+  hfLocal: number;
+  // Below 1.0 on the modelled post-update price: the bid may be sized on these.
+  // Candidates at or above 1.0 are bonus items that may not be liquidatable.
+  sure:    boolean;
+}
+
 interface BuiltOpp {
   key:     string;
   hfLocal: number;
@@ -147,6 +168,11 @@ export class TriggerEngine {
   // borrower → the chain said "not liquidatable" at this model health factor,
   // hold off re-confirming until this time unless the model figure moves.
   private notLiquidatable = new Map<string, { until: number; hf: bigint }>();
+  // feed → the price its latest SVR auction announced. The secondary-transmit log
+  // carries a round id but no price, so this is what lets the log be acted on
+  // without a read round-trip.
+  private svrAnswers = new Map<string, { answer: bigint; at: number }>();
+  private reseedTimer: ReturnType<typeof setInterval> | null = null;
 
   // What the engine has actually seen. In trigger-only mode the heartbeat's
   // `liquidatable` counter is permanently zero — it is incremented by the
@@ -214,6 +240,16 @@ export class TriggerEngine {
     }
     await this.subscribe(this.getProvider());
     logger.info(`Trigger engine: watching ${this.feeds.size} Chainlink aggregators for AnswerUpdated`);
+
+    // Anchor the price estimates to the chain now, rather than waiting for the
+    // first event per feed. SVR feeds never emit AnswerUpdated, so without this
+    // they would have no anchor at all.
+    await this.seedBasis().catch(e => logger.debug(`Trigger engine: basis seed failed: ${e?.message ?? e}`));
+    if (this.reseedTimer === null) {
+      this.reseedTimer = setInterval(() => {
+        this.seedBasis().catch(e => logger.debug(`Trigger engine: basis reseed failed: ${e?.message ?? e}`));
+      }, BASIS_RESEED_MS);
+    }
 
     if (this.reresolveTimer === null) {
       this.reresolveTimer = setInterval(() => {
@@ -310,9 +346,13 @@ export class TriggerEngine {
   // eth_subscribe fails. A synchronous try/catch around it catches nothing and
   // the failure surfaces as an unhandled rejection instead.
   private async subscribe(provider: ethers.Provider): Promise<void> {
+    // Two topics, OR-ed: a public transmit emits AnswerUpdated, but an SVR
+    // (auction) transmit emits SVR_ROUND_TOPIC instead. Aave reads SVR feeds, so
+    // listening for AnswerUpdated alone leaves the bot blind to every price move
+    // that lands through an auction.
     const filter: ethers.Filter = {
       address: [...this.feeds.keys()],
-      topics:  [ANSWER_UPDATED_TOPIC],
+      topics:  [[ANSWER_UPDATED_TOPIC, SVR_ROUND_TOPIC]],
     };
     try {
       await provider.on(filter, this._onLog);
@@ -421,6 +461,112 @@ export class TriggerEngine {
     this.seqFeed?.setWatchedFeeds(this.feeds.keys());
   }
 
+  // ── SVR support ────────────────────────────────────────────────────────────
+
+  // Anchor every asset's (Aave price, raw feed answer) pair to ONE block. Both
+  // reads go through a single Multicall3 call, so they describe the same state.
+  // An estimate is then basis.price × newAnswer / basis.answer, which for a
+  // direct feed is exactly the new answer and for a CAPO-wrapped asset carries the
+  // slowly-moving exchange rate along unchanged.
+  private async seedBasis(): Promise<void> {
+    if (this.feeds.size === 0) return;
+    const t0 = Date.now();
+    const mc = new ethers.Contract(MULTICALL3, MULTICALL3_ABI, this.getReadProvider());
+    const oracleIface = new ethers.Interface(ORACLE_ABI);
+    const answerIface = new ethers.Interface(["function latestAnswer() view returns (int256)"]);
+
+    const calls: Array<{ target: string; callData: string }> = [];
+    const meta:  Array<{ feed: string; asset?: string }> = [];
+    for (const [feed, assets] of this.feeds) {
+      calls.push({ target: feed, callData: answerIface.encodeFunctionData("latestAnswer", []) });
+      meta.push({ feed });
+      for (const asset of assets) {
+        calls.push({ target: AAVE_ORACLE, callData: oracleIface.encodeFunctionData("getAssetPrice", [asset]) });
+        meta.push({ feed, asset });
+      }
+    }
+    const res: Array<{ success: boolean; returnData: string }> = await mc.tryAggregate(false, calls);
+
+    const answers = new Map<string, bigint>();
+    for (let i = 0; i < calls.length; i++) {
+      const m = meta[i]!;
+      const r = res[i];
+      if (m.asset !== undefined || !r?.success || r.returnData === "0x") continue;
+      try {
+        const a = BigInt(answerIface.decodeFunctionResult("latestAnswer", r.returnData)[0]);
+        if (a > 0n) answers.set(m.feed, a);
+      } catch { /* feed without latestAnswer */ }
+    }
+    let seeded = 0;
+    for (let i = 0; i < calls.length; i++) {
+      const m = meta[i]!;
+      const r = res[i];
+      if (m.asset === undefined || !r?.success || r.returnData === "0x") continue;
+      const answer = answers.get(m.feed);
+      if (answer === undefined) continue;
+      try {
+        const price = BigInt(oracleIface.decodeFunctionResult("getAssetPrice", r.returnData)[0]);
+        if (price <= 0n) continue;
+        // An event that landed while this call was in flight produced a fresher
+        // anchor, pinned to its own block. Never overwrite that with this.
+        const existing = this.basis.get(m.asset);
+        if (existing && existing.at >= t0) continue;
+        this.basis.set(m.asset, { price, answer, at: Date.now() });
+        seeded++;
+      } catch { /* undecodable price */ }
+    }
+    for (const [feed, answer] of answers) {
+      if (!this.lastAnswers.has(feed)) this.lastAnswers.set(feed, answer);
+    }
+    logger.debug(`Trigger engine: anchored ${seeded} price estimates to the chain`);
+  }
+
+  // Remember the price an SVR auction announced for `feed`, so the secondary
+  // transmit log that follows can be acted on without a read round-trip.
+  noteSvrAnswer(feed: string, answer: bigint): void {
+    this.svrAnswers.set(feed.toLowerCase(), { answer, at: Date.now() });
+  }
+
+  // Liquidations that would become available if `feed` moved to `answer`. Pure
+  // computation over the in-memory model: nothing is written to the price cache,
+  // and nothing is fired.
+  //
+  // The price is deliberately kept OUT of the shared cache. It is not on-chain
+  // yet, and every other path in this engine treats a cached price as something
+  // the chain holds; poking it in would send the public executor after positions
+  // Aave's oracle still says are healthy, which is precisely the revert this
+  // whole SVR path exists to avoid. Null when the feed is unknown or no asset
+  // behind it has an anchor to estimate from.
+  svrPreview(feed: string, answer: bigint, gasPrice: bigint): { candidates: SvrCandidate[]; ethPrice: number } | null {
+    const assets = this.feeds.get(feed.toLowerCase());
+    if (!assets || assets.size === 0 || answer <= 0n) return null;
+
+    const prev   = this.lastAnswers.get(feed.toLowerCase()) ?? null;
+    const prices = this.oracle.snapshotAllPrices();
+    const touched = new Set<string>();
+    for (const asset of assets) {
+      const est = this.estimate(asset, answer, prev);
+      if (est === null) continue;
+      prices.set(asset, est);
+      touched.add(asset);
+    }
+    if (touched.size === 0) return null;
+
+    const ceiling = BigInt(Math.round(Math.max(1, CONFIG.svrScanCeiling) * 1e18));
+    const found   = this.tracker.findLocalCandidates(touched, prices, ceiling, 32, true);
+    if (found.length === 0) return { candidates: [], ethPrice: this.evaluator.ethPriceCached() || 3000 };
+
+    const ethPrice = this.evaluator.ethPriceCached() || 3000;
+    const out: SvrCandidate[] = [];
+    for (const c of found) {
+      const opp = this.evaluator.buildFromLocal(c.pos, c.collaterals, c.debts, prices, gasPrice, ethPrice);
+      if (!opp) continue;
+      out.push({ opp, hfLocal: c.hfLocal, sure: c.pos.healthFactor < TRIGGER_HF_CEILING });
+    }
+    out.sort((a, b) => b.opp.netProfitUsd - a.opp.netProfitUsd);
+    return { candidates: out, ethPrice };
+  }
+
   // ── Hot path ───────────────────────────────────────────────────────────────
 
   // Arrow property so `this` binds correctly as a provider listener.
@@ -448,12 +594,23 @@ export class TriggerEngine {
         if (lead <= MAX_PLAUSIBLE_FEED_LEAD_MS) metrics.record("trig.feedLead", lead);
       }
 
-      const parsed = ANSWER_UPDATED_IFACE.parseLog({ topics: log.topics as string[], data: log.data });
-      if (!parsed) return;
-      const current = BigInt(parsed.args[0]);
+      let current: bigint;
+      if (log.topics[0] === SVR_ROUND_TOPIC) {
+        // An auction transmit's log has a round id and no price. The auction
+        // announced the price moments ago; use it as the estimate input when it
+        // is fresh, else leave the answer unknown and take the read path below.
+        const hint = this.svrAnswers.get(feed);
+        current = hint && Date.now() - hint.at < SVR_HINT_MAX_AGE_MS ? hint.answer : 0n;
+      } else {
+        const parsed = ANSWER_UPDATED_IFACE.parseLog({ topics: log.topics as string[], data: log.data });
+        if (!parsed) return;
+        current = BigInt(parsed.args[0]);
+      }
 
       const prev = this.lastAnswers.get(feed) ?? null;
-      this.lastAnswers.set(feed, current);
+      // A zero means "price unknown", never a real answer: storing it would wipe
+      // the baseline every later ratio is computed from.
+      if (current > 0n) this.lastAnswers.set(feed, current);
 
       // Fast path: cached Aave price × raw-answer ratio. Every asset behind this
       // aggregator moves proportionally (a CAPO ratio adapter multiplies by a
