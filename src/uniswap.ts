@@ -10,10 +10,10 @@
  */
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { RESERVES, MULTICALL3, MULTICALL3_ABI } from "./config";
+import { RESERVES, MULTICALL3, MULTICALL3_ABI, UNISWAP_ROUTER, UNISWAP_QUOTER } from "./config";
 
-export const UNISWAP_ROUTER = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"; // SwapRouter02
-export const UNISWAP_QUOTER = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"; // QuoterV2
+// Single source of truth lives in config.ts; re-exported for existing importers.
+export { UNISWAP_ROUTER, UNISWAP_QUOTER };
 
 const QUOTER_ABI = [
   "function quoteExactInput(bytes memory path, uint256 amountIn) external returns (uint256 amountOut, uint160[] memory sqrtPriceX96AfterList, uint32[] memory initializedTicksCrossedList, uint256 gasEstimate)",
@@ -337,7 +337,7 @@ export async function uniswapSwap(
   }
 
   const amountOutMinimum = (bestOut * BigInt(10_000 - slippageBps)) / 10_000n;
-  logger.info(`  Uni best ${bestDesc}: in=${amountIn} out=${bestOut} min=${amountOutMinimum}`);
+  logger.debug(`  Uni best ${bestDesc}: in=${amountIn} out=${bestOut} min=${amountOutMinimum}`);
 
   return {
     swapPath:         bestPath,
@@ -346,4 +346,50 @@ export async function uniswapSwap(
     gasEstimate:      bestGas,
     routeDesc:        bestDesc,
   };
+}
+
+// ─── Startup route warm-up ────────────────────────────────────────────────────
+// Without a cached route the evaluator falls back to a heuristic path whose fee
+// tiers are a guess — a pool that does not exist reverts on-chain — and it can
+// only estimate the swap output from oracle prices. The FIRST liquidation of any
+// pair therefore ran on the least reliable data available. Quoting the common
+// pairs once at startup, paced so it never competes with the hot path, means
+// that first fire already has a verified route and a real quote.
+const WARM_COLLATERALS = ["WETH", "wstETH", "WBTC", "weETH", "ARB", "LINK", "rETH", "tBTC", "AAVE", "USDC", "USDT", "DAI"];
+const WARM_DEBTS       = ["USDC", "USDT", "DAI", "WETH", "USDC.e"];
+
+export async function warmRouteCache(
+  provider: ethers.Provider,
+  prices:   Map<string, bigint>,
+  targetUsd = 5_000,
+  paceMs    = 300,
+): Promise<number> {
+  let warmed = 0;
+  for (const cSym of WARM_COLLATERALS) {
+    const c = RESERVES[cSym];
+    if (!c) continue;
+    const cPrice = prices.get(c.address.toLowerCase()) ?? 0n;
+    if (cPrice <= 0n) continue;
+    for (const dSym of WARM_DEBTS) {
+      const d = RESERVES[dSym];
+      if (!d || d.address.toLowerCase() === c.address.toLowerCase()) continue;
+      const key = pairKey(c.address, d.address);
+      if (routeCache.has(key) || inflightRefreshes.has(key)) continue;
+
+      const amountIn = BigInt(Math.max(1, Math.round(targetUsd / (Number(cPrice) / 1e8) * 10 ** c.decimals)));
+      try {
+        const r = await uniswapSwap(c.address, amountIn, d.address, "", 0, provider);
+        if (r) {
+          routeCache.set(key, {
+            path: r.swapPath, desc: r.routeDesc, out: r.outputAmount,
+            gas: r.gasEstimate, ts: Date.now(), amountIn,
+          });
+          warmed++;
+        }
+      } catch { /* best effort — the on-demand path still works */ }
+      await new Promise(res => setTimeout(res, paceMs));
+    }
+  }
+  logger.info(`routeCache: warmed ${warmed} routes`);
+  return warmed;
 }

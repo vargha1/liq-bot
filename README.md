@@ -7,7 +7,7 @@
 2. WATCH   → listen to Borrow/Supply/Repay/Withdraw events for new/changed positions  
 3. REFRESH → call getUserAccountData() on-chain for highest-risk positions each cycle
 4. EVALUATE→ when HF < 1.0, compute best collateral/debt pair to liquidate
-5. EXECUTE → flash-borrow debt token → liquidate → Odos swap collateral→debt → repay flash loan
+5. EXECUTE → flash-borrow debt token → liquidate → Uniswap V3 swap collateral→debt → repay flash loan
 6. PROFIT  → liquidation bonus stays in contract; owner withdraws
 ```
 
@@ -78,15 +78,20 @@ npm run build && npm start  # production
 
 ```
 src/
-  positions.ts   ← seeds + tracks borrowers (subgraph + live events)
-  oracle.ts      ← reads Aave price oracle on-chain (8 decimal USD prices)
-  evaluator.ts   ← calculates profitable collateral/debt pair + bonus
-  odos.ts        ← assembles collateral→debt swap calldata
-  executor.ts    ← fetches Odos calldata, simulates, submits tx
-  index.ts       ← main loop
-  diagnose.ts    ← show current liquidatable positions, no trades
-  config.ts      ← all addresses, ABIs, reserve configs
-LiquidatorContract.sol ← deploy this
+  index.ts        <- wiring, WS/HTTP providers, background timers
+  trigger.ts      <- Chainlink AnswerUpdated -> local HF -> confirm -> fire
+  positions.ts    <- watchlist + in-memory model (scaled balances, local HF)
+  reserveState.ts <- reserve indices/thresholds/bonuses/e-mode, Aave-exact math
+  oracle.ts       <- Aave oracle prices (block-aware cache, estimates vs reads)
+  evaluator.ts    <- best collateral/debt pair, profit + swap floor
+  uniswap.ts      <- route cache, QuoterV2 batching, startup warm-up
+  executor.ts     <- sign once, broadcast to sequencer + RPCs, nonce mgmt
+  rpcLimiter.ts   <- eth_call rate limiter with bounded backlog
+  modelError.ts   <- measured model-vs-chain error for the fire decision
+  sequencerFeed.ts<- optional pre-block Chainlink transmit() detection
+  diagnose.ts     <- show current liquidatable positions, no trades
+  config.ts       <- addresses, ABIs, env-driven settings
+LiquidatorContract.sol <- deploy this
 ```
 
 ## Withdrawing profits
@@ -104,5 +109,5 @@ await executor.withdraw("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"); // WETH
 - **Still competitive** — other liquidation bots exist. But the window is minutes, not milliseconds, so TypeScript/Node is viable.
 - **Subgraph latency** — The Graph may lag 1–2 blocks. We compensate by also watching live events.
 - **Flash loan cost** — Aave charges 0.05% premium. On a $5,000 liquidation that's $2.50, well below the 5–10% bonus.
-- **Odos quote freshness** — We fetch Odos calldata just before submitting. If the market moves between quote and execution, the simulation will catch it and we abort.
+- **Route freshness** — Routes come from a background QuoterV2 cache. The contract enforces a break-even minimum output on-chain, so a stale route reverts instead of losing money.
 - **Min position size** — Aave requires >$1,000 collateral AND >$1,000 debt for partial liquidations. Below that, full liquidation is allowed. Small positions ($500–$2,000) may not be profitable after gas.

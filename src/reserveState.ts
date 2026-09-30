@@ -141,6 +141,7 @@ export interface ReserveState {
   decimals:             number;
   liquidationThreshold: number;   // bps
   liquidationBonus:     number;   // bps
+  liquidationProtocolFee: number; // bps of the bonus portion kept by Aave
   active:               boolean;
   frozen:               boolean;
   liquidityIndex:       bigint;   // RAY
@@ -166,7 +167,9 @@ function decodeConfig(data: bigint) {
     liquidationThreshold: Number((data >> 16n) & BITS_16),
     liquidationBonus:     Number((data >> 32n) & BITS_16),
     decimals:             Number((data >> 48n) & 0xffn),
-    active:               ((data >> 56n) & 1n) === 1n,
+    // Share of the liquidation BONUS Aave keeps for the treasury (bps).
+    liquidationProtocolFee: Number((data >> 152n) & BITS_16),
+    active:              ((data >> 56n) & 1n) === 1n,
     frozen:               ((data >> 57n) & 1n) === 1n,
   };
 }
@@ -217,6 +220,7 @@ export class ReserveRegistry {
           decimals:             cfg.decimals,
           liquidationThreshold: cfg.liquidationThreshold,
           liquidationBonus:     cfg.liquidationBonus,
+          liquidationProtocolFee: cfg.liquidationProtocolFee,
           active:               cfg.active,
           frozen:               cfg.frozen,
           liquidityIndex:       d.liquidityIndex as bigint,

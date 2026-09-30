@@ -145,9 +145,15 @@ export class Executor {
 
     // Bug #5 fix: periodic nonce sync to detect desync after dropped/replaced txs
     setInterval(async () => {
-      if (this.nonce >= 0) {
+      // The local counter counts transactions that are broadcast but not yet
+      // mined, so it must be compared with the PENDING count, and never while
+      // something is in flight: against "latest" any in-flight tx looks like
+      // drift, and resetting would hand the next liquidation a nonce that is
+      // already taken.
+      if (this.nonce >= 0 && this.inFlight.size === 0 && this.noncePromise === null) {
         try {
-          const onChainNonce = await this.submitWallet.getNonce();
+          const onChainNonce = await this.submitWallet.getNonce("pending");
+          if (this.inFlight.size > 0) return;   // a submission started meanwhile
           if (onChainNonce !== this.nonce) {
             logger.warn(`Nonce desync: local=${this.nonce} on-chain=${onChainNonce} — resetting`);
             this.nonce = onChainNonce;

@@ -10,6 +10,7 @@ import { TriggerEngine } from "./trigger";
 import { metrics, startMetricsReporter } from "./metrics";
 import { attachCallLimiter, type CallLimiterHandle } from "./rpcLimiter";
 import { ReserveRegistry, TOPIC_RESERVE_DATA_UPDATED } from "./reserveState";
+import { warmRouteCache } from "./uniswap";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 const HF_ONE = 10n ** 18n;
@@ -96,10 +97,14 @@ async function main(): Promise<void> {
   let cachedFeeDataTs = 0;
   const FEE_CACHE_MS  = 3_000;
 
-  async function getFeeDataCached(): Promise<ethers.FeeData> {
-    if (cachedFeeData && Date.now() - cachedFeeDataTs < FEE_CACHE_MS) return cachedFeeData;
+  // Hot-path HTTP endpoint (own rate limiter). Assigned at startup; fee reads
+  // prefer it over the WebSocket, which is torn down on every reconnect.
+  let hotProviderRef: ethers.JsonRpcProvider | null = null;
+
+  async function getFeeDataCached(force = false): Promise<ethers.FeeData> {
+    if (!force && cachedFeeData && Date.now() - cachedFeeDataTs < FEE_CACHE_MS) return cachedFeeData;
     try {
-      cachedFeeData   = await provider.getFeeData();
+      cachedFeeData   = await (hotProviderRef ?? provider).getFeeData();
       cachedFeeDataTs = Date.now();
     } catch (e: any) {
       // On provider destroyed, serve stale cached value rather than hanging/throwing
@@ -747,6 +752,16 @@ async function main(): Promise<void> {
   callLimiter = attachCallLimiter(httpProvider, CONFIG.rpcCallsPerSecond, CONFIG.rpcMaxQueueMs);
   const getReadProvider = (): ethers.JsonRpcProvider => httpProvider;
 
+  // Dedicated hot-path connection with its OWN, much larger call budget. Price
+  // and health-factor confirmations gate every fire; on the shared limiter they
+  // queued behind model fill, prefetch and audits, and were shed outright when
+  // that backlog passed the cap ("dropping them unfired"). Same endpoint by
+  // default — set HOT_RPC_URL to use a different one.
+  const hotProvider = new ethers.JsonRpcProvider(CONFIG.hotRpcUrl || CONFIG.rpcUrl, undefined, { staticNetwork: true });
+  attachCallLimiter(hotProvider, CONFIG.hotRpcCallsPerSecond, 1_500);
+  hotProviderRef = hotProvider;
+  const getHotProvider = (): ethers.JsonRpcProvider => hotProvider;
+
   try {
     const [net, bn] = await Promise.all([
       httpProvider.getNetwork(),
@@ -799,8 +814,8 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  tracker   = new PositionTracker(getReadProvider, reserveRegistry);
-  oracle    = new AaveOracle(getReadProvider);
+  tracker   = new PositionTracker(getReadProvider, reserveRegistry, getHotProvider);
+  oracle    = new AaveOracle(getReadProvider, getHotProvider);
   evaluator = new Evaluator(oracle, getReadProvider, reserveRegistry);
   // httpProvider doubles as a broadcast + receipt-polling endpoint so a WS
   // reconnect can't strand an in-flight liquidation.
@@ -812,9 +827,22 @@ async function main(): Promise<void> {
   tracker.ownLiquidator = CONFIG.contractAddress.toLowerCase();
   // Lets trigger-path executions reuse the cycle's fee data instead of paying
   // for a getFeeData round-trip before signing.
+  //
+  // The cache is refreshed by its own timer. It used to be filled only inside
+  // runCycle, and only once a cycle had found a liquidatable candidate — so the
+  // trigger always priced gas at the 0.1 gwei fallback, and every fire paid a
+  // getFeeData round-trip before it could sign. In trigger-only mode no cycle
+  // runs at all.
+  // getFeeData is three requests; 5s is plenty on Arbitrum and keeps this ~0.6 req/s.
+  const FEE_REFRESH_MS = 5_000;
+  const FEE_SOURCE_MAX_AGE_MS = 15_000;
   executor.setFeeDataSource(() =>
-    cachedFeeData && Date.now() - cachedFeeDataTs < FEE_CACHE_MS ? cachedFeeData : null
+    cachedFeeData && Date.now() - cachedFeeDataTs < FEE_SOURCE_MAX_AGE_MS ? cachedFeeData : null
   );
+  getFeeDataCached(true).catch(() => { /* retried by the timer */ });
+  setInterval(() => {
+    if (!shuttingDown) getFeeDataCached(true).catch(() => { /* keep serving the last value */ });
+  }, FEE_REFRESH_MS);
 
   // Event-driven trigger engine — fires liquidations directly on Chainlink feed
   // updates using local HF recomputation, bypassing the polling cycle entirely.
@@ -865,7 +893,7 @@ async function main(): Promise<void> {
   // model=modelled/total never drifts visibly above 100%.
   setInterval(() => {
     if (!shuttingDown && ready) tracker.pruneModel();
-  }, 10 * 60_000);  // every 6 hours
+  }, 10 * 60_000);  // every 10 minutes
 
   // Reserve thresholds and bonuses no longer need their own refresh job — the
   // ReserveRegistry owns them and is refreshed below, e-mode included.
@@ -887,7 +915,8 @@ async function main(): Promise<void> {
   setInterval(async () => {
     if (shuttingDown || !ready) return;
     try {
-      const result = await oracle.prefetchAllPricesWithDropDetection();
+      // force: a TTL-gated read here refreshed only every ~15-20s, not every 5s.
+      const result = await oracle.prefetchAllPricesWithDropDetection(true);
       bgPriceCache = { prices: result.prices, droppedAssets: result.droppedAssets, ts: Date.now() };
       // If price dropped, wake dormant positions immediately (don't wait for cycle)
       if (result.droppedAssets.size > 0) {
@@ -956,6 +985,12 @@ async function main(): Promise<void> {
       } catch { /* best-effort */ }
     }, CONFIG.modelAuditIntervalMs);
   }
+
+  // Verified routes + real quotes for the common pairs, before the first fire
+  // needs them. Background and paced; never blocks startup.
+  oracle.prefetchAllPrices(true)
+    .then(prices => warmRouteCache(getReadProvider(), prices))
+    .catch(e => logger.debug(`route warm-up failed: ${e?.message ?? e}`));
 
   await trigger.start().catch(e => logger.warn(`Trigger engine start failed: ${e?.message ?? e}`));
 

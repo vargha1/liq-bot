@@ -133,6 +133,17 @@ export class TriggerEngine {
   // matching log. The gap between the two IS the pre-block lead (trig.feedLead).
   private feedSeenAt   = new Map<string, number>();
   private refreshThrottle = new Map<string, number>();// asset → last forced-refresh ts
+  // asset → an AUTHORITATIVE price together with the raw feed answer in force at
+  // the block it was read at (reads are pinned to the event's block, so that
+  // answer is the event's own). Estimates are then price × newAnswer / answer,
+  // anchored to a real reading, instead of chaining off the previous estimate —
+  // which is how a confirmation landing between two events used to leave the
+  // cache one full update out of step with the ratio applied next.
+  private basis = new Map<string, { price: bigint; answer: bigint; at: number }>();
+  // Beyond this a basis is not trusted: CAPO ratio adapters drift slowly, so the
+  // longer the anchor the larger the error that "cancels in the ratio" assumption
+  // hides.
+  private static readonly BASIS_MAX_AGE_MS = 10 * 60_000;
   // borrower → the chain said "not liquidatable" at this model health factor,
   // hold off re-confirming until this time unless the model figure moves.
   private notLiquidatable = new Map<string, { until: number; hf: bigint }>();
@@ -237,9 +248,9 @@ export class TriggerEngine {
       if (prev !== null && prev > 0n) {
         const touched = new Set<string>();
         for (const asset of assets) {
-          const cached = this.oracle.peekPrice(asset);
-          if (cached === null || cached <= 0n) continue;
-          this.oracle.pokePrice(asset, (cached * hint.answer) / prev);
+          const est = this.estimate(asset, hint.answer, prev);
+          if (est === null) continue;
+          this.oracle.pokePrice(asset, est);
           touched.add(asset);
         }
         this.lastAnswers.set(hint.feed, hint.answer);
@@ -450,14 +461,16 @@ export class TriggerEngine {
       const touched = new Set<string>();
       const estimated: string[]   = [];
       const needsConfirm: string[] = [];
-      const ratioUsable = prev !== null && prev > 0n && current > 0n;
+      const block = log.blockNumber;
 
       for (const asset of assets) {
-        const cached = this.oracle.peekPrice(asset);
-        if (ratioUsable && cached !== null && cached > 0n) {
-          this.oracle.pokePrice(asset, (cached * current) / prev!);
+        const est = current > 0n ? this.estimate(asset, current, prev) : null;
+        if (est !== null) {
+          // pokePrice refuses when an authoritative read at this block or later
+          // is already cached; the asset still counts as touched (its price is
+          // current) but needs no further confirmation.
+          if (this.oracle.pokePrice(asset, est, block)) estimated.push(asset);
           touched.add(asset);
-          estimated.push(asset);
         } else {
           needsConfirm.push(asset);
         }
@@ -468,7 +481,7 @@ export class TriggerEngine {
       // this aggregator may back six reserves, and six separate getAssetPrice
       // calls per event would dominate the rate-limit budget during volatility.
       if (needsConfirm.length > 0) {
-        const confirmed = await this.throttledRefreshMany(needsConfirm);
+        const confirmed = await this.throttledRefreshMany(needsConfirm, block, current);
         for (const [a, p] of confirmed) if (p > 0n) touched.add(a);
       }
 
@@ -477,29 +490,56 @@ export class TriggerEngine {
       // Dispatch on the estimates FIRST — the whole point is to act before a
       // confirmation round-trip. The confirmation runs behind it and corrects
       // the cache for the next event.
-      this.dispatch(touched);
-      if (estimated.length > 0) this.throttledRefreshMany(estimated).catch(() => {});
+      this.dispatch(touched, block);
+      if (estimated.length > 0) this.throttledRefreshMany(estimated, block, current).catch(() => {});
     } catch { /* never throw from a log handler */ }
   };
 
-  // Batched authoritative refresh with a per-asset throttle. Assets still inside
-  // their throttle window are served from cache and cost nothing; the rest go
-  // out as ONE getAssetsPrices call.
-  private async throttledRefreshMany(assets: string[]): Promise<Array<readonly [string, bigint]>> {
+  // New Aave price for `asset` given the feed's new raw answer.
+  // Preferred: anchor to the last authoritative reading (price × new / answerAtRead).
+  // Fallback: chain off the cached price using the previous answer. null when
+  // neither is available, meaning the asset needs an authoritative read.
+  private estimate(asset: string, answer: bigint, prevAnswer: bigint | null): bigint | null {
+    const b = this.basis.get(asset);
+    if (b && b.answer > 0n && Date.now() - b.at < TriggerEngine.BASIS_MAX_AGE_MS) {
+      const est = (b.price * answer) / b.answer;
+      if (est > 0n) return est;
+    }
+    if (prevAnswer !== null && prevAnswer > 0n) {
+      const cached = this.oracle.peekPrice(asset);
+      if (cached !== null && cached > 0n) return (cached * answer) / prevAnswer;
+    }
+    return null;
+  }
+
+  // Batched authoritative refresh with a per-asset throttle, PINNED to the
+  // block of the event that prompted it. Assets still inside their throttle
+  // window are served from cache and cost nothing; the rest go out as ONE
+  // multicall on the hot provider. When the read lands on exactly the event's
+  // block, the result is recorded as the new estimation basis together with the
+  // answer that event carried.
+  private async throttledRefreshMany(
+    assets: string[], block?: number, answer?: bigint,
+  ): Promise<Array<readonly [string, bigint]>> {
     const now = Date.now();
     const out: Array<readonly [string, bigint]> = [];
     const toFetch: string[] = [];
 
     for (const asset of assets) {
       const last = this.refreshThrottle.get(asset) ?? 0;
-      if (now - last < 1_000) out.push([asset, this.oracle.peekPrice(asset) ?? 0n] as const);
+      if (now - last < 500) out.push([asset, this.oracle.peekPrice(asset) ?? 0n] as const);
       else { this.refreshThrottle.set(asset, now); toFetch.push(asset); }
     }
 
     if (toFetch.length > 0) {
       try {
-        const fetched = await this.oracle.refreshPrices(toFetch);
-        for (const asset of toFetch) out.push([asset, fetched.get(asset) ?? 0n] as const);
+        const { block: readBlock, prices } = await this.oracle.refreshPrices(toFetch, block);
+        const pinned = block !== undefined && readBlock === block && answer !== undefined && answer > 0n;
+        for (const asset of toFetch) {
+          const p = prices.get(asset) ?? 0n;
+          out.push([asset, p] as const);
+          if (pinned && p > 0n) this.basis.set(asset, { price: p, answer: answer!, at: Date.now() });
+        }
       } catch {
         for (const asset of toFetch) out.push([asset, this.oracle.peekPrice(asset) ?? 0n] as const);
       }
@@ -509,7 +549,7 @@ export class TriggerEngine {
 
   // Pure-computation hot path: snapshot prices → find crossed positions → build
   // and submit opportunities. No RPC before submission.
-  private dispatch(assetsLower: Set<string>): void {
+  private dispatch(assetsLower: Set<string>, block?: number): void {
     if (!this.canFire()) return;
 
     const stop = metrics.startTimer("trig.dispatch");
@@ -533,7 +573,10 @@ export class TriggerEngine {
       // routed to confirmation — shouldFireBlind rejects anything at or above
       // 1.0 outright — so only an authoritative chain read gets one through.
       const scanCeiling = BigInt(Math.round(Math.max(1, CONFIG.triggerScanCeiling) * 1e18));
-      const candidates = this.tracker.findLocalCandidates(assetsLower, prices, scanCeiling, 10);
+      // 32, ranked by value inside findLocalCandidates: building is pure CPU and
+      // the profit sort below picks what the scarce executor slots go to. Cutting
+      // to the 10 lowest health factors first let dust crowd out the big ones.
+      const candidates = this.tracker.findLocalCandidates(assetsLower, prices, scanCeiling, 32);
 
       // Audit BEFORE the early return below. This sits here and not further down
       // for a reason that cost a whole run to learn: findLocalCandidates only
@@ -628,7 +671,7 @@ export class TriggerEngine {
         // costs nothing when the candidate survives, since fireAll refreshes the
         // timestamp on the way out.
         for (const m of marginal) this.firedAt.set(m.key, now);
-        this.confirmThenFire(marginal, now);
+        this.confirmThenFire(marginal, now, block);
       }
 
 
@@ -772,10 +815,17 @@ export class TriggerEngine {
   // Marginal candidates: confirm against Aave's own getUserAccountData before
   // committing gas. Anything the chain reports at or above 1.0 is dropped —
   // liquidationCall would revert with HealthFactorNotBelowThreshold().
-  private confirmThenFire(marginal: BuiltOpp[], now: number): void {
+  private confirmThenFire(marginal: BuiltOpp[], now: number, block?: number): void {
     const addresses = marginal.map(m => m.key);
-    this.tracker.confirmHealthFactors(addresses)
+    // dispatch() claimed the dedupe window for these before the round-trip. A
+    // verdict of "not liquidatable" (or no verdict at all) must not keep it: the
+    // next feed event may be the one that genuinely crosses, and blocking it for
+    // FIRE_DEDUPE_MS forfeits a race that is decided in milliseconds. fireAll
+    // re-stamps the ones that do go out.
+    const release = () => { for (const m of marginal) this.firedAt.delete(m.key); };
+    this.tracker.confirmHealthFactors(addresses, block)
       .then(confirmed => {
+        release();
         // Every confirmation is a free, perfectly-matched observation of how far
         // the model was from the chain. This is the only place such pairs exist,
         // and they used to be discarded the moment the fire/skip decision was made.
@@ -821,7 +871,7 @@ export class TriggerEngine {
         }
         if (survivors.length > 0) this.fireAll(survivors, Date.now());
       })
-      .catch(e => logger.debug(`trigger confirm failed: ${e?.message ?? e}`));
+      .catch(e => { release(); logger.debug(`trigger confirm failed: ${e?.message ?? e}`); });
   }
 
   // firedAt only exists to dedupe within FIRE_DEDUPE_MS; without this it grows

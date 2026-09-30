@@ -84,6 +84,10 @@ function countHopsFromPath(swapPath: string): number {
 // Pre-screen: skip positions with HF >= 0.9995.
 const HF_EVAL_THRESHOLD = 9995n * 10n ** 14n; // 0.9995
 
+// Extra allowance, on top of the pool fees, for price impact when no quoted
+// route is cached yet and the output can only be estimated from oracle prices.
+const UNQUOTED_IMPACT_BPS = 10;
+
 const MAX_REASONABLE_GAS_WEI = 2_000_000_000n; // 2 gwei
 
 // Arbitrum L2 should be 0.01–0.5 gwei. If gasPrice > cap it's likely an
@@ -108,26 +112,56 @@ interface PairPickContext {
   emodeId:          number;
 }
 
+// Aave's liquidationProtocolFee applies to the BONUS portion of the seized
+// collateral. Used only when the reserve registry has no value for the asset.
+const DEFAULT_PROTOCOL_FEE_BPS = 1000n;
+
+// USD cost of a transaction: L2 execution plus the L1 data fee for its calldata.
+function txCostUsd(
+  gasUnits: bigint, pathBytes: number, effectiveGasPrice: bigint,
+  ethPrice: number, l1BaseFeeWei: bigint,
+): number {
+  return Number(gasUnits * effectiveGasPrice) / 1e18 * ethPrice
+    + l1FeeUsdFor(pathBytes, l1BaseFeeWei, ethPrice);
+}
+
+// Sum of the pool fees along an encoded Uniswap V3 path, in basis points.
+// Path: token(20) ++ [fee(3) ++ token(20)]*N; fee is in hundredths of a bp.
+function pathFeeBps(swapPath: string): number {
+  if (!swapPath || swapPath === "0x") return 0;
+  let bps = 0;
+  for (let pos = 2 + 40; pos + 6 + 40 <= swapPath.length; pos += 6 + 40) {
+    bps += parseInt(swapPath.slice(pos, pos + 6), 16) / 100;
+  }
+  return bps;
+}
+
 // Shared candidate-pair selection used by BOTH the polling cycle (evaluate)
 // and the event-driven trigger (buildFromLocal). Pure computation — no RPC.
 function pickBestPair(ctx: PairPickContext): LiquidationOpportunity | null {
   const { position, collaterals, debts, prices, effectiveGasPrice, ethPrice, l1BaseFeeWei } = ctx;
 
-  // Bug #8 fix: e-mode allows 100% close factor for correlated assets regardless
-  // of HF threshold. If userEmodeCategoryId > 0, the position is in e-mode.
-  const isInEmode = (position as any).userEmodeCategoryId !== undefined && (position as any).userEmodeCategoryId > 0;
-  const closeFactor = (isInEmode || position.healthFactor <= CLOSE_FACTOR_HF_THRESHOLD)
+  // Aave V3 close factor depends on health factor alone: 100% at or below 0.95,
+  // 50% otherwise. E-mode does NOT change it. Treating e-mode positions as 100%
+  // sized debtToCover at twice what Aave would accept; Aave then liquidated half,
+  // and the swap floor — computed for the full amount — reverted the whole tx.
+  const closeFactor = position.healthFactor <= CLOSE_FACTOR_HF_THRESHOLD
     ? MAX_CLOSE_FACTOR : DEFAULT_CLOSE_FACTOR;
 
-  // OPT 4: partial liquidation size optimization — try multiple debtToCover sizes
-  // (25%, 50%, 75%, 100% of close factor max). Smaller liquidations have lower
-  // Uniswap price impact — sometimes a 50% liquidation nets more than 100%.
-  const SIZE_FRACTIONS = [10000n, 7500n, 5000n, 2500n]; // bps
+  // Size candidates. Price impact is modelled in coarse tiers, so 100% wins
+  // almost everywhere; 50% is kept for the tier boundaries. (Two fractions, not
+  // four: the extra two never won and cost twice the arithmetic.)
+  const SIZE_FRACTIONS = [10000n, 5000n]; // bps
   let best: LiquidationOpportunity | null = null;
+
+  // Gas cost depends only on whether a swap is needed — not on the pair or size.
+  const gasUsdSame = txCostUsd(SAME_ASSET_GAS,       0,                     effectiveGasPrice, ethPrice, l1BaseFeeWei);
+  const gasUsdSwap = txCostUsd(estimateGasUnits(1),  estimatePathBytes(1),  effectiveGasPrice, ethPrice, l1BaseFeeWei);
+  const premiumBps = BigInt(CONFIG.flashloanPremiumBps);
 
   for (const debt of debts) {
     const debtPrice = prices.get(debt.address.toLowerCase()) ?? 0n;
-    if (debtPrice === 0n) { logger.warn(`  eval SKIP: debt ${debt.symbol} price=0`); continue; }
+    if (debtPrice === 0n) { logger.debug(`  eval SKIP: debt ${debt.symbol} price=0`); continue; }
 
     const maxDebtToCover = (debt.balance * closeFactor) / 10000n;
     if (maxDebtToCover === 0n) continue;
@@ -138,40 +172,43 @@ function pickBestPair(ctx: PairPickContext): LiquidationOpportunity | null {
         logger.warn(`  eval SKIP: collateral "${collateral.symbol}" not in RESERVES`);
         continue;
       }
-      // Bug #10 fix: prefer on-chain liquidationBonus (refreshed periodically),
-      // fall back to static RESERVES config.
       const collateralPrice = prices.get(collateral.address.toLowerCase()) ?? 0n;
-      if (collateralPrice === 0n) { logger.warn(`  eval SKIP: collateral ${collateral.symbol} price=0`); continue; }
+      if (collateralPrice === 0n) { logger.debug(`  eval SKIP: collateral ${collateral.symbol} price=0`); continue; }
 
       // E-mode aware, straight from the reserve registry. A position in an
       // e-mode category earns that category's bonus for in-category collateral
-      // (e.g. 10100 for stablecoins), not the reserve's own 10500 — using the
-      // reserve value overstated the payout on exactly the positions where the
-      // margin is thinnest.
+      // (e.g. 10100 for stablecoins), not the reserve's own 10500.
       const rs = ctx.registry.get(collateral.address);
       const bonusFactor = BigInt(
         rs ? ctx.registry.effectiveLiquidationBonus(rs, ctx.emodeId) : reserve.liquidationBonus
       );
+      const protocolFeeBps = rs ? BigInt(rs.liquidationProtocolFee) : DEFAULT_PROTOCOL_FEE_BPS;
       const collDec     = BigInt(10 ** collateral.decimals);
       const debtDec     = BigInt(10 ** debt.decimals);
-      const isSameAsset_ = collateral.address.toLowerCase() === debt.address.toLowerCase();
+      const isSameAsset = collateral.address.toLowerCase() === debt.address.toLowerCase();
+      const gasCostUsd  = isSameAsset ? gasUsdSame : gasUsdSwap;
 
       for (const fraction of SIZE_FRACTIONS) {
-        let debtToCover = (maxDebtToCover * fraction) / 10000n;
+        const debtToCover = (maxDebtToCover * fraction) / 10000n;
         if (debtToCover === 0n) continue;
 
-        let expectedCollateral =
+        // Collateral Aave would seize for this repayment, bonus included.
+        let grossCollateral =
           (debtToCover * debtPrice * bonusFactor * collDec)
           / (collateralPrice * 10000n * debtDec);
-        if (expectedCollateral === 0n) continue;
+        if (grossCollateral === 0n) continue;
 
         let actualDebtToCover = debtToCover;
-        if (expectedCollateral > collateral.balance) {
-          expectedCollateral = collateral.balance;
-          actualDebtToCover  = (expectedCollateral * collateralPrice * 10000n * debtDec)
+        if (grossCollateral > collateral.balance) {
+          grossCollateral = collateral.balance;
+          actualDebtToCover = (grossCollateral * collateralPrice * 10000n * debtDec)
             / (debtPrice * bonusFactor * collDec);
           if (actualDebtToCover === 0n) continue;
         }
+
+        // Aave keeps a share of the BONUS as protocol fee; we receive the rest.
+        const bonusPart      = grossCollateral - (grossCollateral * 10000n) / bonusFactor;
+        const expectedCollateral = grossCollateral - (bonusPart * protocolFeeBps) / 10000n;
 
         const collValueUsd8 = (expectedCollateral * collateralPrice) / collDec;
         const debtValueUsd8 = (actualDebtToCover  * debtPrice)       / debtDec;
@@ -180,18 +217,13 @@ function pickBestPair(ctx: PairPickContext): LiquidationOpportunity | null {
         const grossBonusUsd = toUsdNumberStatic(collValueUsd8 - debtValueUsd8);
         const debtUsdNum    = toUsdNumberStatic(debtValueUsd8);
 
-        // OPT 4: price impact scales with size — smaller liquidations have lower impact
+        // Price impact scales with size — smaller liquidations have lower impact.
         const impactPct = debtUsdNum > 100_000 ? 0.02
           : debtUsdNum > 10_000 ? 0.01
           : debtUsdNum > 1_000  ? 0.005
           : 0.002;  // < $1k: virtually zero impact
-        const bonusUsd = grossBonusUsd * (1 - impactPct);
-
-        const preScreenGasUnits = isSameAsset_ ? SAME_ASSET_GAS : estimateGasUnits(1);
-        // Bug #3 fix: include Arbitrum L1 data fee in gas cost estimate — sized to
-        // actual calldata bytes and the live L1 base fee, not a flat guess.
-        const l1FeeUsd   = l1FeeUsdFor(isSameAsset_ ? 0 : estimatePathBytes(1), l1BaseFeeWei, ethPrice);
-        const gasCostUsd = Number(preScreenGasUnits * effectiveGasPrice) / 1e18 * ethPrice + l1FeeUsd;
+        const premiumUsd = debtUsdNum * Number(premiumBps) / 10_000;
+        const bonusUsd   = grossBonusUsd * (1 - impactPct) - premiumUsd;
         const netProfitUsd = bonusUsd - gasCostUsd;
 
         if (netProfitUsd > (best?.netProfitUsd ?? -Infinity)) {
@@ -358,11 +390,26 @@ export class Evaluator {
     return this.finalize(best, priceMap, gasPrice, ethPriceUsd, this._l1BaseFeeWei);
   }
 
-  // Attach swap route + slippage floor + final profitability gate.
+  // Attach swap route + on-chain floor + final profitability gate.
   // HOT-PATH RULE: no RPC here. The route comes from the background cache or a
   // deterministic heuristic; a background refresh is scheduled either way.
-  // amountOutMinimum is derived from Aave oracle prices — the contract enforces
-  // it on-chain, so an inaccurate route reverts cheaply instead of mispricing.
+  //
+  // Expected swap output — the number every decision below rests on — is
+  //   * the cached QuoterV2 result scaled to this size, capped by the oracle
+  //     value (optimistic: real impact grows super-linearly), when a route is
+  //     cached; otherwise
+  //   * the oracle value of the collateral net of the path's pool fees.
+  // Both already exclude Aave's protocol fee (expectedCollateral is net of it).
+  //
+  // The on-chain amountOutMinimum is the BREAK-EVEN output: flashloan repayment
+  // plus this transaction's own gas, expressed in debt tokens. It used to be
+  // "repayment + 99% of the projected bonus", which left 1% of the bonus (~0.05%
+  // of the trade) to cover pool fees, impact and the protocol fee — less than a
+  // 0.05% pool's own fee, so any swap through a normal pool reverted. There is
+  // no public mempool on Arbitrum (the sequencer orders first-come-first-served),
+  // so sandwiching is not the threat a tight floor guards against; the profit
+  // decision is made off-chain, and the floor only has to keep a losing swap
+  // from executing.
   private finalize(
     best:      LiquidationOpportunity,
     prices:    Map<string, bigint>,
@@ -373,11 +420,26 @@ export class Evaluator {
     const effectiveGasPrice = sanitizeGasPrice(gasPrice);
     const isSameAsset = best.collateralAsset.toLowerCase() === best.debtAsset.toLowerCase();
 
-    let swapPath         = "0x";
-    let amountOutMinimum = 0n;
-    let finalGasCostUsd  = best.gasCostUsd;
+    const collReserve = RESERVES[best.collateralSymbol];
+    const debtReserve = RESERVES[best.debtSymbol];
+    const collPrice = prices.get(best.collateralAsset.toLowerCase()) ?? 0n;
+    const debtPrice = prices.get(best.debtAsset.toLowerCase()) ?? 0n;
+    if (!collReserve || !debtReserve || collPrice <= 0n || debtPrice <= 0n) return null;
+    const collDec = BigInt(10 ** collReserve.decimals);
+    const debtDec = BigInt(10 ** debtReserve.decimals);
 
-    if (!isSameAsset) {
+    const premium     = (best.debtToCover * BigInt(CONFIG.flashloanPremiumBps)) / 10_000n;
+    const repayNeeded = best.debtToCover + premium;
+
+    let swapPath        = "0x";
+    let gasCostUsd:       number;
+    let expectedOut:      bigint;   // debt tokens we expect to end up holding
+    let quoteBased      = false;
+
+    if (isSameAsset) {
+      gasCostUsd  = txCostUsd(SAME_ASSET_GAS, 0, effectiveGasPrice, ethPrice, l1BaseFeeWei);
+      expectedOut = best.expectedCollateral;
+    } else {
       // ── Route: cached best-path, else deterministic heuristic ──────────────
       const route = getCachedRoute(best.collateralAsset, best.debtAsset);
       if (!route) {
@@ -387,92 +449,66 @@ export class Evaluator {
       }
       swapPath = route?.path ?? encodeHeuristicPath(best.collateralAsset, best.debtAsset);
 
-      // ── Oracle-derived slippage floor ───────────────────────────────────────
-      // Sell all received collateral (incl. ~bonus%) back into debt units.
-      // Floor = flashloan repayment plus most of the projected bonus, leaving
-      // room for pool fees/impact inside SLIPPAGE_BPS before reverting.
-      const collReserve = RESERVES[best.collateralSymbol];
-      const debtReserve = RESERVES[best.debtSymbol];
-      const collPrice = prices.get(best.collateralAsset.toLowerCase()) ?? 0n;
-      const debtPrice = prices.get(best.debtAsset.toLowerCase()) ?? 0n;
-      if (collReserve && debtReserve && collPrice > 0n && debtPrice > 0n) {
-        const collDec = BigInt(10 ** collReserve.decimals);
-        const debtDec = BigInt(10 ** debtReserve.decimals);
-        const premium     = (best.debtToCover * BigInt(CONFIG.flashloanPremiumBps)) / 10_000n;
-        const repayNeeded = best.debtToCover + premium;
-        // Value of the collateral we'll sell, expressed in debt-token units
-        const expDebtUnits = (best.expectedCollateral * collPrice * debtDec) / (collDec * debtPrice);
-        const headroom     = expDebtUnits > repayNeeded ? expDebtUnits - repayNeeded : 0n;
-        amountOutMinimum   = repayNeeded + (headroom * BigInt(10_000 - CONFIG.slippageBps)) / 10_000n;
-      }
-
       // Actual swapPath bytes now known — price the real calldata, not an estimate.
-      const swapPathBytes  = (swapPath.length - 2) / 2;
-      const l1FeeUsd       = l1FeeUsdFor(swapPathBytes, l1BaseFeeWei, ethPrice);
-      // estimateGasUnits already returns BASE_GAS_UNITS + PER_HOP_GAS × hops —
-      // adding BASE_GAS_UNITS again double-counted 265k units, inflating the
-      // gas estimate and rejecting marginal-but-profitable opportunities.
-      const swapGasUnits   = estimateGasUnits(countHopsFromPath(swapPath));
-      finalGasCostUsd      = Number(swapGasUnits * effectiveGasPrice) / 1e18 * ethPrice + l1FeeUsd;
-    } else {
-      const l1FeeUsd = l1FeeUsdFor(0, l1BaseFeeWei, ethPrice);
-      finalGasCostUsd = Number(SAME_ASSET_GAS * effectiveGasPrice) / 1e18 * ethPrice + l1FeeUsd;
-    }
+      // estimateGasUnits already returns BASE_GAS_UNITS + PER_HOP_GAS × hops.
+      gasCostUsd = txCostUsd(
+        estimateGasUnits(countHopsFromPath(swapPath)), (swapPath.length - 2) / 2,
+        effectiveGasPrice, ethPrice, l1BaseFeeWei,
+      );
 
-    // ── Liquidity reality check ────────────────────────────────────────────
-    // amountOutMinimum is derived from ORACLE prices, which assume the pool can
-    // fill at close to the oracle rate. For a large trade in a thin pool it
-    // cannot: a live quote of 323 weETH returned 151 WETH, roughly 50% impact,
-    // against an impactPct model that caps at 2%. Such an opportunity looks like
-    // the most profitable one available, sorts to the front of the executor
-    // queue, and then reverts on-chain — crowding out the real ones.
-    //
-    // The background route cache holds a genuine QuoterV2 result at a known
-    // size, so compare like for like. Scaling linearly from that quote is
-    // OPTIMISTIC (real impact grows super-linearly with size), so rejecting when
-    // even the optimistic figure falls short can never discard a fillable trade.
-    if (!isSameAsset && amountOutMinimum > 0n) {
-      const quoted = getCachedRoute(best.collateralAsset, best.debtAsset);
-      if (quoted && quoted.amountIn > 0n && quoted.out > 0n) {
-        const optimisticOut = (quoted.out * best.expectedCollateral) / quoted.amountIn;
-        if (optimisticOut < amountOutMinimum) {
-          logger.debug(
-            `  eval SKIP ${best.borrower.slice(0,10)}: ${best.collateralSymbol}→${best.debtSymbol} ` +
-            `insufficient DEX liquidity — quote implies ${optimisticOut} out vs ${amountOutMinimum} required`
-          );
-          return null;
-        }
+      // Oracle value of the collateral we will sell, in debt-token units.
+      const oracleOut = (best.expectedCollateral * collPrice * debtDec) / (collDec * debtPrice);
+      if (route && route.amountIn > 0n && route.out > 0n) {
+        const scaled = (route.out * best.expectedCollateral) / route.amountIn;
+        expectedOut  = scaled < oracleOut ? scaled : oracleOut;
+        quoteBased   = true;
+      } else {
+        const feeBps = BigInt(Math.ceil(pathFeeBps(swapPath) + UNQUOTED_IMPACT_BPS));
+        expectedOut  = (oracleOut * (10_000n - feeBps)) / 10_000n;
       }
     }
 
-    // Final profitability check. Without a live quote we conservatively assume
-    // swap execution eats up to SLIPPAGE_BPS of the bonus (only for diff-asset).
-    const swapDragPct   = isSameAsset ? 0 : CONFIG.slippageBps / 10_000;
-    const finalNetProfit = best.expectedBonusUsd * (1 - swapDragPct) - finalGasCostUsd;
+    // Gas expressed in debt tokens (rounded up) — the on-chain floor's margin.
+    const debtPriceUsd = Number(debtPrice) / 1e8;
+    const gasDebtUnits = BigInt(Math.ceil(gasCostUsd / debtPriceUsd * Number(debtDec)));
+    const breakEven    = repayNeeded + gasDebtUnits;
+
+    // Profit decision runs on a haircut output: SLIPPAGE_BPS is the allowance for
+    // the estimate being optimistic. Same-asset has no swap, so no haircut.
+    const decisionOut = isSameAsset
+      ? expectedOut
+      : (expectedOut * BigInt(10_000 - CONFIG.slippageBps)) / 10_000n;
+
+    if (decisionOut <= repayNeeded) {
+      logger.debug(
+        `  eval SKIP ${best.borrower.slice(0,10)}: ${best.collateralSymbol}→${best.debtSymbol} ` +
+        `swap yields ${decisionOut} < repayment ${repayNeeded} (${quoteBased ? "quote" : "oracle-estimated"})`
+      );
+      return null;
+    }
+
+    const profitUsd = Number(((decisionOut - repayNeeded) * debtPrice) / debtDec) / 1e8;
+    const finalNetProfit = profitUsd - gasCostUsd;
 
     // An opportunity below the profit floor is routine, not a warning — during a
     // crash there can be hundreds per second. Keep the profitable ones at info.
     //
-    // "Profitable" is not the same as "actionable". Since candidate generation
-    // deliberately reaches above 1.0 to catch positions the model reads high,
-    // most of what arrives here sits just over Aave's threshold and cannot be
-    // liquidated at all. Logging those at info claimed the bot had found money
-    // and done nothing about it — a live run printed the same USDC.e position at
-    // "net=$27.91 PROFITABLE" every thirty seconds for ten minutes while it was
-    // never once liquidatable. Only a genuinely liquidatable, genuinely
-    // profitable opportunity earns info.
+    // "Profitable" is not the same as "actionable". Candidate generation reaches
+    // above 1.0 on purpose, so most of what arrives here sits just over Aave's
+    // threshold and cannot be liquidated at all. Only a genuinely liquidatable,
+    // genuinely profitable opportunity earns info.
     const liquidatable = best.healthFactor < 1;
     const profitable   = finalNetProfit >= CONFIG.minProfitUsd;
     const logFn = (profitable && liquidatable) ? logger.info.bind(logger) : logger.debug.bind(logger);
     logFn(
       `  eval ${best.collateralSymbol}/${best.debtSymbol} | ` +
       `HF=${best.healthFactor.toFixed(4)} debt=$${best.debtToCoverUsd.toFixed(2)} ` +
-      `bonus=$${best.expectedBonusUsd.toFixed(2)} gas=$${finalGasCostUsd.toFixed(2)} ` +
+      `bonus=$${profitUsd.toFixed(2)} gas=$${gasCostUsd.toFixed(2)} ` +
       `net=$${finalNetProfit.toFixed(2)} ` +
       `${!profitable ? "below min" : liquidatable ? "PROFITABLE" : "profitable but HF>=1 — needs confirmation"}`
     );
 
-    if (finalNetProfit < CONFIG.minProfitUsd) {
+    if (!profitable) {
       logger.debug(
         `  eval NULL for ${best.borrower.slice(0,10)}: best=$${finalNetProfit.toFixed(2)} minProfit=$${CONFIG.minProfitUsd}`
       );
@@ -481,11 +517,12 @@ export class Evaluator {
 
     return {
       ...best,
-      gasCostUsd:      finalGasCostUsd,
+      expectedBonusUsd: profitUsd,
+      gasCostUsd,
       netProfitUsd:    finalNetProfit,
       swapPath,
-      amountOutMinimum,
-      swapOutputAmount: 0n,  // unknown without a quote — contract enforces minOut on-chain
+      amountOutMinimum: isSameAsset ? 0n : breakEven,
+      swapOutputAmount: 0n,  // unknown without a live quote — contract enforces minOut on-chain
     };
   }
 

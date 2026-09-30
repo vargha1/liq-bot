@@ -11,6 +11,7 @@ import {
 } from "./config";
 import type { BorrowerPosition, AssetPosition } from "./types";
 import { ReserveRegistry, RAY, TOPIC_RESERVE_DATA_UPDATED, rayMul, healthFactorExact } from "./reserveState";
+import type { ReserveState } from "./reserveState";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const HF_ONE   = 10n ** 18n;
@@ -204,6 +205,18 @@ export interface UserReserveSnapshot {
   scaledATokenBalance: bigint;
   usageAsCollateral:   boolean;
   scaledVariableDebt:  bigint;
+}
+
+interface ReserveCtx {
+  reserve: ReserveState;
+  unit:    bigint;   // 10^decimals
+  income:  bigint;   // normalised income index at the pass's clock
+  debtIdx: bigint;   // normalised variable-debt index at the pass's clock
+}
+
+export interface LocalCandidate {
+  pos: BorrowerPosition; collaterals: AssetPosition[]; debts: AssetPosition[];
+  hfLocal: number; debtUsd8: bigint;
 }
 
 export interface UserState {
@@ -496,9 +509,24 @@ export class PositionTracker {
 
   private getProvider(): ethers.Provider { return this._getProvider(); }
 
+  // Separately rate-limited endpoint for the trigger's authoritative HF
+  // confirmations, so they never queue behind background reads.
+  private _hotProviderSeen: ethers.Provider | null = null;
+  private _hotMulticall: ethers.Contract | null = null;
+  private get hotMulticall(): ethers.Contract {
+    if (!this._getHotProvider) return this.multicall;
+    const p = this._getHotProvider();
+    if (p !== this._hotProviderSeen || !this._hotMulticall) {
+      this._hotProviderSeen = p;
+      this._hotMulticall = new ethers.Contract(MULTICALL3, MULTICALL3_ABI, p);
+    }
+    return this._hotMulticall;
+  }
+
   constructor(
     private _getProvider: () => ethers.Provider,
     public  readonly reserves: ReserveRegistry,
+    private _getHotProvider?: () => ethers.Provider,
   ) {}
 
   // ── Model maintenance ──────────────────────────────────────────────────────
@@ -555,10 +583,24 @@ export class PositionTracker {
   // make those positions fully evaluable in memory from then on.
   private static readonly MODEL_USERS_PER_MC = 20;
 
+  // Chunks are dispatched in small sequential WAVES, not all at once. Firing
+  // every chunk together meant a 2 000-address gap recovery put ~100 calls into a
+  // limiter that sheds past ~20, and the shed chunks were skipped silently —
+  // leaving exactly the stale state the recovery existed to replace.
+  private static readonly MODEL_WAVE = 3;
+
   async refreshUserStates(addresses: string[]): Promise<number> {
+    return (await this.refreshUserStatesDetailed(addresses)).loaded;
+  }
+
+  // Same as refreshUserStates but reports which addresses could not be read, so
+  // the caller can retry them instead of assuming success.
+  private async refreshUserStatesDetailed(
+    addresses: string[],
+  ): Promise<{ loaded: number; failed: string[] }> {
     const targets = [...new Set(addresses.map(a => a.toLowerCase()))]
       .filter(a => !this.badDebtDenylist.has(a));
-    if (targets.length === 0) return 0;
+    if (targets.length === 0) return { loaded: 0, failed: [] };
 
     const chunks: string[][] = [];
     for (let i = 0; i < targets.length; i += PositionTracker.MODEL_USERS_PER_MC) {
@@ -566,9 +608,10 @@ export class PositionTracker {
     }
 
     let loaded = 0;
+    const failed: string[] = [];
     const emodeIds = new Set<number>();
 
-    const settled = await Promise.allSettled(chunks.map(async chunk => {
+    const readChunk = async (chunk: string[]) => {
       const results: Array<{ success: boolean; returnData: string }> = await this.multicall.tryAggregate(
         false,
         chunk.map(user => ({
@@ -577,39 +620,60 @@ export class PositionTracker {
         })),
       );
       return { chunk, results };
-    }));
+    };
 
-    for (const s of settled) {
-      if (s.status !== "fulfilled") continue;
-      const { chunk, results } = s.value;
-      for (let i = 0; i < chunk.length; i++) {
-        const address = chunk[i]!;
-        const r = results[i];
-        if (!r?.success || r.returnData === "0x") continue;
-        try {
-          const decoded = UI_IFACE.decodeFunctionResult("getUserReservesData", r.returnData);
-          const rows = decoded[0] as Array<{
-            underlyingAsset: string; scaledATokenBalance: bigint;
-            usageAsCollateralEnabledOnUser: boolean; scaledVariableDebt: bigint;
-          }>;
-          const emodeId = Number(decoded[1]);
-          const snapshots: UserReserveSnapshot[] = [];
-          for (const row of rows) {
-            if (row.scaledATokenBalance === 0n && row.scaledVariableDebt === 0n) continue;
-            snapshots.push({
-              asset:               row.underlyingAsset.toLowerCase(),
-              scaledATokenBalance: row.scaledATokenBalance,
-              usageAsCollateral:   row.usageAsCollateralEnabledOnUser,
-              scaledVariableDebt:  row.scaledVariableDebt,
-            });
+    for (let w = 0; w < chunks.length; w += PositionTracker.MODEL_WAVE) {
+      const wave = chunks.slice(w, w + PositionTracker.MODEL_WAVE);
+      const settled = await Promise.allSettled(wave.map(readChunk));
+
+      for (let k = 0; k < settled.length; k++) {
+        const s = settled[k]!;
+        if (s.status !== "fulfilled") { failed.push(...wave[k]!); continue; }
+        const { chunk, results } = s.value;
+        for (let i = 0; i < chunk.length; i++) {
+          const address = chunk[i]!;
+          const r = results[i];
+          if (!r?.success || r.returnData === "0x") { failed.push(address); continue; }
+          try {
+            const decoded = UI_IFACE.decodeFunctionResult("getUserReservesData", r.returnData);
+            const rows = decoded[0] as Array<{
+              underlyingAsset: string; scaledATokenBalance: bigint;
+              usageAsCollateralEnabledOnUser: boolean; scaledVariableDebt: bigint;
+            }>;
+            const emodeId = Number(decoded[1]);
+            const snapshots: UserReserveSnapshot[] = [];
+            let hasDebt = false;
+            for (const row of rows) {
+              if (row.scaledATokenBalance === 0n && row.scaledVariableDebt === 0n) continue;
+              if (row.scaledVariableDebt > 0n) hasDebt = true;
+              snapshots.push({
+                asset:               row.underlyingAsset.toLowerCase(),
+                scaledATokenBalance: row.scaledATokenBalance,
+                usageAsCollateral:   row.usageAsCollateralEnabledOnUser,
+                scaledVariableDebt:  row.scaledVariableDebt,
+              });
+            }
+            if (!hasDebt) {
+              // Not a borrower (any more): nothing to liquidate and nothing for
+              // the model to hold. Removing it here is what keeps depositors and
+              // fully-repaid accounts out of the watchlist when no sweep runs.
+              // No denylist — a later Borrow re-admits it naturally.
+              this.positions.delete(address);
+              this.dormant.delete(address);
+              this.dropUserState(address);
+              this.markRotationDirty();
+              this.markDangerDirty();
+              continue;
+            }
+            this.setUserState(address, { reserves: snapshots, emodeId, fetchedAt: Date.now() });
+            const pos = this.positions.get(address);
+            if (pos) pos.userEmodeCategoryId = emodeId;
+            if (emodeId > 0) emodeIds.add(emodeId);
+            loaded++;
+          } catch (e: any) {
+            logger.debug(`refreshUserStates decode ${address}: ${e.message}`);
+            failed.push(address);
           }
-          this.setUserState(address, { reserves: snapshots, emodeId, fetchedAt: Date.now() });
-          const pos = this.positions.get(address);
-          if (pos) pos.userEmodeCategoryId = emodeId;
-          if (emodeId > 0) emodeIds.add(emodeId);
-          loaded++;
-        } catch (e: any) {
-          logger.debug(`refreshUserStates decode ${address}: ${e.message}`);
         }
       }
     }
@@ -621,7 +685,81 @@ export class PositionTracker {
         logger.debug(`ensureEModes failed: ${e?.message ?? e}`)
       );
     }
-    return loaded;
+    return { loaded, failed };
+  }
+
+  // ── Dirty model entries ────────────────────────────────────────────────────
+  // An Aave event for a modelled borrower means its scaled balances just moved.
+  // The entry used to be DROPPED, which blinds the trigger to that borrower until
+  // the background fill (30 addresses/second, FIFO behind everything else)
+  // reaches it again. In a crash, borrowers repay and top up collateral in
+  // droves — the fill backlog then runs to minutes, precisely when detection
+  // matters. The entry is kept instead, marked dirty, and re-read within
+  // ~100ms in one batch. A slightly stale model is far better than none: the
+  // trigger's chain confirmation still gates every fire.
+  // address -> when its refresh is due. ACTIVE (near-threshold) borrowers are
+  // re-read almost at once; DORMANT ones (healthy when parked) are batched over a
+  // couple of seconds. Every event on the market touches some borrower, so
+  // refreshing all of them at the fast cadence would spend real RPC budget on
+  // positions that cannot matter for minutes.
+  private dirtyUsers = new Map<string, number>();
+  private dirtyTimer: ReturnType<typeof setTimeout> | null = null;
+  private dirtyFlushing = false;
+  private static readonly DIRTY_ACTIVE_MS = 150;
+  private static readonly DIRTY_LAZY_MS   = 2_000;
+  private static readonly DIRTY_RETRY_MS  = 1_000;
+  private static readonly DIRTY_FLUSH_MAX = 200;
+
+  private markUserDirty(address: string): void {
+    if (!this.userStates.has(address)) return;   // nothing to keep; fillModel loads it
+    // Balances changed, so the skip bound's cached HF describes a position that
+    // no longer exists.
+    this.localHfCache.delete(address);
+    const delay = this.positions.has(address)
+      ? PositionTracker.DIRTY_ACTIVE_MS : PositionTracker.DIRTY_LAZY_MS;
+    const due = Date.now() + delay;
+    const cur = this.dirtyUsers.get(address);
+    if (cur === undefined || due < cur) this.dirtyUsers.set(address, due);
+    this.scheduleDirtyFlush();
+  }
+
+  private scheduleDirtyFlush(minDelayMs = 0): void {
+    if (this.dirtyTimer !== null || this.dirtyUsers.size === 0) return;
+    let next = Infinity;
+    for (const due of this.dirtyUsers.values()) if (due < next) next = due;
+    const delay = Math.max(minDelayMs, next - Date.now(), 0);
+    this.dirtyTimer = setTimeout(() => {
+      this.dirtyTimer = null;
+      this.flushDirty().catch(() => { /* retried by the requeue below */ });
+    }, delay);
+  }
+
+  private async flushDirty(): Promise<void> {
+    if (this.dirtyFlushing) { this.scheduleDirtyFlush(PositionTracker.DIRTY_ACTIVE_MS); return; }
+    const now = Date.now();
+    const batch: string[] = [];
+    for (const [a, due] of [...this.dirtyUsers]) {
+      if (batch.length >= PositionTracker.DIRTY_FLUSH_MAX) break;
+      if (due > now) continue;
+      this.dirtyUsers.delete(a);
+      // Anyone evicted meanwhile no longer needs a model.
+      if (this.positions.has(a) || this.dormant.has(a)) batch.push(a);
+    }
+    if (batch.length === 0) { this.scheduleDirtyFlush(); return; }
+
+    this.dirtyFlushing = true;
+    let retry = false;
+    try {
+      const { failed } = await this.refreshUserStatesDetailed(batch);
+      for (const a of failed) this.dirtyUsers.set(a, Date.now() + PositionTracker.DIRTY_RETRY_MS);
+      retry = failed.length > 0;
+    } catch {
+      for (const a of batch) this.dirtyUsers.set(a, Date.now() + PositionTracker.DIRTY_RETRY_MS);
+      retry = true;
+    } finally {
+      this.dirtyFlushing = false;
+    }
+    this.scheduleDirtyFlush(retry ? PositionTracker.DIRTY_RETRY_MS : 0);
   }
 
   // Background model fill — brings watched positions that have no model entry
@@ -728,6 +866,14 @@ export class PositionTracker {
       }
     }
     if (!this.positions.has(key)) {
+      // Only a Borrow can turn an unknown address into a borrower. Supply,
+      // Withdraw, Repay and collateral toggles fire for every depositor on the
+      // market — none of whom carry debt — and admitting them grew the active
+      // set without bound in trigger-only mode, where nothing ever evicts them.
+      // Known (dormant) addresses are still woken below.
+      if (type && type.startsWith("live:") && !type.includes("Borrow") && !this.dormant.has(key)) {
+        return;
+      }
       // If the address was dormant (parked as healthy), wake it immediately —
       // a live event means its position just changed and HF may have moved.
       if (this.dormant.has(key)) {
@@ -775,9 +921,9 @@ export class PositionTracker {
         // so the next breakdown call gets fresh data immediately.
         this.breakdownCache.delete(key);
         // The model holds SCALED balances, which move only when the user
-        // transacts — which is exactly what just happened. Dropping the entry
-        // here is the entire invalidation story for the model.
-        this.dropUserState(key);
+        // transacts — which is exactly what just happened. The entry is marked
+        // dirty and re-read almost immediately (see markUserDirty).
+        this.markUserDirty(key);
         this.lastDangerHF.delete(key);  // force re-check on next cycle after any event
         if (topic === TOPIC_LIQUIDATION_CALL) {
           // Someone else liquidated this borrower — tell the executor so it can
@@ -1442,8 +1588,10 @@ export class PositionTracker {
     if (all.length === 0) return [];
 
     // Priority tier — event-triggered addresses, always first, no cap
+    // Only consume what fits; the rest stay queued for the next sweep instead of
+    // being silently dropped.
     const prio = [...this.priorityQueue].slice(0, batchSize);
-    this.priorityQueue.clear();
+    for (const a of prio) this.priorityQueue.delete(a);
     const prioSet = new Set(prio);
 
     // Danger tier — capped so rotation always gets guaranteed slots
@@ -2208,8 +2356,8 @@ export class PositionTracker {
     prices: Map<string, bigint>,
     ceiling: bigint,
     maxResults = 10,
-  ): Array<{ pos: BorrowerPosition; collaterals: AssetPosition[]; debts: AssetPosition[]; hfLocal: number }> {
-    const out: Array<{ pos: BorrowerPosition; collaterals: AssetPosition[]; debts: AssetPosition[]; hfLocal: number }> = [];
+  ): LocalCandidate[] {
+    const out: LocalCandidate[] = [];
     if (assetsLower.size === 0 || !this.reserves.loaded) return out;
 
     // Candidate borrowers = union of holders of any moved asset.
@@ -2223,6 +2371,7 @@ export class PositionTracker {
 
     const nowSec = Math.floor(Date.now() / 1000);
     const nowMs  = Date.now();
+    const ctxOf  = this.makeReserveCtx(nowSec);
     let skipped = 0, evaluated_ = 0;
 
     for (const address of candidates) {
@@ -2251,7 +2400,7 @@ export class PositionTracker {
       if (this.canSkipLocalEval(address, state, prices, ceiling, nowMs)) { skipped++; continue; }
 
       evaluated_++;
-      const evaluated = this.evaluateUserState(state, prices, nowSec);
+      const evaluated = this.computeHf(state, prices, ctxOf);
       if (!evaluated) continue;
       // Keep the closest-to-threshold positions this dispatch actually computed,
       // so the trigger can audit one against the chain. These are the only
@@ -2262,15 +2411,17 @@ export class PositionTracker {
       // Cache the result against the prices that produced it, so the next tick
       // can bound this position instead of recomputing it.
       this.rememberLocalHf(address, state, prices, evaluated.hfE18, nowMs);
-      const { collaterals, debts, hfE18, collateralUsd8, debtUsd8 } = evaluated;
+      const { hfE18, collateralUsd8, debtUsd8 } = evaluated;
       // Exclusive: Aave liquidates only when healthFactor < 1e18, so a position
       // exactly at the ceiling is not liquidatable either.
       if (hfE18 >= ceiling) continue;
-      if (collaterals.length === 0 || debts.length === 0) continue;
       // Dust guard. The polling cycle has always filtered these, but the trigger
       // path did not — so sub-cent positions were being evaluated, and were even
       // driving background Uniswap route refreshes to quote 5 wei of USDC.
       if (debtUsd8 < MIN_DEBT_USD8) continue;
+      // Per-asset balances are only needed now, for the handful that crossed.
+      const { collaterals, debts } = this.materialiseState(state, ctxOf);
+      if (collaterals.length === 0 || debts.length === 0) continue;
 
       let pos = this.positions.get(address);
       // Only reactivate a dormant position that is genuinely below 1.0. The
@@ -2288,7 +2439,7 @@ export class PositionTracker {
             totalDebtBase: debtUsd8,
             userEmodeCategoryId: state.emodeId,
           },
-          collaterals, debts, hfLocal: Number(hfE18) / 1e18,
+          collaterals, debts, hfLocal: Number(hfE18) / 1e18, debtUsd8,
         });
         continue;
       }
@@ -2320,7 +2471,7 @@ export class PositionTracker {
       pos.totalDebtBase       = debtUsd8;
       pos.userEmodeCategoryId = state.emodeId;
 
-      out.push({ pos, collaterals, debts, hfLocal: Number(hfE18) / 1e18 });
+      out.push({ pos, collaterals, debts, hfLocal: Number(hfE18) / 1e18, debtUsd8 });
     }
 
     this.boundSkipped   += skipped;
@@ -2328,7 +2479,18 @@ export class PositionTracker {
     if (skipped > 0) {
       logger.debug(`findLocalCandidates: ${evaluated_} evaluated, ${skipped} skipped by bound`);
     }
-    out.sort((a, b) => a.hfLocal - b.hfLocal);
+    // Rank by what is worth acting on, not by health factor alone. Truncating to
+    // the lowest-HF entries let a swarm of dust positions crowd a $954 one out
+    // before the trigger's profit sort ever saw it. Genuinely liquidatable
+    // positions come first, largest debt first; confirmation-only candidates
+    // (model HF at or above 1.0) follow, closest to the threshold first.
+    out.sort((a, b) => {
+      const ax = a.pos.healthFactor < HF_ONE ? 0 : 1;
+      const bx = b.pos.healthFactor < HF_ONE ? 0 : 1;
+      if (ax !== bx) return ax - bx;
+      if (ax === 0) return a.debtUsd8 === b.debtUsd8 ? 0 : (b.debtUsd8 > a.debtUsd8 ? 1 : -1);
+      return a.hfLocal - b.hfLocal;
+    });
     return out.slice(0, maxResults);
   }
 
@@ -2418,53 +2580,65 @@ export class PositionTracker {
     return floorHf >= Number(ceiling) / 1e18;
   }
 
-  // Turn a user's scaled balances into real ones and compute the health factor,
-  // applying e-mode exactly as Aave does. Returns null when a needed price is
-  // missing — the polling sweep still covers those positions with authoritative
-  // getUserAccountData.
+  // Per-reserve figures that depend only on the reserve and the clock — unit
+  // scale and the two normalised indices — computed ONCE per evaluation pass and
+  // shared by every position in it. Previously each position recomputed them for
+  // each of its reserves, and calculateCompoundedInterest is ~10 bigint
+  // operations: across ~17k modelled positions that is tens of thousands of
+  // identical computations per price tick for ~20 distinct answers.
+  private makeReserveCtx(nowSec: number): (asset: string) => ReserveCtx | null {
+    const cache = new Map<string, ReserveCtx | null>();
+    return (asset: string) => {
+      let c = cache.get(asset);
+      if (c === undefined) {
+        const reserve = this.reserves.get(asset);
+        c = reserve ? {
+          reserve,
+          unit:    10n ** BigInt(reserve.decimals),
+          income:  this.reserves.normalizedIncome(reserve, nowSec),
+          debtIdx: this.reserves.normalizedVariableDebt(reserve, nowSec),
+        } : null;
+        cache.set(asset, c);
+      }
+      return c;
+    };
+  }
+
+  // Health factor for a user's scaled balances, applying e-mode exactly as Aave
+  // does. Allocates nothing per asset — callers that also need the per-asset
+  // balances call materialiseState once a position actually matters. Returns
+  // null when a needed price is missing — the polling sweep still covers those
+  // positions with authoritative getUserAccountData.
   //
   // Not modelled: isolation-mode debt ceilings and siloed borrowing. Both make
   // the real position WEAKER than computed here, so ignoring them errs toward
   // firing on something that reverts cheaply, never toward missing a fire.
-  private evaluateUserState(
+  private computeHf(
     state:  UserState,
     prices: Map<string, bigint>,
-    nowSec: number,
-  ): {
-    collaterals: AssetPosition[]; debts: AssetPosition[];
-    hfE18: bigint; collateralUsd8: bigint; debtUsd8: bigint;
-  } | null {
-    const collaterals: AssetPosition[] = [];
-    const debts:       AssetPosition[] = [];
+    ctxOf:  (asset: string) => ReserveCtx | null,
+  ): { hfE18: bigint; collateralUsd8: bigint; debtUsd8: bigint } | null {
     let ltAccum = 0n;  // Σ collateralValue(USD8) × liquidationThreshold(bps)
     let den     = 0n;  // Σ debtValue(USD8)
     let colUsd8Total = 0n;
 
     for (const r of state.reserves) {
-      const reserve = this.reserves.get(r.asset);
-      if (!reserve) return null;               // unknown reserve — can't model it
+      const c = ctxOf(r.asset);
+      if (!c) return null;                     // unknown reserve — can't model it
       const price = prices.get(r.asset);
       if (price === undefined || price === 0n) return null;
-      const unit = BigInt(10 ** reserve.decimals);
 
       if (r.usageAsCollateral && r.scaledATokenBalance > 0n) {
         // rayMul, matching _getUserBalanceInBaseCurrency's scaledBalance.rayMul(index).
-        const balance = rayMul(r.scaledATokenBalance, this.reserves.normalizedIncome(reserve, nowSec));
+        const balance = rayMul(r.scaledATokenBalance, c.income);
         if (balance > 0n) {
-          const usd8 = (price * balance) / unit;
+          const usd8 = (price * balance) / c.unit;
           colUsd8Total += usd8;
           // E-mode aware. A position in a category uses the CATEGORY threshold
           // for assets inside that category's collateral bitmap; assets OUTSIDE
-          // it keep their own reserve threshold and still count as collateral.
-          // (Aave 3.2 "liquid e-mode" — the previous comment here claimed such
-          // assets contribute zero, which is neither what Aave does nor what
-          // effectiveLiquidationThreshold returns.)
-          const lt = BigInt(this.reserves.effectiveLiquidationThreshold(reserve, state.emodeId));
-          ltAccum += usd8 * lt;
-          collaterals.push({
-            symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals,
-            balance, balanceUsd: 0,
-          });
+          // it keep their own reserve threshold and still count as collateral
+          // (Aave 3.2 "liquid e-mode").
+          ltAccum += usd8 * BigInt(this.reserves.effectiveLiquidationThreshold(c.reserve, state.emodeId));
         }
       }
 
@@ -2474,9 +2648,45 @@ export class PositionTracker {
       // decodes correctly. If a future upgrade reintroduces them this must be
       // revisited, because omitted debt overstates the health factor.
       if (r.scaledVariableDebt > 0n) {
-        const balance = rayMul(r.scaledVariableDebt, this.reserves.normalizedVariableDebt(reserve, nowSec));
+        const balance = rayMul(r.scaledVariableDebt, c.debtIdx);
+        if (balance > 0n) den += (price * balance) / c.unit;
+      }
+    }
+
+    if (den === 0n) return null;
+    return {
+      // Bit-exact with GenericLogic: truncate the average threshold to whole
+      // bps first, then percentMul and wadDiv with half-up rounding.
+      hfE18: healthFactorExact(colUsd8Total, ltAccum, den),
+      collateralUsd8: colUsd8Total,
+      debtUsd8: den,
+    };
+  }
+
+  // Real per-asset balances for a user, for the evaluator. Same arithmetic as
+  // computeHf; only run for positions that have crossed the ceiling.
+  private materialiseState(
+    state: UserState,
+    ctxOf: (asset: string) => ReserveCtx | null,
+  ): { collaterals: AssetPosition[]; debts: AssetPosition[] } {
+    const collaterals: AssetPosition[] = [];
+    const debts:       AssetPosition[] = [];
+    for (const r of state.reserves) {
+      const c = ctxOf(r.asset);
+      if (!c) continue;
+      const { reserve } = c;
+      if (r.usageAsCollateral && r.scaledATokenBalance > 0n) {
+        const balance = rayMul(r.scaledATokenBalance, c.income);
         if (balance > 0n) {
-          den += (price * balance) / unit;
+          collaterals.push({
+            symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals,
+            balance, balanceUsd: 0,
+          });
+        }
+      }
+      if (r.scaledVariableDebt > 0n) {
+        const balance = rayMul(r.scaledVariableDebt, c.debtIdx);
+        if (balance > 0n) {
           debts.push({
             symbol: reserve.symbol, address: reserve.address, decimals: reserve.decimals,
             balance, balanceUsd: 0,
@@ -2484,16 +2694,22 @@ export class PositionTracker {
         }
       }
     }
+    return { collaterals, debts };
+  }
 
-    if (den === 0n) return null;
-    return {
-      collaterals, debts,
-      // Bit-exact with GenericLogic: truncate the average threshold to whole
-      // bps first, then percentMul and wadDiv with half-up rounding.
-      hfE18: healthFactorExact(colUsd8Total, ltAccum, den),
-      collateralUsd8: colUsd8Total,
-      debtUsd8: den,
-    };
+  // Full evaluation (health factor + balances) for callers that want both.
+  private evaluateUserState(
+    state:  UserState,
+    prices: Map<string, bigint>,
+    nowSec: number,
+  ): {
+    collaterals: AssetPosition[]; debts: AssetPosition[];
+    hfE18: bigint; collateralUsd8: bigint; debtUsd8: bigint;
+  } | null {
+    const ctxOf = this.makeReserveCtx(nowSec);
+    const hf = this.computeHf(state, prices, ctxOf);
+    if (!hf) return null;
+    return { ...hf, ...this.materialiseState(state, ctxOf) };
   }
 
   // Authoritative health factors for a handful of addresses, in one multicall.
@@ -2513,18 +2729,31 @@ export class PositionTracker {
   // Every call here therefore does double duty: it gates the fire, and it yields
   // a matched (model, chain) pair that ModelErrorTracker uses to measure that
   // residual rather than assume a constant for it.
-  async confirmHealthFactors(addresses: string[]): Promise<Map<string, bigint>> {
+  async confirmHealthFactors(addresses: string[], blockTag?: number): Promise<Map<string, bigint>> {
     const out = new Map<string, bigint>();
     const targets = [...new Set(addresses.map(a => a.toLowerCase()))];
     if (targets.length === 0) return out;
     try {
-      const results: Array<{ success: boolean; returnData: string }> = await this.multicall.tryAggregate(
-        false,
-        targets.map(addr => ({
-          target:   AAVE_POOL,
-          callData: IFACE.encodeFunctionData("getUserAccountData", [addr]),
-        })),
-      );
+      const calls = targets.map(addr => ({
+        target:   AAVE_POOL,
+        callData: IFACE.encodeFunctionData("getUserAccountData", [addr]),
+      }));
+      // `blockTag` pins the read to the event's block when the caller has one, so
+      // a node that has not yet imported it cannot answer with pre-update state.
+      // Such a node throws instead, so retry briefly before giving up.
+      let results: Array<{ success: boolean; returnData: string }> | null = null;
+      const attempts = blockTag !== undefined ? 3 : 1;
+      for (let a = 0; a < attempts && results === null; a++) {
+        try {
+          results = blockTag !== undefined
+            ? await this.hotMulticall.tryAggregate!.staticCall(false, calls, { blockTag })
+            : await this.hotMulticall.tryAggregate!(false, calls);
+        } catch (e) {
+          if (a === attempts - 1) throw e;
+          await sleep(60);
+        }
+      }
+      if (results === null) return out;
       for (let i = 0; i < targets.length; i++) {
         const r = results[i];
         if (!r?.success || r.returnData === "0x") continue;
@@ -2657,12 +2886,12 @@ export class PositionTracker {
   // decide that something above HF_WATCH belongs back in the dormant tier.
   reparkHealthy(prices: Map<string, bigint>): number {
     if (this.positions.size === 0 || !this.reserves.loaded) return 0;
-    const nowSec = Math.floor(Date.now() / 1000);
+    const ctxOf = this.makeReserveCtx(Math.floor(Date.now() / 1000));
     let parked = 0;
     for (const addr of [...this.positions.keys()]) {
       const state = this.userStates.get(addr);
       if (!state) continue;                 // unmodelled — leave it alone
-      const r = this.evaluateUserState(state, prices, nowSec);
+      const r = this.computeHf(state, prices, ctxOf);
       if (!r) continue;                     // missing price — cannot judge
       if (r.debtUsd8 === 0n) continue;      // no debt; eviction is a separate concern
       if (r.hfE18 <= HF_WATCH) continue;    // still worth watching
@@ -2736,7 +2965,7 @@ export class PositionTracker {
   localHealthFactor(address: string, prices: Map<string, bigint>): bigint | null {
     const state = this.userStates.get(address.toLowerCase());
     if (!state || !this.reserves.loaded) return null;
-    const r = this.evaluateUserState(state, prices, Math.floor(Date.now() / 1000));
+    const r = this.computeHf(state, prices, this.makeReserveCtx(Math.floor(Date.now() / 1000)));
     return r ? r.hfE18 : null;
   }
 

@@ -132,8 +132,9 @@ export const CONFIG = {
   // submissions on a thin balance. 400k is ample over the measured estimates.
   gasLimitBuffer:    parseInt(opt("GAS_LIMIT_BUFFER",      "400000"), 10),
   maxGasGwei:        parseFloat(opt("MAX_GAS_GWEI",        "2")),
-  // FIX: slippageBps now properly wired from env (was hardcoded to 100 in executor)
-  slippageBps:       parseInt(opt("SLIPPAGE_BPS",          "100"), 10),
+  // Haircut (bps) on the estimated swap output in the profit decision. NOT the
+  // on-chain floor — that is the break-even output; see Evaluator.finalize.
+  slippageBps:       parseInt(opt("SLIPPAGE_BPS",          "30"), 10),
   // OPT 1: Separate RPC for tx submission — can be a lower-latency endpoint.
   // If not set, falls back to the main RPC_URL. On Arbitrum, Timeboost express
   // lane is dominated by Selini/Wintermute (~90% of rounds per empirical research).
@@ -251,6 +252,12 @@ export const CONFIG = {
   // constant. At 0.25 the distribution becomes usable inside an hour, for well
   // under one extra multicall per minute.
   triggerAuditRate:     parseFloat(opt("TRIGGER_AUDIT_RATE", "0.25")),
+  // Dedicated HTTP endpoint for the trigger's hot-path reads (price confirmation,
+  // health-factor confirmation). It gets its OWN rate limiter instead of sharing
+  // the background budget, so model fill, prefetch and audits can never queue
+  // ahead of — or shed — the calls that gate a fire. Defaults to RPC_URL.
+  hotRpcUrl:            opt("HOT_RPC_URL", ""),
+  hotRpcCallsPerSecond: parseInt(opt("HOT_RPC_CALLS_PER_SECOND", "20"), 10),
 } as const;
 
 // ─── Aave V3 Arbitrum core addresses ─────────────────────────────────────────
