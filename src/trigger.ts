@@ -124,7 +124,17 @@ export interface SvrProbeRow {
   assets: string[];
   status: "ok" | "untracked" | "unanchored";
   shocks: Array<{ bps: number; sure: number; bonus: number; bestNetUsd: number }>;
+  // Smallest move, in bps, at which at least one borrower becomes profitably
+  // liquidatable; null when none does within SVR_PROBE_MAX_BPS. Falling prices hurt
+  // holders of the asset, rising ones hurt those who owe it, so both directions.
+  minDropBps: number | null;
+  minRiseBps: number | null;
+  minDropNetUsd: number;
+  minRiseNetUsd: number;
 }
+
+const SVR_PROBE_MAX_BPS = 2_000;   // 20%
+const SVR_PROBE_RESOLUTION_BPS = 5;
 
 // One liquidation the bot would bundle into an SVR bid.
 export interface SvrCandidate {
@@ -568,7 +578,7 @@ export class TriggerEngine {
     const ethPrice = this.evaluator.ethPriceCached() || 3000;
     const out: SvrCandidate[] = [];
     for (const c of found) {
-      const opp = this.evaluator.buildFromLocal(c.pos, c.collaterals, c.debts, prices, gasPrice, ethPrice);
+      const opp = this.evaluator.buildFromLocal(c.pos, c.collaterals, c.debts, prices, gasPrice, ethPrice, true);
       if (!opp) continue;
       out.push({ opp, hfLocal: c.hfLocal, sure: c.pos.healthFactor < TRIGGER_HF_CEILING });
     }
@@ -592,17 +602,47 @@ export class TriggerEngine {
       const base = this.lastAnswers.get(feed);
       const row: SvrProbeRow = {
         feed, assets: [...assets].map(a => symOf.get(a) ?? a.slice(0, 8)), status: "ok", shocks: [],
+        minDropBps: null, minRiseBps: null, minDropNetUsd: 0, minRiseNetUsd: 0,
       };
       if (base === undefined || base <= 0n) { row.status = "unanchored"; rows.push(row); continue; }
-      for (const bps of shocksBps) {
-        const answer = (base * BigInt(10_000 - bps)) / 10_000n;
+
+      // Borrowers crossing, and the best profit, if the feed moved by `bps`
+      // (negative = fell). null when the feed cannot be previewed at all.
+      const at = (bps: number): { sure: number; bonus: number; best: number } | null => {
+        const answer = (base * BigInt(10_000 + bps)) / 10_000n;
+        if (answer <= 0n) return { sure: 0, bonus: 0, best: 0 };
         const p = this.svrPreview(feed, answer, 40_000_000n);
-        if (typeof p === "string") { row.status = p; break; }
+        if (typeof p === "string") { row.status = p; return null; }
         const sure = p.candidates.filter(c => c.sure);
-        row.shocks.push({
-          bps, sure: sure.length, bonus: p.candidates.length - sure.length,
-          bestNetUsd: sure.reduce((m, c) => Math.max(m, c.opp.netProfitUsd), 0),
-        });
+        return {
+          sure: sure.length, bonus: p.candidates.length - sure.length,
+          best: sure.reduce((m, c) => Math.max(m, c.opp.netProfitUsd), 0),
+        };
+      };
+
+      for (const bps of shocksBps) {
+        const r = at(-bps);
+        if (!r) break;
+        row.shocks.push({ bps, sure: r.sure, bonus: r.bonus, bestNetUsd: r.best });
+      }
+      if (row.status !== "ok") { rows.push(row); continue; }
+
+      // Bisect for the smallest crossing move. Crossing is monotone in the size of
+      // the move for a given direction, so the boundary is found in ~9 evaluations
+      // per direction. The bound itself is checked first: if even 20% crosses
+      // nobody, there is no threshold to find.
+      for (const dir of [-1, 1] as const) {
+        const far = at(dir * SVR_PROBE_MAX_BPS);
+        if (!far || far.sure === 0) continue;
+        let lo = 0, hi = SVR_PROBE_MAX_BPS, hiBest = far.best;
+        while (hi - lo > SVR_PROBE_RESOLUTION_BPS) {
+          const mid = (lo + hi) >> 1;
+          const r = at(dir * mid);
+          if (r && r.sure > 0) { hi = mid; hiBest = r.best; } else { lo = mid; }
+        }
+        if (dir < 0) { row.minDropBps = hi; row.minDropNetUsd = hiBest; }
+        else         { row.minRiseBps = hi; row.minRiseNetUsd = hiBest; }
+        await new Promise(r => setImmediate(r));
       }
       rows.push(row);
       await new Promise(r => setImmediate(r));

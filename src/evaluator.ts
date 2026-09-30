@@ -365,6 +365,9 @@ export class Evaluator {
     priceMap:     Map<string, bigint>,
     gasPrice:     bigint,
     ethPriceUsd:  number,
+    // Hypothetical evaluation (an SVR preview or probe): nothing here is on-chain,
+    // so the result must not be announced at info level as a live opportunity.
+    quiet = false,
   ): LiquidationOpportunity | null {
     if (!collaterals.length || !debts.length) return null;
     for (const c of collaterals) {
@@ -387,7 +390,7 @@ export class Evaluator {
       emodeId:  position.userEmodeCategoryId ?? 0,
     });
     if (!best) return null;
-    return this.finalize(best, priceMap, gasPrice, ethPriceUsd, this._l1BaseFeeWei);
+    return this.finalize(best, priceMap, gasPrice, ethPriceUsd, this._l1BaseFeeWei, quiet);
   }
 
   // Attach swap route + on-chain floor + final profitability gate.
@@ -416,6 +419,7 @@ export class Evaluator {
     gasPrice:  bigint,
     ethPrice:  number,
     l1BaseFeeWei: bigint = this._l1BaseFeeWei,
+    quiet = false,
   ): LiquidationOpportunity | null {
     const effectiveGasPrice = sanitizeGasPrice(gasPrice);
     const isSameAsset = best.collateralAsset.toLowerCase() === best.debtAsset.toLowerCase();
@@ -499,7 +503,7 @@ export class Evaluator {
     // genuinely profitable opportunity earns info.
     const liquidatable = best.healthFactor < 1;
     const profitable   = finalNetProfit >= CONFIG.minProfitUsd;
-    const logFn = (profitable && liquidatable) ? logger.info.bind(logger) : logger.debug.bind(logger);
+    const logFn = (profitable && liquidatable && !quiet) ? logger.info.bind(logger) : logger.debug.bind(logger);
     logFn(
       `  eval ${best.collateralSymbol}/${best.debtSymbol} | ` +
       `HF=${best.healthFactor.toFixed(4)} debt=$${best.debtToCoverUsd.toFixed(2)} ` +

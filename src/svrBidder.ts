@@ -42,6 +42,7 @@ const QUERY_API = "https://solver-query-api-fra.fastlane-labs.xyz/";
 const QUERY_DELAY_MS = 3_500;           // an auction lasts ~2s; results settle a little after
 const BOND_REFRESH_MS = 30_000;
 const PROBE_EVERY_MS  = 10 * 60_000;
+const SVR_PROBE_MAX_PCT = 20;   // mirrors SVR_PROBE_MAX_BPS in trigger.ts
 const SVR_LOG = path.join(process.cwd(), "logs", "svr-auctions.jsonl");
 
 // Gas the oracle update itself is charged to the searcher for, on success. Used
@@ -148,15 +149,15 @@ export class SvrBidder {
       for (const r of rows) {
         if (r.status === "unanchored") { unanchored++; lines.push(`  ${r.assets.join("/")}: NO ANCHOR`); continue; }
         if (r.status !== "ok" || r.shocks.length === 0) continue;
-        const cells = r.shocks.map(s => {
-          if (s.sure > 0) anyCross = true;
-          return `-${(s.bps / 100).toFixed(1)}%:${s.sure}${s.sure > 0 ? `($${s.bestNetUsd.toFixed(0)})` : ""}`;
-        });
-        lines.push(`  ${r.assets.slice(0, 3).join("/")}${r.assets.length > 3 ? "+" + (r.assets.length - 3) : ""}  ${cells.join("  ")}`);
+        if (r.minDropBps !== null || r.minRiseBps !== null) anyCross = true;
+        const pct = (bps: number | null, net: number, sign: string) =>
+          bps === null ? `${sign}none≤${SVR_PROBE_MAX_PCT}%` : `${sign}${(bps / 100).toFixed(2)}% ($${net.toFixed(0)})`;
+        const name = `${r.assets.slice(0, 3).join("/")}${r.assets.length > 3 ? "+" + (r.assets.length - 3) : ""}`;
+        lines.push(`  ${name.padEnd(22)} first bid at ${pct(r.minDropBps, r.minDropNetUsd, "-")}  or ${pct(r.minRiseBps, r.minRiseNetUsd, "+")}`);
       }
       logger.info(
-        `🔬 SVR probe (borrowers that would cross if the feed fell; $ = best net): ` +
-        `${anyCross ? "detection path OK" : "NOTHING crosses even at -5% — check the model"}${unanchored ? `, ${unanchored} feed(s) UNANCHORED` : ""}\n` +
+        `🔬 SVR probe — smallest feed move that would make the bot bid ($ = best net profit there): ` +
+        `${anyCross ? "detection path OK" : "NOTHING crosses even at ±20% — check the model"}${unanchored ? `, ${unanchored} feed(s) UNANCHORED` : ""}\n` +
         lines.join("\n")
       );
     } catch (e: any) {

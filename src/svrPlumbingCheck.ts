@@ -30,6 +30,7 @@ async function main(): Promise<void> {
 
   let pokes = 0;
   const seen: Array<{ wethPrice: bigint; hypothetical: boolean }> = [];
+  const quietFlags: unknown[] = [];
   const cache = new Map<string, bigint>([[WETH, PRICE], [USDC, 100_000_000n]]);
 
   const oracle: any = {
@@ -52,7 +53,10 @@ async function main(): Promise<void> {
   };
   const evaluator: any = {
     ethPriceCached: () => 2700,
-    buildFromLocal: () => ({ borrower: "0xb0", netProfitUsd: 42, expectedBonusUsd: 45, collateralSymbol: "WETH", debtSymbol: "USDC" }),
+    buildFromLocal: (...args: unknown[]) => {
+      quietFlags.push(args[6]);
+      return { borrower: "0xb0", netProfitUsd: 42, expectedBonusUsd: 45, collateralSymbol: "WETH", debtSymbol: "USDC" };
+    },
   };
 
   const t: any = new TriggerEngine(
@@ -81,6 +85,13 @@ async function main(): Promise<void> {
     JSON.stringify(eth.shocks.map((s: any) => s.sure)));
   check("probe flags the unanchored feed", rows.find((r: any) => r.feed === UNANCHORED_FEED)!.status === "unanchored");
   check("probe never touched the cache either", pokes === 0);
+
+  // The stub crosses below $2,650, i.e. a 185 bps drop; bisection resolves to 5 bps.
+  check("probe finds the smallest crossing drop (185-190 bps)",
+    eth.minDropBps !== null && eth.minDropBps >= 185 && eth.minDropBps <= 190, `(${eth.minDropBps})`);
+  check("probe reports no crossing rise when none exists", eth.minRiseBps === null);
+  check("probe reports the profit at the threshold", eth.minDropNetUsd === 42);
+  check("hypothetical evaluations are logged quietly", quietFlags.length > 0 && quietFlags.every(q => q === true));
 
   console.log(fails === 0 ? "\nAll checks passed." : `\n${fails} check(s) FAILED.`);
   process.exit(fails === 0 ? 0 : 1);
