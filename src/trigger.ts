@@ -119,6 +119,13 @@ const SVR_HINT_MAX_AGE_MS = 10_000;
 // updates, and an anchor older than BASIS_MAX_AGE_MS is refused.
 const BASIS_RESEED_MS = 4 * 60_000;
 
+export interface SvrProbeRow {
+  feed:   string;
+  assets: string[];
+  status: "ok" | "untracked" | "unanchored";
+  shocks: Array<{ bps: number; sure: number; bonus: number; bestNetUsd: number }>;
+}
+
 // One liquidation the bot would bundle into an SVR bid.
 export interface SvrCandidate {
   opp:     LiquidationOpportunity;
@@ -537,9 +544,11 @@ export class TriggerEngine {
   // Aave's oracle still says are healthy, which is precisely the revert this
   // whole SVR path exists to avoid. Null when the feed is unknown or no asset
   // behind it has an anchor to estimate from.
-  svrPreview(feed: string, answer: bigint, gasPrice: bigint): { candidates: SvrCandidate[]; ethPrice: number } | null {
+  svrPreview(
+    feed: string, answer: bigint, gasPrice: bigint,
+  ): { candidates: SvrCandidate[]; ethPrice: number } | "untracked" | "unanchored" {
     const assets = this.feeds.get(feed.toLowerCase());
-    if (!assets || assets.size === 0 || answer <= 0n) return null;
+    if (!assets || assets.size === 0 || answer <= 0n) return "untracked";
 
     const prev   = this.lastAnswers.get(feed.toLowerCase()) ?? null;
     const prices = this.oracle.snapshotAllPrices();
@@ -550,7 +559,7 @@ export class TriggerEngine {
       prices.set(asset, est);
       touched.add(asset);
     }
-    if (touched.size === 0) return null;
+    if (touched.size === 0) return "unanchored";
 
     const ceiling = BigInt(Math.round(Math.max(1, CONFIG.svrScanCeiling) * 1e18));
     const found   = this.tracker.findLocalCandidates(touched, prices, ceiling, 32, true);
@@ -565,6 +574,40 @@ export class TriggerEngine {
     }
     out.sort((a, b) => b.opp.netProfitUsd - a.opp.netProfitUsd);
     return { candidates: out, ethPrice };
+  }
+
+  // Self-test of the SVR detection path, runnable at any time. It asks, for every
+  // tracked feed: if this price fell by N bps, how many borrowers would become
+  // liquidatable and what would it be worth? A quiet market produces no real
+  // opportunities for hours, which makes "zero would-bid" indistinguishable from
+  // "the pipeline is broken". This produces the positive evidence on demand,
+  // through exactly the code a live auction goes through.
+  //
+  // Yields between feeds: each evaluation is a synchronous pass over every holder
+  // of the moved assets, and the ETH feed alone backs six reserves.
+  async svrProbe(shocksBps: number[] = [50, 200, 500]): Promise<SvrProbeRow[]> {
+    const rows: SvrProbeRow[] = [];
+    const symOf = new Map(Object.values(RESERVES).map(r => [r.address.toLowerCase(), r.symbol]));
+    for (const [feed, assets] of this.feeds) {
+      const base = this.lastAnswers.get(feed);
+      const row: SvrProbeRow = {
+        feed, assets: [...assets].map(a => symOf.get(a) ?? a.slice(0, 8)), status: "ok", shocks: [],
+      };
+      if (base === undefined || base <= 0n) { row.status = "unanchored"; rows.push(row); continue; }
+      for (const bps of shocksBps) {
+        const answer = (base * BigInt(10_000 - bps)) / 10_000n;
+        const p = this.svrPreview(feed, answer, 40_000_000n);
+        if (typeof p === "string") { row.status = p; break; }
+        const sure = p.candidates.filter(c => c.sure);
+        row.shocks.push({
+          bps, sure: sure.length, bonus: p.candidates.length - sure.length,
+          bestNetUsd: sure.reduce((m, c) => Math.max(m, c.opp.netProfitUsd), 0),
+        });
+      }
+      rows.push(row);
+      await new Promise(r => setImmediate(r));
+    }
+    return rows;
   }
 
   // ── Hot path ───────────────────────────────────────────────────────────────

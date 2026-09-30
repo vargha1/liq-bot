@@ -11,6 +11,7 @@
     "check-feed": "tsx src/checkSequencerFeed.ts",
     "svr": "tsx src/svrTool.ts",
     "svr-selftest": "tsx src/svrSelftest.ts",
+    "svr-plumbing": "tsx src/svrPlumbingCheck.ts",
     "build": "tsc",
     "start": "node dist/index.js"
   },

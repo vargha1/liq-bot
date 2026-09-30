@@ -41,6 +41,7 @@ const WETH = RESERVES.WETH!.address;
 const QUERY_API = "https://solver-query-api-fra.fastlane-labs.xyz/";
 const QUERY_DELAY_MS = 3_500;           // an auction lasts ~2s; results settle a little after
 const BOND_REFRESH_MS = 30_000;
+const PROBE_EVERY_MS  = 10 * 60_000;
 const SVR_LOG = path.join(process.cwd(), "logs", "svr-auctions.jsonl");
 
 // Gas the oracle update itself is charged to the searcher for, on success. Used
@@ -76,8 +77,9 @@ export class SvrBidder {
   private bondedWei   = 0n;
   private dappGasLimit = 2_000_000n;
   private bondTimer: ReturnType<typeof setInterval> | null = null;
+  private probeTimer: ReturnType<typeof setInterval> | null = null;
 
-  stats = { auctions: 0, unknownFeed: 0, noOpportunity: 0, skipped: 0, wouldBid: 0, submitted: 0, rejected: 0, included: 0 };
+  stats = { auctions: 0, untracked: 0, unanchored: 0, noOpportunity: 0, skipped: 0, wouldBid: 0, submitted: 0, rejected: 0, included: 0 };
 
   constructor(private deps: SvrBidderDeps) {
     this.feed = new SvrFeed(CONFIG.svrWsUrl, a => this.onAuction(a), logger);
@@ -93,6 +95,9 @@ export class SvrBidder {
       this.refreshBond().catch(() => { /* keep the last figure */ });
     }, BOND_REFRESH_MS);
     this.feed.start();
+    // First probe after the trigger engine has had time to anchor, then regularly.
+    setTimeout(() => this.probe(), 90_000);
+    this.probeTimer = setInterval(() => this.probe(), PROBE_EVERY_MS);
     logger.info(
       `SVR bidder started — ${live ? "LIVE" : "DRY-RUN (logs only)"}, ` +
       `bid fraction ${CONFIG.svrBidFraction}, bonded ${ethers.formatEther(this.bondedWei)} ETH`
@@ -106,12 +111,14 @@ export class SvrBidder {
     this.feed.stop();
     if (this.bondTimer) clearInterval(this.bondTimer);
     this.bondTimer = null;
+    if (this.probeTimer) clearInterval(this.probeTimer);
+    this.probeTimer = null;
   }
 
   summary(): string {
     const s = this.stats;
     const f = this.feed.stats;
-    return `svr: ${s.auctions} auctions (${f.connects} conn), ${s.unknownFeed} unknown-feed, ` +
+    return `svr: ${s.auctions} auctions (${f.connects} conn), ${s.untracked} not-aave, ${s.unanchored} NO-ANCHOR, ` +
       `${s.noOpportunity} no-opp, ${s.skipped} skipped, ${s.wouldBid} would-bid, ` +
       `${s.submitted} submitted, ${s.rejected} rejected, ${s.included} included`;
   }
@@ -125,6 +132,36 @@ export class SvrBidder {
       const g = await dc.getDAppGasLimit();
       if (g > 0n) this.dappGasLimit = g;
     } catch { /* keep the default */ }
+  }
+
+  // Positive evidence that detection works. A quiet market yields no real
+  // opportunities for hours, so "0 would-bid" proves nothing by itself. This feeds
+  // small hypothetical drops through the same path a live auction uses and logs how
+  // many borrowers would cross. If every row shows 0 crossing even at -5%, or an
+  // Aave feed shows as unanchored, the pipeline is broken.
+  private async probe(): Promise<void> {
+    if (!this.deps.canBid()) return;
+    try {
+      const rows = await this.deps.trigger.svrProbe();
+      const lines: string[] = [];
+      let anyCross = false, unanchored = 0;
+      for (const r of rows) {
+        if (r.status === "unanchored") { unanchored++; lines.push(`  ${r.assets.join("/")}: NO ANCHOR`); continue; }
+        if (r.status !== "ok" || r.shocks.length === 0) continue;
+        const cells = r.shocks.map(s => {
+          if (s.sure > 0) anyCross = true;
+          return `-${(s.bps / 100).toFixed(1)}%:${s.sure}${s.sure > 0 ? `($${s.bestNetUsd.toFixed(0)})` : ""}`;
+        });
+        lines.push(`  ${r.assets.slice(0, 3).join("/")}${r.assets.length > 3 ? "+" + (r.assets.length - 3) : ""}  ${cells.join("  ")}`);
+      }
+      logger.info(
+        `🔬 SVR probe (borrowers that would cross if the feed fell; $ = best net): ` +
+        `${anyCross ? "detection path OK" : "NOTHING crosses even at -5% — check the model"}${unanchored ? `, ${unanchored} feed(s) UNANCHORED` : ""}\n` +
+        lines.join("\n")
+      );
+    } catch (e: any) {
+      logger.warn(`SVR probe failed: ${e?.message ?? e}`);
+    }
   }
 
   // ── Per-auction decision ───────────────────────────────────────────────────
@@ -146,6 +183,9 @@ export class SvrBidder {
       // or cross no one) would be nearly every line of the file; keep the ones
       // that show a decision being made.
       const routine = d.reason.startsWith("feed not tracked") || d.reason.startsWith("no borrower crosses");
+      if (d.reason.startsWith("Aave feed has no price anchor")) {
+        logger.warn(`SVR ${a.auctionId.slice(0, 8)}: ${d.reason} (${a.aggregator.slice(0, 10)}…) — cannot evaluate this auction`);
+      }
       if (!routine) this.log(a, { decision: "skip", reason: d.reason, ms });
       logger.debug(`SVR ${a.auctionId.slice(0, 8)} skip: ${d.reason} (${ms.toFixed(1)}ms)`);
       return;
@@ -175,7 +215,13 @@ export class SvrBidder {
 
   private decide(a: SvrAuction): Decision {
     const preview = this.deps.trigger.svrPreview(a.aggregator, a.medianPrice, a.maxFeePerGas);
-    if (!preview) { this.stats.unknownFeed++; return { kind: "skip", reason: "feed not tracked or no price anchor" }; }
+    if (preview === "untracked") { this.stats.untracked++; return { kind: "skip", reason: "feed not tracked (not an Aave feed)" }; }
+    // An Aave feed with nothing to estimate from means the detection path is blind
+    // for it. That is a fault, not a routine skip, so it is logged and recorded.
+    if (preview === "unanchored") {
+      this.stats.unanchored++;
+      return { kind: "skip", reason: "Aave feed has no price anchor yet" };
+    }
 
     const sure = preview.candidates.filter(c => c.sure);
     if (sure.length === 0) { this.stats.noOpportunity++; return { kind: "skip", reason: "no borrower crosses 1.0" }; }
