@@ -479,17 +479,45 @@ export const RESERVES: Record<string, ReserveConfig> = {
     symbol: "EURS", address: "0xD22a58f79e9481D1a88e00c343885A588b34b68B",
     decimals: 2, liquidationBonus: 10750, liquidationThreshold: 6700,
   },
-  // NOTE: MAI (0x3F56e0ad...) and USDe (0x5d3a1Ff2...) were removed — their
-  // Aave oracle price feeds on Arbitrum revert (deprecated). Keeping them in
-  // RESERVES causes every batch oracle call to fail and fall back to slow
-  // per-asset calls. If these feeds are re-enabled upstream, add them back.
+  // MAI: frozen and being wound down (LT 100 bps), but existing MAI DEBT is still
+  // liquidatable. Its oracle feed reverted in Feb 2026 and was removed; it prices
+  // again (checked on-chain Oct 2026). The oracle reads each asset in isolation, so
+  // if it dies again only MAI is blacklisted, not the whole batch.
+  MAI: {
+    symbol: "MAI", address: "0x3F56e0c36d275367b8C502090EDF38289b3dEa0d",
+    decimals: 18, liquidationBonus: 10500, liquidationThreshold: 100,
+  },
+  // USDe was removed — its oracle feed reverts (deprecated).
+  //
+  // Reserves listed on Aave AFTER this table was written need no edit here:
+  // ReserveRegistry.refreshAll() registers every on-chain reserve missing from it
+  // through registerReserve() below.
 };
 
-
-// Address → symbol reverse lookup (lowercase keys)
+// Address → symbol reverse lookup, and address → config (lowercase keys). Both are
+// kept in step with RESERVES by registerReserve().
 export const ADDRESS_TO_SYMBOL: Record<string, string> = {};
+export const RESERVE_BY_ADDRESS: Record<string, ReserveConfig> = {};
 for (const [, r] of Object.entries(RESERVES)) {
   ADDRESS_TO_SYMBOL[r.address.toLowerCase()] = r.symbol;
+  RESERVE_BY_ADDRESS[r.address.toLowerCase()] = r;
+}
+
+// Add a reserve discovered on-chain. Returns the config actually stored, or the
+// existing one if the address is already known. Symbols are not unique on chain
+// (USDC.e reports "USDC"), and RESERVES is keyed by symbol, so a clash gets the
+// address tail appended instead of overwriting the other token.
+export function registerReserve(r: ReserveConfig): ReserveConfig {
+  const lower = r.address.toLowerCase();
+  const known = RESERVE_BY_ADDRESS[lower];
+  if (known) return known;
+  let key = r.symbol;
+  if (RESERVES[key]) key = `${r.symbol}.${lower.slice(2, 6)}`;
+  const stored: ReserveConfig = { ...r, symbol: key };
+  RESERVES[key] = stored;
+  ADDRESS_TO_SYMBOL[lower] = key;
+  RESERVE_BY_ADDRESS[lower] = stored;
+  return stored;
 }
 
 // ─── ABIs ──────────────────────────────────────────────────────────────────────

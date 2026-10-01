@@ -6,7 +6,7 @@ import { logger } from "./logger";
 import {
   AAVE_POOL, AAVE_DATA_PROVIDER, UI_POOL_DATA_PROVIDER, POOL_ADDRESSES_PROVIDER,
   MULTICALL3, AAVE_SUBGRAPH_URL,
-  AAVE_POOL_ABI, DATA_PROVIDER_ABI, UI_POOL_DATA_PROVIDER_ABI, MULTICALL3_ABI, RESERVES,
+  AAVE_POOL_ABI, DATA_PROVIDER_ABI, UI_POOL_DATA_PROVIDER_ABI, MULTICALL3_ABI, RESERVES, RESERVE_BY_ADDRESS,
   CONFIG,
 } from "./config";
 import type { BorrowerPosition, AssetPosition } from "./types";
@@ -169,8 +169,8 @@ const UI_IFACE               = new ethers.Interface(UI_POOL_DATA_PROVIDER_ABI);
 // Lowercase address → reserve config. Replaces the repeated
 // Object.values(RESERVES).find(...) linear scan that ran once per active asset
 // per address inside the breakdown hot path.
-const RESERVE_BY_ADDRESS: Record<string, (typeof RESERVES)[string]> = {};
-for (const r of Object.values(RESERVES)) RESERVE_BY_ADDRESS[r.address.toLowerCase()] = r;
+// RESERVE_BY_ADDRESS lives in config.ts so reserves discovered on-chain at startup
+// (registerReserve) are visible here too.
 const TOPIC_BORROW           = IFACE.getEvent("Borrow")!.topicHash;
 const TOPIC_SUPPLY           = IFACE.getEvent("Supply")!.topicHash;
 const TOPIC_REPAY            = IFACE.getEvent("Repay")!.topicHash;

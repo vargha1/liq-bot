@@ -21,7 +21,7 @@
 
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { AAVE_POOL, MULTICALL3, MULTICALL3_ABI, ADDRESS_TO_SYMBOL } from "./config";
+import { AAVE_POOL, MULTICALL3, MULTICALL3_ABI, ADDRESS_TO_SYMBOL, RESERVE_BY_ADDRESS, registerReserve } from "./config";
 
 export const RAY = 10n ** 27n;
 const SECONDS_PER_YEAR = 31_536_000n;   // Aave's constant
@@ -236,12 +236,59 @@ export class ReserveRegistry {
         logger.debug(`ReserveRegistry: decode failed for ${list[i]}: ${e.message}`);
       }
     }
+    await this.registerNewReserves(mc);
+
     // Only announce the first load; this refreshes on a timer and would
     // otherwise print an identical line every few minutes forever.
     const first = this._loadedAt === 0;
     this._loadedAt = Date.now();
     if (first) logger.info(`ReserveRegistry: ${ok}/${list.length} reserves loaded`);
     else logger.debug(`ReserveRegistry refreshed: ${ok}/${list.length} reserves`);
+  }
+
+  // Any reserve on-chain that the static RESERVES table lacks (a token Aave listed
+  // after the table was written) is registered here, so the evaluator, oracle
+  // prefetch, route warm-up and position breakdown all treat it as a normal
+  // collateral/debt asset instead of skipping it. Symbol comes from the token
+  // itself; decimals/LT/bonus from the config bitmap already decoded above.
+  // Best effort: a token with no readable symbol() still registers under its
+  // address prefix. A reserve listed while the bot runs is picked up here on the
+  // next refresh, but its Chainlink feed is only subscribed at startup.
+  private async registerNewReserves(mc: ethers.Contract): Promise<void> {
+    const missing = this.all().filter(r => !RESERVE_BY_ADDRESS[r.address]);
+    if (missing.length === 0) return;
+
+    const symIface = new ethers.Interface(["function symbol() view returns (string)"]);
+    let results: Array<{ success: boolean; returnData: string }> = [];
+    try {
+      results = await mc.tryAggregate(
+        false,
+        missing.map(r => ({ target: r.address, callData: symIface.encodeFunctionData("symbol") })),
+      );
+    } catch (e: any) {
+      logger.debug(`registerNewReserves: symbol() batch failed: ${e.message}`);
+    }
+
+    missing.forEach((r, i) => {
+      let symbol = r.address.slice(0, 8);
+      const res = results[i];
+      if (res?.success && res.returnData !== "0x") {
+        try { symbol = symIface.decodeFunctionResult("symbol", res.returnData)[0] as string; } catch { /* keep prefix */ }
+      }
+      const stored = registerReserve({
+        symbol,
+        address:              ethers.getAddress(r.address),
+        decimals:             r.decimals,
+        liquidationBonus:     r.liquidationBonus,
+        liquidationThreshold: r.liquidationThreshold,
+      });
+      r.symbol = stored.symbol;
+      logger.warn(
+        `ReserveRegistry: new reserve ${stored.symbol} (${stored.address}) not in static table — registered ` +
+        `(dec=${r.decimals} LT=${r.liquidationThreshold} bonus=${r.liquidationBonus}). Swap routes are quoted on demand; ` +
+        `restart to subscribe its price feed.`
+      );
+    });
   }
 
   // Apply a ReserveDataUpdated log — keeps indices current between full refreshes

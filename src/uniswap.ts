@@ -71,6 +71,7 @@ const STABLES = new Set([
   "0x17fc002b466eec40dae837fc4be5c67993ddbd6f", // FRAX
   "0x7dff72693f6a4149b17e7c6314655f6a9f7c8b33", // GHO
   "0xd22a58f79e9481d1a88e00c343885a588b34b68b", // EURS
+  "0x3f56e0c36d275367b8c502090edf38289b3dea0d", // MAI
 ]);
 
 // Encode a Uniswap V3 multi-hop path.
@@ -90,39 +91,59 @@ function symOf(addr: string): string {
   )?.symbol ?? addr.slice(0, 8);
 }
 
-// Build candidate paths to try, ordered by expected output quality.
+const WBTC = "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f";
+
+// Bridge tokens and the fee tiers worth trying on each leg that touches them.
+// The old candidate list guessed ONE fee per leg (3000 for volatile, 500 for
+// stables), which missed the deepest pool whenever it was a different tier: a live
+// probe quoted wstETH→USDC at $2.6k of a $5k trade through [3000,500] while
+// wstETH-[100]→WETH-[500]→USDC returns ~$5k, and tBTC→DAI lost half its value the
+// same way. WETH→GHO had no candidate at all (the 3-hop builder started the path
+// with WETH twice). Every tier pair per hub is cheap now that the whole list goes
+// out as batched eth_calls; 10000 is only worth quoting on direct pools.
+const HUBS: Array<{ token: string; fees: readonly FeeTier[] }> = [
+  { token: WETH,  fees: [100, 500, 3000] },
+  { token: USDC,  fees: [100, 500] },
+  { token: USDCe, fees: [100, 500] },
+  { token: WBTC,  fees: [100, 500] },
+];
+
+// Two-hub bridges for tokens whose only pools face a stable (GHO and friends:
+// X→WETH→USDC→GHO). Fees on the legs that exist on Arbitrum in practice.
+const TWO_HUB: Array<[string, string]> = [[WETH, USDC], [WETH, USDCe], [USDC, WETH]];
+
+// Build candidate paths to try. Order does not matter — every path is quoted and
+// the best output wins.
 function candidatePaths(tokenIn: string, tokenOut: string): Array<{ tokens: string[]; fees: FeeTier[] }> {
   const inL  = tokenIn.toLowerCase();
   const outL = tokenOut.toLowerCase();
   const paths: Array<{ tokens: string[]; fees: FeeTier[] }> = [];
+  const seen = new Set<string>();
+  const add = (tokens: string[], fees: FeeTier[]) => {
+    const lower = tokens.map(t => t.toLowerCase());
+    if (new Set(lower).size !== lower.length) return;          // a token twice = not a path
+    const key = lower.join(",") + "|" + fees.join(",");
+    if (seen.has(key)) return;
+    seen.add(key);
+    paths.push({ tokens, fees });
+  };
 
-  // 1. Direct pools — all three fee tiers
-  for (const fee of FEE_TIERS) {
-    paths.push({ tokens: [tokenIn, tokenOut], fees: [fee] });
+  // 1. Direct pools
+  for (const fee of FEE_TIERS) add([tokenIn, tokenOut], [fee]);
+
+  // 2. One bridge token, every tier pair
+  for (const hub of HUBS) {
+    const h = hub.token.toLowerCase();
+    if (h === inL || h === outL) continue;
+    for (const f1 of hub.fees) for (const f2 of hub.fees) add([tokenIn, hub.token, tokenOut], [f1, f2]);
   }
 
-  // 2. Via WETH — best for LSTs, ARB, LINK, AAVE, WBTC
-  if (inL !== WETH.toLowerCase() && outL !== WETH.toLowerCase()) {
-    const inFee:  FeeTier = STABLES.has(inL)  ? 500 : 3000;
-    const outFee: FeeTier = STABLES.has(outL) ? 500 : 3000;
-    paths.push({ tokens: [tokenIn, WETH, tokenOut], fees: [inFee,  outFee] });
-    paths.push({ tokens: [tokenIn, WETH, tokenOut], fees: [3000,   3000]   });
-    paths.push({ tokens: [tokenIn, WETH, tokenOut], fees: [500,    500]    });
-  }
-
-  // 3. Non-stable → non-USDC stable via WETH→USDC
-  if (!STABLES.has(inL) && STABLES.has(outL) &&
-      outL !== USDC.toLowerCase() && outL !== USDCe.toLowerCase()) {
-    paths.push({ tokens: [tokenIn, WETH, USDC,  tokenOut], fees: [3000, 500, 500] });
-    paths.push({ tokens: [tokenIn, WETH, USDCe, tokenOut], fees: [3000, 500, 500] });
-  }
-
-  // 4. Stable → stable via USDC bridge
-  if (STABLES.has(inL) && STABLES.has(outL)) {
-    if (inL !== USDC.toLowerCase()  && outL !== USDC.toLowerCase())
-      paths.push({ tokens: [tokenIn, USDC,  tokenOut], fees: [500, 500] });
-    if (inL !== USDCe.toLowerCase() && outL !== USDCe.toLowerCase())
-      paths.push({ tokens: [tokenIn, USDCe, tokenOut], fees: [500, 500] });
+  // 3. Two bridge tokens — only when a stablecoin is on one side, the case this
+  // exists for. Skipping it elsewhere halves the number of quotes per refresh.
+  if (STABLES.has(inL) || STABLES.has(outL)) for (const [a, b] of TWO_HUB) {
+    for (const f1 of [100, 500, 3000] as const) for (const f3 of [100, 500] as const) {
+      add([tokenIn, a, b, tokenOut], [f1, 500, f3]);
+    }
   }
 
   return paths;
@@ -142,7 +163,8 @@ export interface UniswapQuoteResult {
 // Each quote has a tight timeout — Tenderly returns in <200ms when healthy.
 // Short timeout prevents orphaned staticCalls from piling up in the provider
 // queue when Tenderly is slow, which causes cascading delays across cycles.
-const QUOTE_TIMEOUT_MS = 1_500;
+const QUOTE_TIMEOUT_MS = 3_000;   // background-only (route refresh / warm-up), never the hot path
+const QUOTE_CHUNK      = 8;      // quoter calls per batched eth_call
 
 // ─── Background route cache ──────────────────────────────────────────────────
 // HOT-PATH RULE: evaluate() must never wait on a QuoterV2 staticCall. Instead:
@@ -293,16 +315,36 @@ export async function uniswapSwap(
   // requireSuccess=false absorbs the revert QuoterV2 throws for a missing pool.
   try {
     const mc = getMulticall(provider);
-    const results: Array<{ success: boolean; returnData: string }> = await withTimeout(
-      mc.tryAggregate.staticCall(
-        false,
-        encoded.map(e => ({
-          target:   UNISWAP_QUOTER,
-          callData: QUOTER_IFACE.encodeFunctionData("quoteExactInput", [e.path, amountIn]),
-        })),
-      ),
-      QUOTE_TIMEOUT_MS,
-    );
+    // Quote in batches of QUOTE_CHUNK. A path through a thin pool can burn millions
+    // of gas crossing ticks (7.7M seen for one LINK→USDC→GHO candidate), which
+    // exceeds the node's eth_call gas cap and fails the WHOLE batch with "missing
+    // revert data" — silently taking the good candidates down with it. So a failed
+    // batch is bisected until the offender is isolated and dropped; the healthy
+    // halves still return their quotes. Costs extra calls only when that happens.
+    const quoteBatch = async (items: typeof encoded): Promise<Array<{ success: boolean; returnData: string } | undefined>> => {
+      try {
+        return await withTimeout(
+          mc.tryAggregate.staticCall(
+            false,
+            items.map(e => ({
+              target:   UNISWAP_QUOTER,
+              callData: QUOTER_IFACE.encodeFunctionData("quoteExactInput", [e.path, amountIn]),
+            })),
+          ),
+          QUOTE_TIMEOUT_MS,
+        ) as Array<{ success: boolean; returnData: string }>;
+      } catch (e: any) {
+        if (items.length === 1) return [undefined];
+        if (/timeout|RPC_BACKPRESSURE|destroyed/i.test(`${e?.message} ${e?.code}`)) throw e;   // bisecting would not help
+        const mid = items.length >> 1;
+        const [l, r] = await Promise.all([quoteBatch(items.slice(0, mid)), quoteBatch(items.slice(mid))]);
+        return [...l, ...r];
+      }
+    };
+    const results: Array<{ success: boolean; returnData: string } | undefined> = [];
+    for (let i = 0; i < encoded.length; i += QUOTE_CHUNK) {
+      results.push(...await quoteBatch(encoded.slice(i, i + QUOTE_CHUNK)));
+    }
     for (let i = 0; i < encoded.length; i++) {
       const r = results[i];
       if (!r?.success || r.returnData === "0x") continue;
@@ -316,7 +358,9 @@ export async function uniswapSwap(
     logger.debug(`uniswapSwap: batched quote failed (${e?.message ?? e}) — individual quotes`);
     const quoter = getQuoter(provider);
     const quoteResults = await Promise.allSettled(
-      encoded.map(async ({ path, desc }) => {
+      // Direct pools + the WETH bridge only: this runs when batching is broken, so
+      // it must not fan out the full candidate list one request at a time.
+      encoded.slice(0, 13).map(async ({ path, desc }) => {
         const [amountOut, , , gasEstimate] = await withTimeout(
           quoter.quoteExactInput.staticCall(path, amountIn),
           QUOTE_TIMEOUT_MS,
@@ -355,14 +399,14 @@ export async function uniswapSwap(
 // pair therefore ran on the least reliable data available. Quoting the common
 // pairs once at startup, paced so it never competes with the hot path, means
 // that first fire already has a verified route and a real quote.
-const WARM_COLLATERALS = ["WETH", "wstETH", "WBTC", "weETH", "ARB", "LINK", "rETH", "tBTC", "AAVE", "USDC", "USDT", "DAI"];
-const WARM_DEBTS       = ["USDC", "USDT", "DAI", "WETH", "USDC.e"];
+const WARM_COLLATERALS = ["WETH", "wstETH", "WBTC", "weETH", "ARB", "LINK", "rETH", "tBTC", "AAVE", "USDC", "USDT", "DAI", "USDC.e"];
+const WARM_DEBTS       = ["USDC", "USDT", "DAI", "WETH", "USDC.e", "WBTC", "GHO"];
 
 export async function warmRouteCache(
   provider: ethers.Provider,
   prices:   Map<string, bigint>,
   targetUsd = 5_000,
-  paceMs    = 300,
+  paceMs    = 500,   // each pair is now up to two batched calls; stay inside the shared RPC budget
 ): Promise<number> {
   let warmed = 0;
   for (const cSym of WARM_COLLATERALS) {
