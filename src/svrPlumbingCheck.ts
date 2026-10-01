@@ -40,6 +40,7 @@ async function main(): Promise<void> {
   };
   // A borrower who crosses only once WETH is below $2,650 (-1.85%).
   const tracker: any = {
+    modelHf: () => 1.01,
     findLocalCandidates: (_a: Set<string>, prices: Map<string, bigint>, _c: bigint, _m: number, hypothetical: boolean) => {
       const w = prices.get(WETH)!;
       seen.push({ wethPrice: w, hypothetical });

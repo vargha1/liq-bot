@@ -27,7 +27,7 @@ import * as path from "path";
 import axios from "axios";
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { CONFIG, RESERVES } from "./config";
+import { CONFIG, RESERVES, AAVE_POOL, AAVE_POOL_ABI } from "./config";
 import { SvrFeed } from "./svrFeed";
 import type { TriggerEngine, SvrCandidate } from "./trigger";
 import { encodeHeuristicPath, getCachedRoute } from "./uniswap";
@@ -80,7 +80,7 @@ export class SvrBidder {
   private bondTimer: ReturnType<typeof setInterval> | null = null;
   private probeTimer: ReturnType<typeof setInterval> | null = null;
 
-  stats = { auctions: 0, untracked: 0, unanchored: 0, noOpportunity: 0, skipped: 0, wouldBid: 0, submitted: 0, rejected: 0, included: 0, solverFailed: 0, updateGone: 0 };
+  stats = { auctions: 0, untracked: 0, unanchored: 0, noOpportunity: 0, skipped: 0, wouldBid: 0, submitted: 0, rejected: 0, included: 0, solverFailed: 0, updateGone: 0, suspect: 0 };
 
   constructor(private deps: SvrBidderDeps) {
     this.feed = new SvrFeed(CONFIG.svrWsUrl, a => this.onAuction(a), logger);
@@ -122,7 +122,7 @@ export class SvrBidder {
     return `svr: ${s.auctions} auctions (${f.connects} conn), ${s.untracked} not-aave, ${s.unanchored} NO-ANCHOR, ` +
       `${s.noOpportunity} no-opp, ${s.skipped} skipped, ${s.wouldBid} would-bid, ` +
       `${s.submitted} submitted, ${s.rejected} rejected, ${s.included} included, ` +
-      `${s.solverFailed} solver-failed, ${s.updateGone} update-gone`;
+      `${s.solverFailed} solver-failed, ${s.updateGone} update-gone, ${s.suspect} suspect`;
   }
 
   private async refreshBond(): Promise<void> {
@@ -193,6 +193,14 @@ export class SvrBidder {
       return;
     }
 
+    // The model proposes; the chain disposes. Nothing is bid on until every
+    // borrower in it has been read from the chain and found to match the model.
+    this.verified(a, d).then(final => {
+      if (final) this.proceed(a, final, performance.now() - t0);
+    }).catch(e => logger.warn(`SVR ${a.auctionId.slice(0, 8)}: verification failed, not bidding: ${e?.message ?? e}`));
+  }
+
+  private proceed(a: SvrAuction, d: Extract<Decision, { kind: "bid" }>, ms: number): void {
     this.log(a, {
       decision: CONFIG.svrDryRun ? "would-bid" : "bid",
       items: d.chosen.length, bidEth: ethers.formatEther(d.bidWei), bidUsd: d.bidUsd, netUsd: d.netUsd,
@@ -215,7 +223,74 @@ export class SvrBidder {
     this.submit(a, d).catch(e => logger.error(`SVR submit failed: ${e?.message ?? e}`));
   }
 
-  private decide(a: SvrAuction): Decision {
+  // Check each chosen borrower against Pool.getUserAccountData. A borrower passes
+  // when the model's health factor at the CURRENT chain prices matches the chain's
+  // within SVR_VERIFY_TOLERANCE and, for items the bid is sized on, the chain's HF
+  // carried through the model's own price effect still lands under 1.0. Failures
+  // are dropped and the bid re-sized without them; null when nothing survives.
+  private async verified(
+    a: SvrAuction, first: Extract<Decision, { kind: "bid" }>,
+  ): Promise<Extract<Decision, { kind: "bid" }> | null> {
+    const ok = new Set<string>();
+    const failed = new Set<string>();
+    let cur = first;
+    for (let round = 0; round < 3; round++) {
+      const todo = cur.chosen.filter(c => !ok.has(c.opp.borrower.toLowerCase()));
+      if (todo.length === 0) return cur;
+      const results = await this.checkAgainstChain(todo);
+      let anyFailed = false;
+      for (const [c, reason] of results) {
+        const key = c.opp.borrower.toLowerCase();
+        if (reason === null) { ok.add(key); continue; }
+        failed.add(key);
+        anyFailed = true;
+        logger.warn(`SVR ${a.auctionId.slice(0, 8)}: dropping ${c.opp.borrower.slice(0, 10)}… — ${reason}`);
+      }
+      if (!anyFailed) return cur;
+
+      // Re-size without the rejected borrowers. decide() counts auctions in the
+      // stats, and this one has already been counted.
+      const saved = { ...this.stats };
+      const next = this.decide(a, failed);
+      this.stats = saved;
+      if (next.kind === "skip") {
+        this.stats.suspect++;
+        this.log(a, { decision: "skip", reason: `verification: ${next.reason}`, dropped: [...failed] });
+        return null;
+      }
+      cur = next;
+    }
+    return null;
+  }
+
+  // null per candidate = matches the chain; otherwise the reason it does not.
+  private async checkAgainstChain(cands: SvrCandidate[]): Promise<Array<[SvrCandidate, string | null]>> {
+    const pool = new ethers.Contract(AAVE_POOL, AAVE_POOL_ABI, this.deps.getReadProvider());
+    return Promise.all(cands.map(async (c): Promise<[SvrCandidate, string | null]> => {
+      if (c.hfPre === null) return [c, "model has no health factor for it at current prices"];
+      let chainHf: number;
+      try {
+        const r = await pool.getUserAccountData(c.opp.borrower);
+        chainHf = Number(r[5]) / 1e18;
+      } catch (e: any) {
+        return [c, `chain read failed (${e?.shortMessage ?? e?.message ?? e})`];
+      }
+      if (!(chainHf > 0) || chainHf > 1e6) return [c, `chain health factor ${chainHf} (no debt?)`];
+      const off = Math.abs(chainHf - c.hfPre) / chainHf;
+      if (off > CONFIG.svrVerifyTolerance) {
+        return [c, `model HF ${c.hfPre.toFixed(4)} vs chain ${chainHf.toFixed(4)} (${(off * 100).toFixed(2)}% off) — stale model`];
+      }
+      if (c.sure) {
+        const corrected = chainHf * (c.hfLocal / c.hfPre);
+        if (corrected >= 1) {
+          return [c, `chain-corrected post-update HF ${corrected.toFixed(4)} is not under 1.0`];
+        }
+      }
+      return [c, null];
+    }));
+  }
+
+  private decide(a: SvrAuction, exclude: Set<string> = new Set()): Decision {
     const preview = this.deps.trigger.svrPreview(a.aggregator, a.medianPrice, a.maxFeePerGas);
     if (preview === "untracked") { this.stats.untracked++; return { kind: "skip", reason: "feed not tracked (not an Aave feed)" }; }
     // An Aave feed with nothing to estimate from means the detection path is blind
@@ -225,12 +300,26 @@ export class SvrBidder {
       return { kind: "skip", reason: "Aave feed has no price anchor yet" };
     }
 
-    const sure = preview.candidates.filter(c => c.sure);
+    const candidates = exclude.size === 0
+      ? preview.candidates
+      : preview.candidates.filter(c => !exclude.has(c.opp.borrower.toLowerCase()));
+    const sure = candidates.filter(c => c.sure);
     if (sure.length === 0) { this.stats.noOpportunity++; return { kind: "skip", reason: "no borrower crosses 1.0" }; }
+
+    // A jump this large in one update is, in practice, the model's fault (a bad
+    // anchor or scale), not the market's. Do not size a bid on it.
+    if (preview.movePct !== null && Math.abs(preview.movePct) > CONFIG.svrMaxMovePct) {
+      this.stats.suspect++;
+      logger.warn(
+        `SVR ${a.auctionId.slice(0, 8)}: announced answer is ${preview.movePct.toFixed(2)}% from the last seen ` +
+        `(limit ${CONFIG.svrMaxMovePct}%) on ${a.aggregator.slice(0, 10)}… — not bidding`
+      );
+      return { kind: "skip", reason: `announced move ${preview.movePct.toFixed(2)}% exceeds SVR_MAX_MOVE_PCT` };
+    }
 
     // Sure items first (the bid is sized on them), then bonus items, all within the
     // gas the operation is allowed to use.
-    const ordered = [...sure, ...preview.candidates.filter(c => !c.sure)];
+    const ordered = [...sure, ...candidates.filter(c => !c.sure)];
     const chosen: SvrCandidate[] = [];
     let gas = 150_000n;    // solver-call overhead: decode, unwrap, pay bid, reconcile
     for (const c of ordered) {

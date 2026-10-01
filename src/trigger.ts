@@ -143,6 +143,10 @@ export interface SvrCandidate {
   // Below 1.0 on the modelled post-update price: the bid may be sized on these.
   // Candidates at or above 1.0 are bonus items that may not be liquidatable.
   sure:    boolean;
+  // The model's health factor at the prices the chain holds NOW (before the
+  // announced update). The bidder checks it against Pool.getUserAccountData: a
+  // borrower the model misreads today is not one to bid on for tomorrow's price.
+  hfPre:   number | null;
 }
 
 interface BuiltOpp {
@@ -556,12 +560,16 @@ export class TriggerEngine {
   // behind it has an anchor to estimate from.
   svrPreview(
     feed: string, answer: bigint, gasPrice: bigint,
-  ): { candidates: SvrCandidate[]; ethPrice: number } | "untracked" | "unanchored" {
+  ): { candidates: SvrCandidate[]; ethPrice: number; movePct: number | null } | "untracked" | "unanchored" {
     const assets = this.feeds.get(feed.toLowerCase());
     if (!assets || assets.size === 0 || answer <= 0n) return "untracked";
 
     const prev   = this.lastAnswers.get(feed.toLowerCase()) ?? null;
+    // How far the announced answer is from the last one this engine saw.
+    const movePct = prev !== null && prev > 0n
+      ? (Number(answer - prev) / Number(prev)) * 100 : null;
     const prices = this.oracle.snapshotAllPrices();
+    const pricesNow = new Map(prices);   // the chain's prices, before the override
     const touched = new Set<string>();
     for (const asset of assets) {
       const est = this.estimate(asset, answer, prev);
@@ -573,17 +581,20 @@ export class TriggerEngine {
 
     const ceiling = BigInt(Math.round(Math.max(1, CONFIG.svrScanCeiling) * 1e18));
     const found   = this.tracker.findLocalCandidates(touched, prices, ceiling, 32, true);
-    if (found.length === 0) return { candidates: [], ethPrice: this.evaluator.ethPriceCached() || 3000 };
+    if (found.length === 0) return { candidates: [], ethPrice: this.evaluator.ethPriceCached() || 3000, movePct };
 
     const ethPrice = this.evaluator.ethPriceCached() || 3000;
     const out: SvrCandidate[] = [];
     for (const c of found) {
       const opp = this.evaluator.buildFromLocal(c.pos, c.collaterals, c.debts, prices, gasPrice, ethPrice, true);
       if (!opp) continue;
-      out.push({ opp, hfLocal: c.hfLocal, sure: c.pos.healthFactor < TRIGGER_HF_CEILING });
+      out.push({
+        opp, hfLocal: c.hfLocal, sure: c.pos.healthFactor < TRIGGER_HF_CEILING,
+        hfPre: this.tracker.modelHf(c.pos.address, pricesNow),
+      });
     }
     out.sort((a, b) => b.opp.netProfitUsd - a.opp.netProfitUsd);
-    return { candidates: out, ethPrice };
+    return { candidates: out, ethPrice, movePct };
   }
 
   // Self-test of the SVR detection path, runnable at any time. It asks, for every

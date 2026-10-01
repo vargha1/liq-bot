@@ -296,6 +296,15 @@ export const CONFIG = {
   svrOverheadGas:     BigInt(opt("SVR_OVERHEAD_GAS", "700000")),
   // Flat allowance, in USD, for the L1 data fee Atlas bills on the operation.
   svrExtraCostUsd:    parseFloat(opt("SVR_EXTRA_COST_USD", "0.03")),
+  // An announced answer further than this (percent) from the last one seen is
+  // treated as a model fault, not a market move, and never bid on. Routine
+  // updates are a fraction of a percent; a bid sized on a 10%+ jump that is not
+  // real costs the bond and wastes the auction.
+  svrMaxMovePct:      parseFloat(opt("SVR_MAX_MOVE_PCT", "10")),
+  // Before bidding, each borrower's health factor is read from the chain and
+  // compared with the model's at the same prices. A larger relative difference
+  // means the model's picture of that borrower is stale or wrong.
+  svrVerifyTolerance: parseFloat(opt("SVR_VERIFY_TOLERANCE", "0.005")),
 } as const;
 
 // ─── Aave V3 Arbitrum core addresses ─────────────────────────────────────────

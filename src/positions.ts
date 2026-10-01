@@ -2689,6 +2689,17 @@ export class PositionTracker {
     };
   }
 
+  // The model's health factor for one tracked borrower at `prices`, as a plain
+  // number; null when the borrower is not modelled or a needed price is missing.
+  // Pure, no state written. The SVR bidder compares it with the chain before
+  // trusting a candidate.
+  modelHf(address: string, prices: Map<string, bigint>): number | null {
+    const state = this.userStates.get(address);
+    if (!state) return null;
+    const r = this.computeHf(state, prices, this.makeReserveCtx(Math.floor(Date.now() / 1000)));
+    return r ? Number(r.hfE18) / 1e18 : null;
+  }
+
   // Real per-asset balances for a user, for the evaluator. Same arithmetic as
   // computeHf; only run for positions that have crossed the ceiling.
   private materialiseState(
