@@ -8,10 +8,24 @@ import {
 } from "./uniswap";
 import type { BorrowerPosition, LiquidationOpportunity, AssetPosition } from "./types";
 
-// Aave V3 close factor rules
+// Aave V3.3+ liquidation sizing (LiquidationLogic.executeLiquidationCall; the
+// Arbitrum pool is revision 11). Per debt reserve:
+//   * the whole reserve debt is liquidatable, EXCEPT when HF > 0.95 and both the
+//     collateral reserve and the debt reserve are worth >= $2000: then the repay
+//     is capped at 50% of the borrower's TOTAL debt (in base currency);
+//   * a partial repay must leave >= $1000 of debt in that reserve AND >= $1000 of
+//     collateral in the collateral reserve, unless it clears the whole debt or
+//     seizes all the collateral; anything else reverts with MustNotLeaveDust.
 const CLOSE_FACTOR_HF_THRESHOLD = 95n * 10n ** 16n;  // 0.95
 const DEFAULT_CLOSE_FACTOR      = 5000n;               // 50% in bps
-const MAX_CLOSE_FACTOR          = 10000n;              // 100% in bps
+const MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD = 2000n * 10n ** 8n;   // $2000, 8-dec base
+const MIN_LEFTOVER_BASE = MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD / 2n;
+// Safety margins against model drift (interest accrual, price estimate error).
+const LEFTOVER_MARGIN_BPS  = 50n;  // keep leftovers 0.5% above the $1000 line
+const FULL_CLOSE_BUFFER_BPS = 5n;  // ask for 0.05% more than a full close / collateral sweep
+const CAP_SHAVE_BPS        = 1n;   // ask for 0.01% less than the 50% cap
+
+function ceilDiv(a: bigint, b: bigint): bigint { return (a + b - 1n) / b; }
 
 // Bug #3 fix, refined: Arbitrum L1 data fee estimate.
 // On Arbitrum, transactions have an L1 data fee (calldata posting cost) that is NOT
@@ -141,18 +155,20 @@ function pathFeeBps(swapPath: string): number {
 function pickBestPair(ctx: PairPickContext): LiquidationOpportunity | null {
   const { position, collaterals, debts, prices, effectiveGasPrice, ethPrice, l1BaseFeeWei } = ctx;
 
-  // Aave V3 close factor depends on health factor alone: 100% at or below 0.95,
-  // 50% otherwise. E-mode does NOT change it. Treating e-mode positions as 100%
-  // sized debtToCover at twice what Aave would accept; Aave then liquidated half,
-  // and the swap floor — computed for the full amount — reverted the whole tx.
-  const closeFactor = position.healthFactor <= CLOSE_FACTOR_HF_THRESHOLD
-    ? MAX_CLOSE_FACTOR : DEFAULT_CLOSE_FACTOR;
-
-  // Size candidates. Price impact is modelled in coarse tiers, so 100% wins
-  // almost everywhere; 50% is kept for the tier boundaries. (Two fractions, not
-  // four: the extra two never won and cost twice the arithmetic.)
-  const SIZE_FRACTIONS = [10000n, 5000n]; // bps
+  // The repay Aave accepts depends on the pair (collateral and debt reserve
+  // values) and on the borrower's total debt, so it is derived inside the loop.
+  // Asking for more than Aave allows is not an error: Aave silently repays less,
+  // and a swap floor computed for the larger amount then reverts the whole tx.
+  // Asking for a partial repay that leaves dust IS an error (MustNotLeaveDust).
   let best: LiquidationOpportunity | null = null;
+
+  let totalDebtBase = 0n;
+  for (const d of debts) {
+    const p = prices.get(d.address.toLowerCase()) ?? 0n;
+    if (p === 0n) continue;
+    totalDebtBase += ceilDiv(d.balance * p, BigInt(10 ** d.decimals));
+  }
+  const leftoverMinBase = (MIN_LEFTOVER_BASE * (10000n + LEFTOVER_MARGIN_BPS)) / 10000n;
 
   // Gas cost depends only on whether a swap is needed — not on the pair or size.
   const gasUsdSame = txCostUsd(SAME_ASSET_GAS,       0,                     effectiveGasPrice, ethPrice, l1BaseFeeWei);
@@ -163,8 +179,10 @@ function pickBestPair(ctx: PairPickContext): LiquidationOpportunity | null {
     const debtPrice = prices.get(debt.address.toLowerCase()) ?? 0n;
     if (debtPrice === 0n) { logger.debug(`  eval SKIP: debt ${debt.symbol} price=0`); continue; }
 
-    const maxDebtToCover = (debt.balance * closeFactor) / 10000n;
-    if (maxDebtToCover === 0n) continue;
+    const debtDecimals  = BigInt(10 ** debt.decimals);
+    const reserveDebt   = debt.balance;
+    if (reserveDebt === 0n) continue;
+    const debtBase      = ceilDiv(reserveDebt * debtPrice, debtDecimals);
 
     for (const collateral of collaterals) {
       const reserve = RESERVES[collateral.symbol];
@@ -188,8 +206,29 @@ function pickBestPair(ctx: PairPickContext): LiquidationOpportunity | null {
       const isSameAsset = collateral.address.toLowerCase() === debt.address.toLowerCase();
       const gasCostUsd  = isSameAsset ? gasUsdSame : gasUsdSwap;
 
-      for (const fraction of SIZE_FRACTIONS) {
-        const debtToCover = (maxDebtToCover * fraction) / 10000n;
+      // Most Aave will let us repay in this reserve (see the constants above).
+      const collBase = (collateral.balance * collateralPrice) / collDec;
+      let maxLiquidatable = reserveDebt;
+      if (
+        position.healthFactor > CLOSE_FACTOR_HF_THRESHOLD &&
+        collBase >= MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD &&
+        debtBase >= MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD
+      ) {
+        const cap = (totalDebtBase * DEFAULT_CLOSE_FACTOR) / 10000n;
+        if (debtBase > cap) maxLiquidatable = (cap * debtDec) / debtPrice;
+      }
+      if (maxLiquidatable === 0n) continue;
+
+      // Sizes worth pricing: the most allowed, the most allowed that still leaves
+      // the $1000 debt leftover (matters when the 50% cap lands just short of a
+      // full close), and half the most allowed for the price-impact tier edges.
+      const sizes = new Set<bigint>([maxLiquidatable, maxLiquidatable / 2n]);
+      const leftoverUnits = ceilDiv(leftoverMinBase * debtDec, debtPrice) + 1n;
+      if (reserveDebt > leftoverUnits && reserveDebt - leftoverUnits < maxLiquidatable) {
+        sizes.add(reserveDebt - leftoverUnits);
+      }
+
+      for (const debtToCover of sizes) {
         if (debtToCover === 0n) continue;
 
         // Collateral Aave would seize for this repayment, bonus included.
@@ -199,11 +238,36 @@ function pickBestPair(ctx: PairPickContext): LiquidationOpportunity | null {
         if (grossCollateral === 0n) continue;
 
         let actualDebtToCover = debtToCover;
-        if (grossCollateral > collateral.balance) {
+        let sweepsCollateral  = false;
+        if (grossCollateral >= collateral.balance) {
+          sweepsCollateral = true;
           grossCollateral = collateral.balance;
           actualDebtToCover = (grossCollateral * collateralPrice * 10000n * debtDec)
             / (debtPrice * bonusFactor * collDec);
           if (actualDebtToCover === 0n) continue;
+        }
+        const clearsDebt = actualDebtToCover >= reserveDebt;
+
+        // Aave rejects a partial repay that strands dust on either side.
+        if (!clearsDebt && !sweepsCollateral) {
+          const debtLeftBase = ceilDiv((reserveDebt - actualDebtToCover) * debtPrice, debtDec);
+          const collLeftBase = ((collateral.balance - grossCollateral) * collateralPrice) / collDec;
+          if (debtLeftBase < leftoverMinBase || collLeftBase < leftoverMinBase) continue;
+        }
+
+        // What we ask Aave for. Clearing the debt or sweeping the collateral only
+        // works if we ask for slightly more than our estimate says is needed (the
+        // balance may have accrued since); Aave takes just what it needs and the
+        // unused part of the flashloan stays in the contract. Under the 50% cap we
+        // ask for slightly less, so rounding can never push the request above it.
+        let requested = actualDebtToCover;
+        if (clearsDebt) {
+          requested = (reserveDebt * (10000n + FULL_CLOSE_BUFFER_BPS)) / 10000n;
+        } else if (sweepsCollateral) {
+          requested = (actualDebtToCover * (10000n + FULL_CLOSE_BUFFER_BPS)) / 10000n;
+          if (requested > maxLiquidatable) requested = maxLiquidatable;
+        } else if (debtToCover === maxLiquidatable && maxLiquidatable < reserveDebt) {
+          requested = debtToCover - (debtToCover * CAP_SHAVE_BPS) / 10000n;
         }
 
         // Aave keeps a share of the BONUS as protocol fee; we receive the rest.
@@ -234,7 +298,7 @@ function pickBestPair(ctx: PairPickContext): LiquidationOpportunity | null {
             collateralSymbol:   collateral.symbol,
             debtAsset:          debt.address,
             debtSymbol:         debt.symbol,
-            debtToCover:        actualDebtToCover,
+            debtToCover:        requested,
             debtToCoverUsd:     debtUsdNum,
             expectedCollateral,
             expectedBonusUsd:   bonusUsd,

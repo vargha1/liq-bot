@@ -12,6 +12,7 @@
     "svr": "tsx src/svrTool.ts",
     "svr-selftest": "tsx src/svrSelftest.ts",
     "svr-plumbing": "tsx src/svrPlumbingCheck.ts",
+    "sizing-check": "tsx src/sizingCheck.ts",
     "build": "tsc",
     "start": "node dist/index.js"
   },

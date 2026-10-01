@@ -80,7 +80,7 @@ export class SvrBidder {
   private bondTimer: ReturnType<typeof setInterval> | null = null;
   private probeTimer: ReturnType<typeof setInterval> | null = null;
 
-  stats = { auctions: 0, untracked: 0, unanchored: 0, noOpportunity: 0, skipped: 0, wouldBid: 0, submitted: 0, rejected: 0, included: 0 };
+  stats = { auctions: 0, untracked: 0, unanchored: 0, noOpportunity: 0, skipped: 0, wouldBid: 0, submitted: 0, rejected: 0, included: 0, solverFailed: 0, updateGone: 0 };
 
   constructor(private deps: SvrBidderDeps) {
     this.feed = new SvrFeed(CONFIG.svrWsUrl, a => this.onAuction(a), logger);
@@ -121,7 +121,8 @@ export class SvrBidder {
     const f = this.feed.stats;
     return `svr: ${s.auctions} auctions (${f.connects} conn), ${s.untracked} not-aave, ${s.unanchored} NO-ANCHOR, ` +
       `${s.noOpportunity} no-opp, ${s.skipped} skipped, ${s.wouldBid} would-bid, ` +
-      `${s.submitted} submitted, ${s.rejected} rejected, ${s.included} included`;
+      `${s.submitted} submitted, ${s.rejected} rejected, ${s.included} included, ` +
+      `${s.solverFailed} solver-failed, ${s.updateGone} update-gone`;
   }
 
   private async refreshBond(): Promise<void> {
@@ -346,9 +347,19 @@ export class SvrBidder {
       params: [{ auctionId: a.auctionId, userOperationHash: a.userOpHash, solverOperationFrom: ethers.getAddress(from), signature }],
     }, { timeout: 5_000 });
     const result = res.data?.result?.result ?? res.data?.error?.message ?? "unknown";
-    if (result === "included") this.stats.included++;
-    logger.info(`SVR ${a.auctionId.slice(0, 8)}: outcome = ${result}`);
-    this.log(a, { decision: "outcome", outcome: result });
+    const text = String(result);
+    if (text === "included") this.stats.included++;
+    // The gateway accepts a bid before simulating it, so a failed simulation
+    // never shows as "rejected". UserOpSimFail: the oracle update itself no longer
+    // applies (someone else's bundle landed it first). SolverSimFail: the update
+    // applied and our operation reverted.
+    else if (/UserOpSimFail/.test(text)) this.stats.updateGone++;
+    else if (/SolverSimFail|SolverOpReverted/.test(text)) this.stats.solverFailed++;
+    // The gateway echoes the whole simulated calldata (several KB); keep the head,
+    // which carries the outcome codes, and put the full text in the jsonl.
+    const shown = text.length > 200 ? `${text.slice(0, 200)}… (+${text.length - 200} chars, full text in svr-auctions.jsonl)` : text;
+    logger.info(`SVR ${a.auctionId.slice(0, 8)}: outcome = ${shown}`);
+    this.log(a, { decision: "outcome", outcome: text });
   }
 
   // One JSON line per auction, so a dry run can be analysed afterwards against
