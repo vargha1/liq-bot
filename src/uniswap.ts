@@ -188,6 +188,8 @@ const inflightRefreshes   = new Map<string, Promise<void>>();
 const lastRefreshAttempt  = new Map<string, number>();
 const ROUTE_REFRESH_MIN_INTERVAL_MS = 60_000;   // at most one background quote fan-out per pair per minute
 const ROUTE_TTL_MS                  = 10 * 60_000; // routes older than this are refreshed on next touch
+const ROUTE_FORCE_BACKOFF_MS        = 15_000;      // min gap between forced refreshes of one uncached pair
+const MAX_CONCURRENT_REFRESHES      = 2;           // background quote fan-outs in flight at once
 
 function pairKey(tokenIn: string, tokenOut: string): string {
   return `${tokenIn.toLowerCase()}->${tokenOut.toLowerCase()}`;
@@ -239,10 +241,16 @@ export function scheduleRouteRefresh(
 
   const cached = routeCache.get(key);
   if (!force && cached && now - cached.ts < ROUTE_REFRESH_MIN_INTERVAL_MS) return;
-  if (!force && !cached && now - (lastRefreshAttempt.get(key) ?? 0) < ROUTE_REFRESH_MIN_INTERVAL_MS) return;
+  // force skips the per-minute throttle but not a short backoff: a pair whose
+  // quote just failed (shed by the limiter) must not be re-fanned-out every eval.
+  const sinceLast = now - (lastRefreshAttempt.get(key) ?? 0);
+  if (!cached && sinceLast < (force ? ROUTE_FORCE_BACKOFF_MS : ROUTE_REFRESH_MIN_INTERVAL_MS)) return;
 
   const inflight = inflightRefreshes.get(key);
   if (inflight) return;
+  // Each refresh is ~5 batched eth_calls; bursts (SVR probe, many pairs at once)
+  // would blow through the limiter budget and starve the hot path.
+  if (inflightRefreshes.size >= MAX_CONCURRENT_REFRESHES) return;
 
   lastRefreshAttempt.set(key, now);
   const job = (async () => {
@@ -299,6 +307,9 @@ export async function uniswapSwap(
   let bestPath = "";
   let bestGas  = 350_000;
   let bestDesc = "";
+  // Set when a quote failed for transport reasons (shed/timeout), as opposed to
+  // the pool genuinely not existing. Without it a busy limiter reads as "no route".
+  let transportFailed = false;
 
   const consider = (path: string, desc: string, out: bigint, gas: number) => {
     logger.debug(`  Uni ${desc}: out=${out} gas=${gas}`);
@@ -334,8 +345,11 @@ export async function uniswapSwap(
           QUOTE_TIMEOUT_MS,
         ) as Array<{ success: boolean; returnData: string }>;
       } catch (e: any) {
+        if (/timeout|RPC_BACKPRESSURE|destroyed/i.test(`${e?.message} ${e?.code}`)) {
+          transportFailed = true;
+          throw e;   // bisecting would not help
+        }
         if (items.length === 1) return [undefined];
-        if (/timeout|RPC_BACKPRESSURE|destroyed/i.test(`${e?.message} ${e?.code}`)) throw e;   // bisecting would not help
         const mid = items.length >> 1;
         const [l, r] = await Promise.all([quoteBatch(items.slice(0, mid)), quoteBatch(items.slice(mid))]);
         return [...l, ...r];
@@ -369,13 +383,23 @@ export async function uniswapSwap(
       })
     );
     for (const result of quoteResults) {
-      if (result.status !== "fulfilled") continue;
+      if (result.status !== "fulfilled") {
+        const r = result.reason as any;
+        if (/timeout|RPC_BACKPRESSURE|destroyed/i.test(`${r?.message} ${r?.code}`)) transportFailed = true;
+        continue;
+      }
       const { path, desc, out, gas } = result.value;
       consider(path, desc, out, gas);
     }
   }
 
   if (bestOut === 0n) {
+    if (transportFailed) {
+      // Quotes never reached the chain (rate limiter shed / timeout): not evidence
+      // the pools are missing. Callers keep the cached or heuristic route.
+      logger.debug(`uniswapSwap: quote unavailable ${symOf(tokenIn)}→${symOf(tokenOut)} (rpc busy) — keeping existing route`);
+      return null;
+    }
     logger.warn(`uniswapSwap: no route ${symOf(tokenIn)}→${symOf(tokenOut)}`);
     return null;
   }
