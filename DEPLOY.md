@@ -197,6 +197,27 @@ Red flags:
 - Watchdog warnings about no cycle processed — the RPC is too slow or rate
   limited.
 
+## 6b. Running a Base instance
+
+A second service for Base, next to the Arbitrum one. It needs its own env file, RPC
+endpoints, funded wallet balance and contract:
+
+```bash
+sudo -u liqbot cp .env.example .env.base
+sudo -u liqbot chmod 600 .env.base
+sudo -u liqbot nano .env.base        # CHAIN=base, Base RPC_URL / RPC_WS, CONTRACT_ADDRESS from the next step
+CHAIN=base DOTENV_CONFIG_PATH=.env.base sudo -E -u liqbot npm run deploy-liquidator          # dry run
+CHAIN=base DOTENV_CONFIG_PATH=.env.base sudo -E -u liqbot npm run deploy-liquidator -- --yes # deploy
+```
+
+Copy the Arbitrum unit to `/etc/systemd/system/liq-bot-base.service`, change the
+`Description`, `SyslogIdentifier` and add `Environment=CHAIN=base` and
+`Environment=DOTENV_CONFIG_PATH=/opt/liq-bot/app/.env.base`, then
+`systemctl enable --now liq-bot-base`. Both units share `dist/`; state files, logs and the
+log-control port are separated per chain by the bot.
+
+Base's sequencer is also in the US, so the latency note at the top applies to it too.
+
 ## 7. Updating
 
 ```bash

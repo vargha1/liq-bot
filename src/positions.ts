@@ -7,7 +7,7 @@ import {
   AAVE_POOL, AAVE_DATA_PROVIDER, UI_POOL_DATA_PROVIDER, POOL_ADDRESSES_PROVIDER,
   MULTICALL3, AAVE_SUBGRAPH_URL,
   AAVE_POOL_ABI, ATOKEN_ABI, DATA_PROVIDER_ABI, UI_POOL_DATA_PROVIDER_ABI, MULTICALL3_ABI, RESERVES, RESERVE_BY_ADDRESS,
-  CONFIG,
+  CONFIG, AAVE_DEPLOY_BLOCK, PROFILE,
 } from "./config";
 import type { BorrowerPosition, AssetPosition } from "./types";
 import { ReserveRegistry, RAY, TOPIC_RESERVE_DATA_UPDATED, rayMul, healthFactorExact } from "./reserveState";
@@ -31,12 +31,11 @@ const HF_SEED  = 110n * 10n ** 16n;   // 1.10 — initial HF for unseen position
 // check returning e.g. 1.04 they stay in danger forever and starve rotation).
 // FIX: Reduced from 50 000 to 2 000 — most RPC providers reject ranges > 10 000 blocks.
 // 2 000 is conservative and works on Alchemy, QuickNode, Infura, etc.
-const SCAN_CHUNK        = 3_000n;
+const SCAN_CHUNK        = PROFILE.scanChunk;
 // Gap-fill queries every monitored Aave topic at once, so a chunk yields far
 // more logs than the Borrow-only historical scan. Keep it small enough to stay
 // under provider result-count caps.
 const GAP_FILL_CHUNK    = 2_000n;
-const AAVE_DEPLOY_BLOCK = 7742429n;
 
 const MIN_DEBT_USD8             = 1_000_000_000n;     // $10 — eviction threshold (matches cycle MIN_DEBT_USD)
                                                         // Positions below this can never cover flashloan premium + gas
@@ -46,8 +45,10 @@ const MIN_DEBT_FOR_BREAKDOWN_USD8 = 1_000_000_000n;   // $10 — skip cheap brea
 // Danger positions (HF < 1.05) need fresh data every 5 blocks (~6s).
 // Other positions change slowly — 50 blocks (~60s) avoids redundant RPC calls.
 // Both are invalidated immediately on any Aave event for the address.
-const BREAKDOWN_CACHE_BLOCKS_DANGER = 5n;   // HF < HF_PREWARM
-const BREAKDOWN_CACHE_BLOCKS_NORMAL = 50n;  // all others
+// Defined in time (~1.25s and ~12.5s) and converted with the chain's block time:
+// 5 / 50 blocks on Arbitrum, 1 / 6 on Base.
+const BREAKDOWN_CACHE_BLOCKS_DANGER = BigInt(Math.max(1, Math.round(1_250 / PROFILE.blockTimeMs)));   // HF < HF_PREWARM
+const BREAKDOWN_CACHE_BLOCKS_NORMAL = BigInt(Math.max(2, Math.round(12_500 / PROFILE.blockTimeMs)));  // all others
 
 // ── Borrower cache ─────────────────────────────────────────────────────────────
 //
@@ -74,13 +75,16 @@ const BREAKDOWN_CACHE_BLOCKS_NORMAL = 50n;  // all others
 // Anchored to the project root (like the logs), not the launch directory, so
 // starting the bot from elsewhere cannot silently begin with empty caches.
 const STATE_DIR       = path.resolve(__dirname, "..");
-const CACHE_FILE      = path.join(STATE_DIR, "active-cache.json");
-const FULL_CACHE_FILE = path.join(STATE_DIR, "borrowers-cache.json");
+// State is per chain: another chain's borrowers would only waste reads. The original
+// chain (Arbitrum) keeps the unsuffixed names so existing caches stay valid.
+const SFX             = PROFILE.stateSuffix;
+const CACHE_FILE      = path.join(STATE_DIR, `active-cache${SFX}.json`);
+const FULL_CACHE_FILE = path.join(STATE_DIR, `borrowers-cache${SFX}.json`);
 // Persisted bad-debt denylist — survives restarts so known bad-debt positions are never
 // re-evaluated. Without this, every restart re-seeds 0x04511e… and 0xf740382c from the
 // full cache, detects them as liquidatable (HF=0), runs breakdown+evaluate, then evicts —
 // wasting a cycle and logging a false "liquidatable=1" indefinitely.
-const DENYLIST_FILE    = path.join(STATE_DIR, "bad-debt-denylist.json");
+const DENYLIST_FILE    = path.join(STATE_DIR, `bad-debt-denylist${SFX}.json`);
 // A dormant position remembers which reserve addresses it actually touches, so a
 // price drop on an unrelated asset doesn't wake it. Populated from the breakdown
 // cache at park time; absent when the position was parked without a breakdown
@@ -285,7 +289,8 @@ export class PositionTracker {
   // invisible until the borrower transacted.)
   private lastDangerHF = new Map<string, { hf: bigint; stableFor: number; checkedAtBlock: bigint }>();
   private static readonly DANGER_SKIP_BLOCKS = 1;          // skip only 1 cycle of unchanged HF
-  private static readonly DANGER_FORCE_RECHECK_BLOCKS = 40; // ~10s on Arbitrum — max blind window for any danger position
+  // ~10s on any chain (40 blocks on Arbitrum, 5 on Base) — max blind window for any danger position
+  private static readonly DANGER_FORCE_RECHECK_BLOCKS = Math.max(2, Math.round(10_000 / PROFILE.blockTimeMs));
 
   private rebuildDangerList(): void {
     this.dangerList = [...this.positions.values()]
@@ -1422,7 +1427,7 @@ export class PositionTracker {
         // were permanently missed. 10,000 blocks (~4.6 hours) is a much safer window.
         const truncated = current - this.lastEventBlock > 10_000n;
         const fromBlock = truncated
-          ? current - 10_000n   // cap: ~42 min on Arbitrum (0.25s blocks)
+          ? current - 10_000n   // cap: ~42 min on Arbitrum (0.25s blocks), ~5.5h on Base
           : this.lastEventBlock;
         logger.info(`Gap-filling ${fromBlock}→${current}…`);
         // Chunked: the previous single unchunked request could span the full
@@ -1470,7 +1475,7 @@ export class PositionTracker {
           // The cap dropped the oldest part of the gap: those events can never be
           // replayed, so re-read state instead of trusting it.
           if (truncated && isReconnect) {
-            logger.warn(`  Gap exceeded ${10_000n} blocks (~42 min) — oldest events unrecoverable`);
+            logger.warn(`  Gap exceeded ${10_000n} blocks (~${Math.round(10_000 * PROFILE.blockTimeMs / 60_000)} min) — oldest events unrecoverable`);
             this.recoverFromUnrecoveredGap();
           }
         } else {

@@ -310,6 +310,12 @@ export class TriggerEngine {
   // this only lets us act earlier when it works.
   private startSequencerFeed(): void {
     if (!CONFIG.sequencerFeedEnabled) return;
+    // The decoder understands Arbitrum's feed framing only. A chain without a feed
+    // URL (Base) has nothing to connect to, so say so rather than fail silently.
+    if (!CONFIG.sequencerFeedUrl) {
+      logger.warn("SEQUENCER_FEED_ENABLED=true ignored: no sequencer feed is available for this chain");
+      return;
+    }
     this.seqFeed = new SequencerFeedWatcher(CONFIG.sequencerFeedUrl, hint => this.onFeedHint(hint));
     this.seqFeed.setWatchedFeeds(this.feeds.keys());
     this.seqFeed.start();

@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { CONFIG, LIQUIDATOR_ABI, ARBITRUM_SEQUENCER_RPC, CHAIN_ID, RESERVE_BY_ADDRESS } from "./config";
+import { CONFIG, LIQUIDATOR_ABI, SEQUENCER_RPC, CHAIN_ID, RESERVE_BY_ADDRESS, PROFILE } from "./config";
 import { estimateGasUnits, SAME_ASSET_GAS } from "./evaluator";
 import { hopsFromPath } from "./uniswap";
 import { metrics } from "./metrics";
@@ -114,15 +114,15 @@ export class Executor {
     this.contract = new ethers.Contract(contractAddress, LIQUIDATOR_ABI, wallet);
     this.fallbackProvider = fallbackProvider ?? null;
 
-    if (CONFIG.broadcastToSequencer) {
+    if (CONFIG.broadcastToSequencer && SEQUENCER_RPC) {
       try {
         // Submission-only endpoint: it serves eth_sendRawTransaction but not
         // eth_blockNumber/eth_chainId, so the network is pinned explicitly and
         // staticNetwork stops ethers probing for a chain id it cannot answer.
         this.sequencerProvider = new ethers.JsonRpcProvider(
-          ARBITRUM_SEQUENCER_RPC, CHAIN_ID, { staticNetwork: true },
+          SEQUENCER_RPC, CHAIN_ID, { staticNetwork: true },
         );
-        logger.info(`Executor: also broadcasting to Arbitrum sequencer (${ARBITRUM_SEQUENCER_RPC})`);
+        logger.info(`Executor: also broadcasting to ${PROFILE.name} sequencer (${SEQUENCER_RPC})`);
       } catch (e: any) {
         logger.warn(`Executor: sequencer endpoint unavailable: ${e?.message ?? e}`);
       }
@@ -309,17 +309,21 @@ export class Executor {
 
       const feeData = feeDataOverride ?? this.feeDataSource?.() ?? await this.getFeeDataResilient();
 
-      // NOTE on ordering: Arbitrum sequences FCFS by arrival time — priority
-      // tips do not reorder transactions. So the tip is CLAMPED to the network's
-      // own maxFeePerGas rather than raising it. Paying above the network rate
-      // buys no ordering here, while inflating maxFeePerGas inflates the balance
-      // reservation above for exactly zero benefit.
+      // NOTE on ordering. Arbitrum sequences FCFS by arrival time — priority tips
+      // do not reorder transactions, so there the tip is CLAMPED to the network's
+      // own maxFeePerGas rather than raising it: paying above the network rate buys
+      // no ordering while inflating the balance reservation above.
+      // Base (ordering "priority-fee") DOES sequence by tip, so there a tip above
+      // the suggested one is paid for by raising maxFeePerGas with it.
       const tipCap       = BigInt(Math.round(CONFIG.timeboostPriorityGwei * 1e9));
       const suggestedMax = feeData.maxFeePerGas ?? 0n;
-      const maxFee       = suggestedMax > 0n ? suggestedMax : (feeData.gasPrice ?? 100_000_000n);
+      let   maxFee       = suggestedMax > 0n ? suggestedMax : (feeData.gasPrice ?? 100_000_000n);
       let   priority     = feeData.maxPriorityFeePerGas ?? 0n;
-      if (tipCap > priority) priority = tipCap;
-      if (priority > maxFee) priority = maxFee;   // clamp, never raise maxFee
+      if (tipCap > priority) {
+        if (PROFILE.gas.ordering === "priority-fee" && suggestedMax > 0n) maxFee += tipCap - priority;
+        priority = tipCap;
+      }
+      if (priority > maxFee) priority = maxFee;   // clamp
 
       const txOpts: ethers.Overrides = {
         gasLimit,
@@ -618,7 +622,7 @@ export class Executor {
     }
     this.noteGas(receipt);
     const gasCost = receipt.gasUsed * (receipt.gasPrice ?? 0n);
-    logger.info(`Gas: ${receipt.gasUsed} | ${ethers.formatEther(gasCost)} ETH`);
+    logger.info(`Gas: ${receipt.gasUsed} | ${ethers.formatEther(gasCost)} ${PROFILE.nativeSymbol}`);
   }
 
   async withdraw(tokenAddress: string): Promise<void> {

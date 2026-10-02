@@ -1,5 +1,5 @@
 import { createLogger, format, transports } from "winston";
-import { CONFIG } from "./config";
+import { CONFIG, PROFILE } from "./config";
 import * as fs from "fs";
 import * as path from "path";
 import * as http from "http";
@@ -37,14 +37,14 @@ export const logger = createLogger({
   transports: [
     new transports.Console({ format: consoleFmt }),
     new transports.File({
-      filename: path.join(LOG_DIR, "liquidator.log"),
+      filename: path.join(LOG_DIR, `liquidator${PROFILE.stateSuffix}.log`),
       format:   fileFmt,
       maxsize:  50 * 1024 * 1024,   // 50 MB — rotate at 50 MB
       maxFiles: 5,                   // keep 5 rotated files
       tailable: true,
     }),
     new transports.File({
-      filename: path.join(LOG_DIR, "errors.log"),
+      filename: path.join(LOG_DIR, `errors${PROFILE.stateSuffix}.log`),
       level:    "error",
       format:   fileFmt,
       maxsize:  10 * 1024 * 1024,
@@ -106,7 +106,8 @@ process.on("SIGUSR1", () => cycleLevel("up"));    // more verbose
 process.on("SIGUSR2", () => cycleLevel("down"));  // less verbose
 
 // ── HTTP control server ───────────────────────────────────────────────────────
-const LOG_CTRL_PORT = parseInt(process.env["LOG_CTRL_PORT"] ?? "3099", 10);
+// Per-chain default so two bots (one per chain) on one host do not fight over a port.
+const LOG_CTRL_PORT = parseInt(process.env["LOG_CTRL_PORT"] ?? (PROFILE.key === "arbitrum" ? "3099" : "3100"), 10);
 
 const ctrlServer = http.createServer((req, res) => {
   const url    = req.url  ?? "/";
@@ -149,7 +150,7 @@ ctrlServer.on("error", (e: Error & { code?: string }) => {
 // Write a level name to ./loglevel.ctrl to change the level without signals.
 // Useful inside Docker or when you don't have easy shell access.
 // Example: echo debug > loglevel.ctrl
-const CTRL_FILE = path.join(PROJECT_ROOT, "loglevel.ctrl");
+const CTRL_FILE = path.join(PROJECT_ROOT, `loglevel${PROFILE.stateSuffix}.ctrl`);
 
 // unref(): the control watchers must never be the reason a process stays alive
 // (matters for tests and one-shot diagnostic scripts).

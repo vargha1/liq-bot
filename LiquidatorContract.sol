@@ -48,13 +48,16 @@ interface ISwapRouter {
  *   - debtToCover != max guard (flashLoanSimple rejects max)
  *   - deadline guard — stale txs revert cleanly rather than executing at wrong prices
  *
- * Deployment:
- *   constructor(UNISWAP_SWAP_ROUTER02)  // 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
+ * Deployment (one contract per chain — the Pool and router differ):
+ *   constructor(UNISWAP_SWAP_ROUTER02, AAVE_V3_POOL)
+ *     Arbitrum: 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45, 0x794a61358D6845594F94dc1DB02A252b5b4814aD
+ *     Base:     0x2626664c2603336E57B271c5C0b26F421741e481, 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5
+ *   Easiest: `CHAIN=base npm run deploy-liquidator -- --yes`, which passes the right pair.
  */
 contract AaveLiquidator {
 
     address public immutable owner;
-    address public constant  AAVE_POOL    = 0x794a61358D6845594F94dc1DB02A252b5b4814aD;
+    address public immutable AAVE_POOL;    // Aave V3 Pool of the chain this is deployed on
     address public immutable SWAP_ROUTER;  // Uniswap V3 SwapRouter02
 
     uint256 private constant _NOT_ENTERED = 1;
@@ -80,10 +83,12 @@ contract AaveLiquidator {
         uint256 flashloanPremium  // FIX: emit premium for accurate accounting
     );
 
-    constructor(address swapRouter) {
+    constructor(address swapRouter, address aavePool) {
         require(swapRouter != address(0), "Bad router");
+        require(aavePool   != address(0), "Bad pool");
         owner       = msg.sender;
         SWAP_ROUTER = swapRouter;
+        AAVE_POOL   = aavePool;
     }
 
     modifier onlyOwner()    { require(msg.sender == owner,   "Not owner");  _; }
@@ -178,7 +183,7 @@ contract AaveLiquidator {
 
         // Step 3: swap collateral → debtAsset via Uniswap V3
         if (p.collateralAsset != p.debtAsset) {
-            require(colReceived > 0, "No collateral — already liquidated?");
+            require(colReceived > 0, "No collateral - already liquidated?");
 
             _safeApprove(IERC20(p.collateralAsset), SWAP_ROUTER, colReceived);
 
@@ -208,7 +213,7 @@ contract AaveLiquidator {
         // at least (B0 - amount) + repayToAave.
         uint256 debtBal  = IERC20(p.debtAsset).balanceOf(address(this));
         uint256 required = debtBefore - amount + repayToAave;
-        require(debtBal >= required, "Unprofitable — cannot repay flashloan");
+        require(debtBal >= required, "Unprofitable - cannot repay flashloan");
 
         uint256 profit = debtBal - required;
 

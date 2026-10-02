@@ -12,10 +12,10 @@ dist/
 # ── Runtime state ─────────────────────────────────────────────────────────────
 # Rebuilt automatically on startup. borrowers-cache.json in particular grows to
 # hundreds of thousands of addresses and is pure derived data.
-active-cache.json
-borrowers-cache.json
-bad-debt-denylist.json
-loglevel.ctrl
+active-cache*.json
+borrowers-cache*.json
+bad-debt-denylist*.json
+loglevel*.ctrl
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 logs/

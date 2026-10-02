@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { CONFIG, AAVE_POOL, AAVE_POOL_ABI } from "./config";
+import { CONFIG, AAVE_POOL, AAVE_POOL_ABI, PROFILE } from "./config";
 import { PositionTracker } from "./positions";
 import { AaveOracle } from "./oracle";
 import { Evaluator } from "./evaluator";
@@ -31,7 +31,7 @@ process.on("unhandledRejection", r => logger.error(`Rejection: ${r}`));
 
 async function main(): Promise<void> {
   logger.info("═══════════════════════════════════════════════════════════");
-  logger.info(" Aave V3 Liquidation Bot — Arbitrum One ");
+  logger.info(` Aave V3 Liquidation Bot — ${PROFILE.name} `);
   logger.info("═══════════════════════════════════════════════════════════");
   logger.info(`Contract   : ${CONFIG.contractAddress}`);
   logger.info(`Min profit : $${CONFIG.minProfitUsd}`);
@@ -89,8 +89,10 @@ async function main(): Promise<void> {
   // moves by more than EVAL_HF_CHANGE_THRESHOLD re-evaluates immediately
   // regardless, so the case that actually matters — a price move making it
   // profitable — is not delayed.
-  const EVAL_COOLDOWN_DEFAULT      = 2n;   // blocks — plain rate limit
-  const EVAL_COOLDOWN_UNPROFITABLE = 30n;  // blocks (~7.5s on Arbitrum)
+  // Cooldowns are defined in time and converted with the chain's block time:
+  // ~0.5s (2 blocks on Arbitrum, 1 on Base) and ~7.5s (30 blocks on Arbitrum).
+  const EVAL_COOLDOWN_DEFAULT      = BigInt(Math.max(1, Math.round(500 / PROFILE.blockTimeMs)));   // blocks — plain rate limit
+  const EVAL_COOLDOWN_UNPROFITABLE = BigInt(Math.max(2, Math.round(7_500 / PROFILE.blockTimeMs))); // blocks
 
   // Opt #26: Background price pre-fetch cache, populated by the interval set up
   // during startup. Declared here rather than beside that interval because
@@ -190,7 +192,7 @@ async function main(): Promise<void> {
       `📊 uptime=${upMin}m | cycles=${cycles} | liquidatable=${liquidatable} | ` +
       `landed=${executor?.results.confirmed ?? 0} reverted=${executor?.results.reverted ?? 0} ` +
       `timeout=${executor?.results.timedOut ?? 0} | profit=$${(executor?.results.realizedProfitUsd ?? 0).toFixed(2)} ` +
-      `gas=${(executor?.results.gasSpentEth ?? 0).toFixed(5)}ETH | ` +
+      `gas=${(executor?.results.gasSpentEth ?? 0).toFixed(5)}${PROFILE.nativeSymbol} | ` +
       `watching=${tracker?.size ?? 0} dormant=${tracker?.dormantSize ?? 0}` +
       (cov ? ` model=${cov.modelled}/${cov.total}` : "") +
       dangerStr + rpcStr + boundStr + trigStr +
@@ -779,9 +781,11 @@ async function main(): Promise<void> {
       httpProvider.getNetwork(),
       httpProvider.getBlockNumber(),
     ]);
-    if (net.chainId !== 42161n) throw new Error(`Wrong chain: ${net.chainId}`);
+    if (net.chainId !== BigInt(PROFILE.chainId)) {
+      throw new Error(`Wrong chain: RPC reports ${net.chainId}, CHAIN=${PROFILE.key} expects ${PROFILE.chainId}`);
+    }
     lastSeenBlock = BigInt(bn);
-    logger.info(`Connected to Arbitrum | block ${bn}`);
+    logger.info(`Connected to ${PROFILE.name} | block ${bn}`);
   } catch (err: any) {
     logger.error(`Init failed: ${err.message}`);
     process.exit(1);
@@ -790,13 +794,13 @@ async function main(): Promise<void> {
   const wallet = new ethers.Wallet(CONFIG.privateKey, provider);
 
   const ethBal = await httpProvider.getBalance(wallet.address); // FIX: reuse existing provider, don't leak a new one
-  logger.info(`Wallet: ${wallet.address} | ETH: ${ethers.formatEther(ethBal)}`);
+  logger.info(`Wallet: ${wallet.address} | ${PROFILE.nativeSymbol}: ${ethers.formatEther(ethBal)}`);
 
   // No balance threshold is checked here: any constant would be a guess about a
   // number the node already enforces when it validates a transaction. The only
   // case worth flagging is a completely empty wallet.
   if (ethBal === 0n) {
-    logger.warn("Wallet holds no ETH — the executor will refuse every submission until it is funded.");
+    logger.warn(`Wallet holds no ${PROFILE.nativeSymbol} — the executor will refuse every submission until it is funded.`);
   }
 
   // PositionTracker/AaveOracle/Evaluator do only reads (multicall, price fetches) —
@@ -916,9 +920,9 @@ async function main(): Promise<void> {
   // Reserve thresholds and bonuses no longer need their own refresh job — the
   // ReserveRegistry owns them and is refreshed below, e-mode included.
 
-  // Arbitrum L1 base fee — read from the ArbGasInfo precompile on an interval so
-  // the L1 data-fee estimate in evaluator.ts tracks real Ethereum L1 congestion
-  // instead of a flat guess. Cheap (one staticcall), off the hot path.
+  // L1 data fee — read from the chain's fee precompile on an interval so the
+  // estimate in evaluator.ts tracks real Ethereum L1 congestion instead of a flat
+  // guess. Cheap (one or two staticcalls), off the hot path.
   setInterval(() => {
     if (!shuttingDown) evaluator.refreshL1BaseFee().catch(() => { /* silent */ });
   }, 20_000);
@@ -1024,7 +1028,9 @@ async function main(): Promise<void> {
   // land publicly; Aave's SVR feeds update inside the auction winner's own
   // transaction, so those positions can only be reached by winning the auction.
   // Off by default, and dry-run (log only) until SVR_DRY_RUN=false.
-  if (CONFIG.svrEnabled) {
+  if (CONFIG.svrEnabled && !PROFILE.svrSupported) {
+    logger.warn(`SVR_ENABLED=true ignored: Chainlink SVR / Atlas auctions are only wired up for Arbitrum, not ${PROFILE.name}.`);
+  } else if (CONFIG.svrEnabled) {
     svr = new SvrBidder({
       trigger,
       wallet,

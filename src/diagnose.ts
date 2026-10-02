@@ -20,7 +20,7 @@ import {
   CONFIG, AAVE_POOL, AAVE_POOL_ABI, RESERVES,
   UI_POOL_DATA_PROVIDER, UI_POOL_DATA_PROVIDER_ABI,
   POOL_ADDRESSES_PROVIDER, MULTICALL3, MULTICALL3_ABI,
-  AAVE_ORACLE, ORACLE_ABI,
+  AAVE_ORACLE, ORACLE_ABI, PROFILE,
 } from "./config";
 import { PositionTracker } from "./positions";
 import { ReserveRegistry } from "./reserveState";
@@ -86,7 +86,7 @@ async function runBasicScan(): Promise<void> {
   console.log(`${B}${C}   Aave V3 Liquidation Bot — Diagnostic          ${RST}`);
   console.log(`${B}${C}════════════════════════════════════════════════${RST}\n`);
 
-  const httpProvider = new ethers.JsonRpcProvider(CONFIG.rpcUrl, { chainId: 42161, name: "arbitrum" });
+  const httpProvider = new ethers.JsonRpcProvider(CONFIG.rpcUrl, { chainId: PROFILE.chainId, name: PROFILE.key });
   const block    = await httpProvider.getBlockNumber();
   const feeData  = await httpProvider.getFeeData();
   const gweiNow  = Number(feeData.gasPrice ?? 0n) / 1e9;
@@ -103,7 +103,7 @@ async function runBasicScan(): Promise<void> {
   const oracle    = new AaveOracle(getProvider);
   const evaluator = new Evaluator(oracle, getProvider, reserveRegistry);
   const ethPrice  = await evaluator.getEthPrice();
-  console.log(`ETH price: $${ethPrice.toFixed(2)}\n`);
+  console.log(`${PROFILE.nativeSymbol} price: $${ethPrice.toFixed(2)}\n`);
 
   const tracker = new PositionTracker(getProvider, reserveRegistry);
   console.log("Seeding from Aave subgraph…");
@@ -159,7 +159,7 @@ async function runBasicScan(): Promise<void> {
   }
 
   console.log("─".repeat(70));
-  console.log(`\n${B}Liquidation bonuses by asset (on Arbitrum V3):${RST}`);
+  console.log(`\n${B}Liquidation bonuses by asset (on ${PROFILE.name} V3):${RST}`);
   for (const [sym, r] of Object.entries(RESERVES)) {
     const bonus = ((r.liquidationBonus - 10000) / 100).toFixed(1);
     console.log(`  ${sym.padEnd(8)} ${bonus}% bonus  (threshold=${r.liquidationThreshold / 100}%)`);
@@ -180,7 +180,7 @@ async function runDeepAnalysis(): Promise<void> {
   console.log(`${B}${C}   Aave V3 Liquidation Bot — Deep Diagnostic      ${RST}`);
   console.log(`${B}${C}════════════════════════════════════════════════${RST}\n`);
 
-  const provider = new ethers.JsonRpcProvider(CONFIG.rpcUrl, { chainId: 42161, name: "arbitrum" });
+  const provider = new ethers.JsonRpcProvider(CONFIG.rpcUrl, { chainId: PROFILE.chainId, name: PROFILE.key });
   const block = await provider.getBlockNumber();
   console.log(`${B}Connected${RST} | block=${block}\n`);
 
@@ -208,7 +208,7 @@ async function runDeepAnalysis(): Promise<void> {
   const allPrices   = await oracle.prefetchAllPrices();
   const ethPriceUsd = await evaluator.getEthPrice();
 
-  console.log(`Gas: ${gweiNow.toFixed(4)} gwei | ETH: $${ethPriceUsd.toFixed(2)}\n`);
+  console.log(`Gas: ${gweiNow.toFixed(4)} gwei | ${PROFILE.nativeSymbol}: $${ethPriceUsd.toFixed(2)}\n`);
   console.log("─".repeat(80));
 
   const HF_EVAL_THRESHOLD = 990n * 10n ** 15n;
@@ -427,7 +427,7 @@ async function runExcelOutput(): Promise<void> {
 
   const provider = new ethers.JsonRpcProvider(CONFIG.rpcUrl, undefined, { staticNetwork: true });
   const block    = await provider.getBlockNumber();
-  console.log(`Connected to Arbitrum | block=${block}`);
+  console.log(`Connected to ${PROFILE.name} | block=${block}`);
 
   // Load caches
   const activeCache = loadJSON<CacheFile>(CACHE_FILE);
@@ -567,7 +567,7 @@ async function runExcelOutput(): Promise<void> {
   function addHyperlink(cell: any, addr: string): void {
     cell.value = {
       text: addr,
-      hyperlink: `https://arbiscan.io/address/${addr}`,
+      hyperlink: `${PROFILE.explorer}/address/${addr}`,
     };
     cell.font = { color: { argb: "FF0563C1" }, underline: true, size: 9, name: "Arial" };
   }
@@ -678,7 +678,7 @@ async function runExcelOutput(): Promise<void> {
 
     // Title block
     const title = ws.getCell("A1");
-    title.value = "Aave V3 Arbitrum — Bot Diagnostic Report";
+    title.value = `Aave V3 ${PROFILE.name} — Bot Diagnostic Report`;
     title.font  = { bold: true, size: 16, name: "Arial", color: { argb: COLORS.headerBg } };
     ws.mergeCells("A1:F1");
 

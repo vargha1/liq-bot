@@ -1,4 +1,4 @@
-# Aave V3 Liquidation Bot — Arbitrum One
+# Aave V3 Liquidation Bot — Arbitrum One and Base
 
 ## How it works
 
@@ -47,9 +47,13 @@ Example: borrower has $10,000 WETH collateral and $8,500 USDC debt.
 ### 1. Deploy `LiquidatorContract.sol`
 
 ```bash
-# Deploy to Arbitrum One — deployer becomes owner
-# Contract self-funds via flash loans — no capital needed in contract
+# Deployer becomes owner. The contract self-funds via flash loans — no capital needed in it.
+# Constructor: (Uniswap SwapRouter02, Aave V3 Pool) — the deploy script passes the right pair.
+CHAIN=arbitrum npm run deploy-liquidator -- --yes
 ```
+
+A contract deployed before the Pool became a constructor argument is Arbitrum-only and
+keeps working unchanged; Base needs a fresh deployment.
 
 ### 2. Configure
 
@@ -141,6 +145,48 @@ npm run svr -- bond 0.0003 --yes   # bond ETH with Atlas
 Expect competition: the two bids in the auction that prompted this work were within 3%
 of each other and near break-even. Winning comes from a better profit estimate and a
 cheaper route, not from speed. Tune `SVR_BID_FRACTION` from the dry-run log.
+
+## Running on Base
+
+The same bot serves Aave V3 on Base. A process serves one chain, chosen with `CHAIN`
+(`arbitrum` by default, or `base`); everything chain-specific lives in
+[src/chains.ts](src/chains.ts). Run both with two processes and two env files:
+
+```
+DOTENV_CONFIG_PATH=.env.base CHAIN=base npm start
+```
+
+Caches (`*.base.json`), logs (`*.base.log`) and the log-control port (3100) are kept
+per chain automatically.
+
+Setup for Base:
+
+1. `RPC_URL` / `RPC_WS` for Base (an archive-capable plan lets the first run scan history;
+   otherwise set `THEGRAPH_API_KEY`).
+2. Deploy the contract for Base: `CHAIN=base npm run deploy-liquidator` is a dry run that
+   prints the cost; add `-- --yes` to broadcast. It passes Base's Aave Pool and Uniswap
+   SwapRouter02, and verifies the deployment. Put the address in `CONTRACT_ADDRESS`.
+3. Fund the wallet with a little ETH on Base (a liquidation costs well under a cent).
+4. Before going live, `CHAIN=base npm run simulate-liquidation` runs the real flow
+   (flashloan, liquidationCall, swap, repay) against live Base state with nothing
+   deployed or sent, and `CHAIN=base npx tsx src/checkModel.ts <rpc> <borrower>` should
+   report `EXACT`.
+
+How Base differs, and what the bot does about it:
+
+| | Arbitrum | Base |
+|---|---|---|
+| Ordering | first come, first served | by priority tip, so `TIMEBOOST_PRIORITY_GWEI` matters |
+| L1 data fee | ArbGasInfo | OP-stack GasPriceOracle (tiny since blobs) |
+| Block time | 250 ms | 2 s (all block-count windows are converted from time) |
+| Chainlink SVR / sequencer feed | supported | not available, so ignored with a warning |
+| Price feeds | Chainlink + CAPO | Chainlink + CAPO (6 aggregators), resolved the same way |
+
+Measured on Base: the in-memory health-factor model matched Aave to 0.0001 bps, and every
+liquidation pair that matters (WETH, cbBTC, USDC, cbETH, wstETH, weETH, EURC, GHO, AAVE)
+has a Uniswap V3 route within 3% of oracle value at $5k. Base-specific limits: the liquid
+staking tokens are thin above roughly $50k and LBTC has no usable pool, so those large or
+exotic positions can be skipped; Aerodrome is not routed through.
 
 ## Withdrawing profits
 

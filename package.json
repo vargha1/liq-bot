@@ -10,6 +10,8 @@
     "check-feeds": "tsx src/checkFeeds.ts",
     "check-feed": "tsx src/checkSequencerFeed.ts",
     "svr": "tsx src/svrTool.ts",
+    "deploy-liquidator": "tsx src/deployLiquidator.ts",
+    "simulate-liquidation": "tsx src/simulateLiquidation.ts",
     "svr-selftest": "tsx src/svrSelftest.ts",
     "svr-plumbing": "tsx src/svrPlumbingCheck.ts",
     "sizing-check": "tsx src/sizingCheck.ts",

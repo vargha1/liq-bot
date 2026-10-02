@@ -19,7 +19,7 @@
 // trigger still sees disagreement, the difference is prices, not maths.
 import { ethers } from "ethers";
 import { AAVE_POOL, AAVE_POOL_ABI, UI_POOL_DATA_PROVIDER, UI_POOL_DATA_PROVIDER_ABI,
-         POOL_ADDRESSES_PROVIDER, AAVE_ORACLE, ORACLE_ABI } from "./config";
+         POOL_ADDRESSES_PROVIDER, AAVE_ORACLE, ORACLE_ABI, PROFILE } from "./config";
 import { ReserveRegistry } from "./reserveState";
 import { PositionTracker, type UserReserveSnapshot } from "./positions";
 
@@ -31,7 +31,7 @@ async function main() {
     process.exit(1);
   }
 
-  const provider = new ethers.JsonRpcProvider(rpcUrl, 42161, { staticNetwork: true });
+  const provider = new ethers.JsonRpcProvider(rpcUrl, PROFILE.chainId, { staticNetwork: true });
   const registry = new ReserveRegistry(() => provider);
   await registry.refreshAll();
 

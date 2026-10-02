@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { CONFIG, RESERVES } from "./config";
+import { CONFIG, RESERVES, PROFILE } from "./config";
 import type { ReserveRegistry } from "./reserveState";
 import { AaveOracle } from "./oracle";
 import {
@@ -27,8 +27,8 @@ const CAP_SHAVE_BPS        = 1n;   // ask for 0.01% less than the 50% cap
 
 function ceilDiv(a: bigint, b: bigint): bigint { return (a + b - 1n) / b; }
 
-// Bug #3 fix, refined: Arbitrum L1 data fee estimate.
-// On Arbitrum, transactions have an L1 data fee (calldata posting cost) that is NOT
+// Bug #3 fix, refined: L1 data fee estimate (Arbitrum and OP-stack chains such as Base).
+// On these L2s, transactions have an L1 data fee (calldata posting cost) that is NOT
 // included in gasPrice * gasUsed. This fee scales with (a) actual calldata bytes and
 // (b) the current L1 base fee, which can swing 5-10x with Ethereum L1 congestion. A
 // single flat constant applied to every tx — same-asset or 3-hop swap, calm L1 or
@@ -36,11 +36,16 @@ function ceilDiv(a: bigint, b: bigint): bigint { return (a + b - 1n) / b; }
 // expensive ones (submitting trades that lose money after the real fee lands). At
 // MIN_PROFIT_USD as low as $0.07, that mispricing is the whole decision.
 //
-// Fix: read the real L1 base fee from the ArbGasInfo precompile (cached, refreshed
+// Fix: read the real L1 price from the chain's own precompile (cached, refreshed
 // off the hot path — see Evaluator.refreshL1BaseFee) and scale by the ACTUAL
 // calldata size for the liquidate() call being priced.
+//   Arbitrum : ArbGasInfo.getL1BaseFeeEstimate()
+//   OP stack : GasPriceOracle.getL1FeeUpperBound(size), sampled at two sizes to get
+//              the per-byte slope (the Fjord fee is linear in transaction size)
 const ARB_GAS_INFO_ADDRESS = "0x000000000000000000000000000000000000006C";
 const ARB_GAS_INFO_ABI = ["function getL1BaseFeeEstimate() external view returns (uint256)"];
+const OP_GAS_ORACLE_ADDRESS = "0x420000000000000000000000000000000000000F";
+const OP_GAS_ORACLE_ABI = ["function getL1FeeUpperBound(uint256 unsignedTxSize) external view returns (uint256)"];
 // Standard Ethereum calldata cost: 16 gas per byte. Arbitrum's L1 pricer applies a
 // compression discount in practice, so this flat per-byte rate is conservative
 // (slightly overestimates fee) rather than risking underestimation.
@@ -48,14 +53,16 @@ const L1_CALLDATA_GAS_PER_BYTE = 16n;
 // Buffer on top of the raw base-fee*bytes estimate for the L1 pricer's dynamic
 // backlog adjustment (can push effective cost above the raw base fee briefly).
 const L1_FEE_SAFETY_MARGIN_BPS = 11_500n; // +15%
-const L1_BASE_FEE_FALLBACK_WEI = 500_000_000n; // ~0.5 gwei — used until first refresh succeeds
+// Used until the first refresh succeeds. The OP-stack figure is the "equivalent base
+// fee" described at refreshL1BaseFee, sized from a live Base reading (~0.43M).
+const L1_BASE_FEE_FALLBACK_WEI = PROFILE.l1Fee.kind === "arbitrum" ? 500_000_000n : 600_000n;
 const L1_BASE_FEE_REFRESH_MS   = 20_000;
 
 // Calldata bytes for liquidate(address,address,address,uint256,bytes,uint256,uint256):
 // 4-byte selector + 6 fixed 32-byte words (3 addr + debtToCover + bytes-offset +
 // amountOutMinimum... deadline is a 7th word) + the dynamic `bytes swapPath` encoding
 // (32-byte length word + path data padded to a 32-byte boundary).
-const LIQUIDATE_FIXED_CALLDATA_BYTES = 4 + 7 * 32; // 228
+const LIQUIDATE_FIXED_CALLDATA_BYTES = 4 + 7 * 32 + PROFILE.l1Fee.overheadBytes; // 228 + signature/nonce/gas fields on OP stack
 function estimateCalldataBytes(swapPathBytes: number): number {
   const pathWords = Math.ceil(swapPathBytes / 32);
   return LIQUIDATE_FIXED_CALLDATA_BYTES + 32 /* length word */ + pathWords * 32;
@@ -100,13 +107,14 @@ const HF_EVAL_THRESHOLD = 9995n * 10n ** 14n; // 0.9995
 // route is cached yet and the output can only be estimated from oracle prices.
 const UNQUOTED_IMPACT_BPS = 10;
 
-const MAX_REASONABLE_GAS_WEI = 2_000_000_000n; // 2 gwei
+const MAX_REASONABLE_GAS_WEI = PROFILE.gas.maxGasWei;
 
-// Arbitrum L2 should be 0.01–0.5 gwei. If gasPrice > cap it's likely an
+// An L2 gas price is 0.01–0.5 gwei. If gasPrice > cap it's likely an
 // L1-equivalent estimate that would make every opportunity look unprofitable.
 export function sanitizeGasPrice(gasPrice: bigint): bigint {
   if (gasPrice > MAX_REASONABLE_GAS_WEI) {
-    logger.warn(`  eval gasPrice=${Number(gasPrice)/1e9}gwei seems high for Arbitrum — capping at 2 gwei`);
+    const cap = Number(MAX_REASONABLE_GAS_WEI) / 1e9;
+    logger.warn(`  eval gasPrice=${Number(gasPrice)/1e9}gwei seems high for ${PROFILE.name} — capping at ${cap} gwei`);
     return MAX_REASONABLE_GAS_WEI;
   }
   return gasPrice;
@@ -338,8 +346,8 @@ export class Evaluator {
   private minProfitFn: () => number = () => CONFIG.minProfitUsd;
   setMinProfitSource(fn: () => number): void { this.minProfitFn = fn; }
 
-  // Cached Arbitrum L1 base fee (wei) — see l1FeeUsdFor(). Refreshed off the
-  // hot path; a hot-path caller always reads the last cached value synchronously.
+  // Cached L1 base fee (wei) — see l1FeeUsdFor(). Refreshed off the hot path; a
+  // hot-path caller always reads the last cached value synchronously.
   private _l1BaseFeeWei     = L1_BASE_FEE_FALLBACK_WEI;
   private _lastL1FeeRefreshTs = 0;
 
@@ -349,17 +357,35 @@ export class Evaluator {
     private registry:     ReserveRegistry,
   ) {}
 
-  // Refresh the cached L1 base fee from the ArbGasInfo precompile. Throttled;
+  // Refresh the cached L1 base fee from the chain's fee precompile. Throttled;
   // call on an interval (see index.ts) — never from the hot path. Falls back
   // silently to the last known value (or the flat fallback) on any RPC failure.
+  //
+  // On OP-stack chains there is no "L1 base fee" that l1FeeUsdFor's formula
+  // (bytes x 16 x fee x margin) could use directly, so the per-byte price is read
+  // from the oracle and converted into the EQUIVALENT base fee: the value that
+  // makes that formula return exactly bytes x perByteWei. The oracle figure is
+  // already an upper bound, so the formula's own safety margin is divided back out.
   async refreshL1BaseFee(): Promise<void> {
     const now = Date.now();
     if (now - this._lastL1FeeRefreshTs < L1_BASE_FEE_REFRESH_MS) return;
     this._lastL1FeeRefreshTs = now;
     try {
-      const gasInfo = new ethers.Contract(ARB_GAS_INFO_ADDRESS, ARB_GAS_INFO_ABI, this._getProvider());
-      const fee: bigint = await gasInfo.getL1BaseFeeEstimate();
-      if (fee > 0n) this._l1BaseFeeWei = fee;
+      if (PROFILE.l1Fee.kind === "arbitrum") {
+        const gasInfo = new ethers.Contract(ARB_GAS_INFO_ADDRESS, ARB_GAS_INFO_ABI, this._getProvider());
+        const fee: bigint = await gasInfo.getL1BaseFeeEstimate();
+        if (fee > 0n) this._l1BaseFeeWei = fee;
+      } else {
+        const oracle = new ethers.Contract(OP_GAS_ORACLE_ADDRESS, OP_GAS_ORACLE_ABI, this._getProvider());
+        const [small, large] = await Promise.all([
+          oracle.getL1FeeUpperBound(1000n) as Promise<bigint>,
+          oracle.getL1FeeUpperBound(2000n) as Promise<bigint>,
+        ]);
+        const perByteWei = large > small ? (large - small) / 1000n : 0n;
+        if (perByteWei > 0n) {
+          this._l1BaseFeeWei = (perByteWei * 10_000n) / (L1_CALLDATA_GAS_PER_BYTE * L1_FEE_SAFETY_MARGIN_BPS);
+        }
+      }
     } catch (e: any) {
       logger.debug(`refreshL1BaseFee failed, keeping cached value: ${e?.message ?? e}`);
     }
@@ -656,7 +682,8 @@ export class Evaluator {
   async getEthPrice(): Promise<number> {
     // Always return cached value if available — avoids RPC call on dead provider
     if (this._ethPrice && Date.now() - this._ethPriceTs < 30_000) return this._ethPrice;
-    const WETH = RESERVES.WETH!.address;
+    // The native gas token is priced through the chain's WETH reserve.
+    const WETH = PROFILE.routing.weth;
     try {
       const p    = await this.oracle.getPrice(WETH);
       this._ethPrice   = Number(p) / 1e8;

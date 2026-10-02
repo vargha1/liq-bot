@@ -10,7 +10,7 @@
  */
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { RESERVES, MULTICALL3, MULTICALL3_ABI, UNISWAP_ROUTER, UNISWAP_QUOTER } from "./config";
+import { RESERVES, MULTICALL3, MULTICALL3_ABI, UNISWAP_ROUTER, UNISWAP_QUOTER, PROFILE } from "./config";
 
 // Single source of truth lives in config.ts; re-exported for existing importers.
 export { UNISWAP_ROUTER, UNISWAP_QUOTER };
@@ -58,21 +58,12 @@ function getMulticall(provider: ethers.Provider): ethers.Contract {
 const FEE_TIERS = [100, 500, 3000, 10000] as const;
 type FeeTier = typeof FEE_TIERS[number];
 
-// Intermediate routing tokens (deepest liquidity on Arbitrum)
-const WETH  = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
-const USDC  = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
-const USDCe = "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8";
+// Intermediate routing tokens (deepest liquidity on the selected chain) and the set
+// of stablecoins, both from the chain profile.
+const WETH  = PROFILE.routing.weth;
+const USDC  = PROFILE.routing.usdc;
 
-const STABLES = new Set([
-  USDC.toLowerCase(), USDCe.toLowerCase(),
-  "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9", // USDT
-  "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1", // DAI
-  "0x93b346b6bc2548da6a1e7d98e9a421b42541425b", // LUSD
-  "0x17fc002b466eec40dae837fc4be5c67993ddbd6f", // FRAX
-  "0x7dff72693f6a4149b17e7c6314655f6a9f7c8b33", // GHO
-  "0xd22a58f79e9481d1a88e00c343885a588b34b68b", // EURS
-  "0x3f56e0c36d275367b8c502090edf38289b3dea0d", // MAI
-]);
+const STABLES = new Set(PROFILE.routing.stables);
 
 // Encode a Uniswap V3 multi-hop path.
 // Format: tokenA (20 bytes) ++ fee (3 bytes) ++ tokenB (20 bytes) [++ fee ++ tokenC ...]
@@ -91,8 +82,6 @@ function symOf(addr: string): string {
   )?.symbol ?? addr.slice(0, 8);
 }
 
-const WBTC = "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f";
-
 // Bridge tokens and the fee tiers worth trying on each leg that touches them.
 // The old candidate list guessed ONE fee per leg (3000 for volatile, 500 for
 // stables), which missed the deepest pool whenever it was a different tier: a live
@@ -101,16 +90,11 @@ const WBTC = "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f";
 // same way. WETH→GHO had no candidate at all (the 3-hop builder started the path
 // with WETH twice). Every tier pair per hub is cheap now that the whole list goes
 // out as batched eth_calls; 10000 is only worth quoting on direct pools.
-const HUBS: Array<{ token: string; fees: readonly FeeTier[] }> = [
-  { token: WETH,  fees: [100, 500, 3000] },
-  { token: USDC,  fees: [100, 500] },
-  { token: USDCe, fees: [100, 500] },
-  { token: WBTC,  fees: [100, 500] },
-];
+const HUBS = PROFILE.routing.hubs as Array<{ token: string; fees: readonly FeeTier[] }>;
 
 // Two-hub bridges for tokens whose only pools face a stable (GHO and friends:
-// X→WETH→USDC→GHO). Fees on the legs that exist on Arbitrum in practice.
-const TWO_HUB: Array<[string, string]> = [[WETH, USDC], [WETH, USDCe], [USDC, WETH]];
+// X→WETH→USDC→GHO). Fees on the legs that exist on the chain in practice.
+const TWO_HUB = PROFILE.routing.twoHub;
 
 // Build candidate paths to try. Order does not matter — every path is quoted and
 // the best output wins.
@@ -141,7 +125,7 @@ function candidatePaths(tokenIn: string, tokenOut: string): Array<{ tokens: stri
   // 3. Two bridge tokens — only when a stablecoin is on one side, the case this
   // exists for. Skipping it elsewhere halves the number of quotes per refresh.
   if (STABLES.has(inL) || STABLES.has(outL)) for (const [a, b] of TWO_HUB) {
-    for (const f1 of [100, 500, 3000] as const) for (const f3 of [100, 500] as const) {
+    for (const f1 of [100, 500, 3000] as const) for (const f3 of PROFILE.routing.twoHubTailFees as readonly FeeTier[]) {
       add([tokenIn, a, b, tokenOut], [f1, 500, f3]);
     }
   }
@@ -203,8 +187,8 @@ function pairKey(tokenIn: string, tokenOut: string): string {
 }
 
 // Deterministic fallback route used when no quoted route is cached.
-// Mirrors the liquidity layout on Arbitrum: stables cluster around USDC 0.05%,
-// volatile assets route through WETH 0.3%.
+// Mirrors the liquidity layout on Arbitrum and Base: stables cluster around USDC
+// 0.05%, volatile assets route through WETH 0.3%.
 function heuristicCandidate(tokenIn: string, tokenOut: string): { tokens: string[]; fees: FeeTier[] } {
   const inL  = tokenIn.toLowerCase();
   const outL = tokenOut.toLowerCase();
@@ -216,7 +200,8 @@ function heuristicCandidate(tokenIn: string, tokenOut: string): { tokens: string
     return { tokens: [tokenIn, tokenOut], fees: [stableSide ? 500 : 3000] };
   }
   if (inIsStable && outIsStable) {
-    if (inL === USDC.toLowerCase()) return { tokens: [tokenIn, tokenOut], fees: [500] };
+    // Direct when USDC is either end: routing X→USDC→USDC would name the same token twice.
+    if (inL === USDC.toLowerCase() || outL === USDC.toLowerCase()) return { tokens: [tokenIn, tokenOut], fees: [500] };
     return { tokens: [tokenIn, USDC, tokenOut], fees: [500, 500] };
   }
   if (inIsStable && !outIsStable) return { tokens: [tokenIn, WETH, tokenOut], fees: [500, 3000] };
@@ -434,8 +419,8 @@ export async function uniswapSwap(
 // pair therefore ran on the least reliable data available. Quoting the common
 // pairs once at startup, paced so it never competes with the hot path, means
 // that first fire already has a verified route and a real quote.
-const WARM_COLLATERALS = ["WETH", "wstETH", "WBTC", "weETH", "ARB", "LINK", "rETH", "tBTC", "AAVE", "USDC", "USDT", "DAI", "USDC.e"];
-const WARM_DEBTS       = ["USDC", "USDT", "DAI", "WETH", "USDC.e", "WBTC", "GHO"];
+const WARM_COLLATERALS = PROFILE.routing.warmCollaterals;
+const WARM_DEBTS       = PROFILE.routing.warmDebts;
 
 export async function warmRouteCache(
   provider: ethers.Provider,

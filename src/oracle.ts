@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { AAVE_ORACLE, ORACLE_ABI, MULTICALL3, MULTICALL3_ABI, RESERVES } from "./config";
+import { AAVE_ORACLE, ORACLE_ABI, MULTICALL3, MULTICALL3_ABI, RESERVES, PROFILE } from "./config";
 
 const CACHE_TTL = 15_000;
 
@@ -71,9 +71,20 @@ function markDeadFeed(addr: string): void {
 }
 
 const ORACLE_IFACE = new ethers.Interface(ORACLE_ABI);
-// Arbitrum precompile; arbBlockNumber() is the L2 block number.
-const ARB_SYS       = "0x0000000000000000000000000000000000000064";
-const ARBSYS_IFACE  = new ethers.Interface(["function arbBlockNumber() view returns (uint256)"]);
+// Where an L2 block number can be read inside a Multicall3 batch. Arbitrum's
+// block.number is the L1 number, so it needs the ArbSys precompile; on chains whose
+// block.number is the L2 number (Base) Multicall3's own getBlockNumber() is right.
+const BLOCK_CALL = PROFILE.blockNumberSource === "arbsys"
+  ? {
+      target: "0x0000000000000000000000000000000000000064",
+      iface:  new ethers.Interface(["function arbBlockNumber() view returns (uint256)"]),
+      fn:     "arbBlockNumber",
+    }
+  : {
+      target: MULTICALL3,
+      iface:  new ethers.Interface(["function getBlockNumber() view returns (uint256)"]),
+      fn:     "getBlockNumber",
+    };
 
 function isTransportGone(err: any): boolean {
   return err?.code === "RPC_BACKPRESSURE"
@@ -122,10 +133,10 @@ export class AaveOracle {
   // getAssetsPrices reverted the WHOLE batch, which forced a per-asset fan-out
   // on every failure. Failed / zero prices come back as 0n.
   //
-  // `block` is the L2 block the read executed at, taken from ArbSys inside the
-  // same call. Multicall3's own block number is NOT usable here: on Arbitrum
-  // block.number is the L1 number (~26M against an L2 head of ~510M), which would
-  // make every read look ancient next to an event's block.
+  // `block` is the L2 block the read executed at, taken inside the same call
+  // (see BLOCK_CALL). On Arbitrum Multicall3's own block number is NOT usable:
+  // block.number there is the L1 number (~26M against an L2 head of ~510M), which
+  // would make every read look ancient next to an event's block.
   private async fetchMany(
     addrs: string[], hot: boolean, blockTag?: number,
   ): Promise<{ block: number | undefined; prices: Map<string, bigint> }> {
@@ -134,7 +145,7 @@ export class AaveOracle {
       target:   AAVE_ORACLE,
       callData: ORACLE_IFACE.encodeFunctionData("getAssetPrice", [a]),
     }));
-    calls.push({ target: ARB_SYS, callData: ARBSYS_IFACE.encodeFunctionData("arbBlockNumber") });
+    calls.push({ target: BLOCK_CALL.target, callData: BLOCK_CALL.iface.encodeFunctionData(BLOCK_CALL.fn) });
     const results: Array<{ success: boolean; returnData: string }> = blockTag !== undefined
       ? await mc.tryAggregate!.staticCall(false, calls, { blockTag })
       : await mc.tryAggregate!.staticCall(false, calls);
@@ -142,7 +153,7 @@ export class AaveOracle {
     let block: number | undefined = blockTag;
     const last = results[addrs.length];
     if (last?.success && last.returnData !== "0x") {
-      try { block = Number(ARBSYS_IFACE.decodeFunctionResult("arbBlockNumber", last.returnData)[0] as bigint); }
+      try { block = Number(BLOCK_CALL.iface.decodeFunctionResult(BLOCK_CALL.fn, last.returnData)[0] as bigint); }
       catch { /* keep blockTag / undefined */ }
     }
     const prices = new Map<string, bigint>();

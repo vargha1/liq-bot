@@ -19,6 +19,8 @@ function num(k: string, d: string): number {
   return v;
 }
 
+import { PROFILE, type ReserveConfig } from "./chains";
+
 export const CONFIG = {
   rpcUrl:            req("RPC_URL"),
   privateKey:        req("PRIVATE_KEY"),
@@ -170,15 +172,18 @@ export const CONFIG = {
   // removes the forwarding hop your general-purpose RPC provider adds, which is
   // pure latency on the one path where latency decides whether you win.
   broadcastToSequencer: opt("BROADCAST_TO_SEQUENCER", "true") !== "false",
-  // Priority tip in gwei.
+  // Priority tip in gwei. The default comes from the chain profile.
   //
-  // CORRECTION: this does NOT buy earlier ordering. Arbitrum's sequencer is
+  // Base: the sequencer orders by priority fee, so the tip DOES buy position — raise
+  // it if you keep arriving second to the same competitor.
+  //
+  // Arbitrum — CORRECTION: this does NOT buy earlier ordering. Its sequencer is
   // strictly first-come-first-served by arrival time; priority fees do not
   // reorder transactions (see the note in executor.ts, which had this right
   // while this comment did not). Ordering is decided by arrival time and, above
   // that, by Timeboost's express lane — which is auctioned, not tipped for.
   // The tip is kept because it is harmless and costs almost nothing on L2.
-  timeboostPriorityGwei: num("TIMEBOOST_PRIORITY_GWEI", "0.1"),
+  timeboostPriorityGwei: num("TIMEBOOST_PRIORITY_GWEI", String(PROFILE.gas.tipGwei)),
   // OPT 3: Max concurrent liquidation executions in the parallel queue.
   maxConcurrentExecutions: int("MAX_CONCURRENT_EXECUTIONS", "3"),
   // OPT 4 (retired): hot-path Uniswap quotes were removed — amountOutMinimum is
@@ -213,7 +218,7 @@ export const CONFIG = {
   // decode that silently stops matching costs you the head start, not
   // correctness. Turn it on once you have watched the logs confirm it matching.
   sequencerFeedEnabled: opt("SEQUENCER_FEED_ENABLED", "false") === "true",
-  sequencerFeedUrl:     opt("SEQUENCER_FEED_URL", "wss://arb1.arbitrum.io/feed"),
+  sequencerFeedUrl:     opt("SEQUENCER_FEED_URL", PROFILE.sequencerFeedUrl),
   // FALLBACK ONLY, used until the bot has measured its own model error.
   //
   // This was the sole basis for the fire/confirm decision: fire blind below it,
@@ -336,36 +341,26 @@ export const CONFIG = {
   svrVerifyTolerance: num("SVR_VERIFY_TOLERANCE", "0.005"),
 };
 
-// ─── Aave V3 Arbitrum core addresses ─────────────────────────────────────────
-// All addresses are EIP-55 checksummed. ethers v6 validates checksums on every
-// contract call — a wrong-case address throws INVALID_ARGUMENT before any RPC
-// call is made, causing silent fallback to the slower path for every breakdown.
-//
-// Sources (verified Feb 2026):
-//   Pool, DataProvider, Oracle, PoolAddressesProvider:
-//     https://aave.com/docs/resources/addresses (Arbitrum V3 Core Market)
-//   UiPoolDataProvider:
-//     https://arbiscan.io/address/0x13c833256BD767da2320d727a3691BAff3770E39
-//   Multicall3: canonical address, same on all EVM chains
-export const AAVE_POOL           = "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
-export const AAVE_DATA_PROVIDER  = "0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654";
-export const AAVE_ORACLE         = "0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7";
-export const POOL_ADDRESSES_PROVIDER = "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb";
-
-// FIXED: previous address (0x145dE30c...) had an incorrect EIP-55 checksum,
-// causing ethers v6 to throw INVALID_ARGUMENT on every getUserReservesData call
-// and silently fall back to the full per-reserve scan (20× slower).
-// Updated to the correct deployed address verified on Arbiscan.
-export const UI_POOL_DATA_PROVIDER = "0x13c833256BD767da2320d727a3691BAff3770E39";
-
-// FIX 4.1/4.5 — Multicall3 canonical address (same on all EVM chains)
-export const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
+// ─── Chain-specific addresses ────────────────────────────────────────────────
+// Everything below comes from the selected chain profile (see chains.ts). The
+// exported names are unchanged so existing importers keep working.
+export { PROFILE };
+export type { ReserveConfig };
+export const AAVE_POOL               = PROFILE.aave.pool;
+export const AAVE_DATA_PROVIDER      = PROFILE.aave.dataProvider;
+export const AAVE_ORACLE             = PROFILE.aave.oracle;
+export const POOL_ADDRESSES_PROVIDER = PROFILE.aave.addressesProvider;
+export const UI_POOL_DATA_PROVIDER   = PROFILE.aave.uiPoolDataProvider;
+export const AAVE_DEPLOY_BLOCK       = PROFILE.aave.deployBlock;
+// Multicall3 is deployed at the same canonical address on every EVM chain.
+export const MULTICALL3              = PROFILE.multicall3;
 
 // ─── Subgraph ─────────────────────────────────────────────────────────────────
 function buildSubgraphUrl(): string {
   const key = CONFIG.thegraphApiKey;
-  if (!key) return "";
-  return `https://gateway.thegraph.com/api/${key}/subgraphs/id/4xyasjQeREe7PxnF6wVdobZvCw5mhoHZq3T7guRpuNPf`;
+  const id  = opt("AAVE_SUBGRAPH_ID", PROFILE.aave.subgraphId);
+  if (!key || !id) return "";
+  return `https://gateway.thegraph.com/api/${key}/subgraphs/id/${id}`;
 }
 export const AAVE_SUBGRAPH_URL = buildSubgraphUrl();
 
@@ -378,7 +373,9 @@ import { getAddress } from "ethers";
 const CONTRACT_ADDRESSES: Record<string, string> = {
   AAVE_POOL, AAVE_DATA_PROVIDER, AAVE_ORACLE,
   POOL_ADDRESSES_PROVIDER, UI_POOL_DATA_PROVIDER, MULTICALL3,
+  UNISWAP_ROUTER: PROFILE.uniswap.router, UNISWAP_QUOTER: PROFILE.uniswap.quoter,
 };
+for (const r of Object.values(PROFILE.reserves)) CONTRACT_ADDRESSES[`reserve ${r.symbol}`] = r.address;
 for (const [name, addr] of Object.entries(CONTRACT_ADDRESSES)) {
   try {
     if (getAddress(addr) !== addr) {
@@ -391,146 +388,22 @@ for (const [name, addr] of Object.entries(CONTRACT_ADDRESSES)) {
   }
 }
 
-// Uniswap V3 on Arbitrum
-// Arbitrum One's public sequencer RPC. Accepts eth_sendRawTransaction directly,
-// so a liquidation reaches the sequencer without the extra hop through a
-// general-purpose provider. Broadcast-only — never used for reads.
-export const ARBITRUM_SEQUENCER_RPC = "https://arb1-sequencer.arbitrum.io/rpc";
-
-export const UNISWAP_ROUTER = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"; // SwapRouter02
-export const UNISWAP_QUOTER = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"; // QuoterV2
-export const CHAIN_ID       = 42161;
+// Direct-broadcast sequencer endpoint (broadcast-only, never used for reads).
+export const SEQUENCER_RPC  = PROFILE.sequencerRpc;
+export const UNISWAP_ROUTER = PROFILE.uniswap.router;
+export const UNISWAP_QUOTER = PROFILE.uniswap.quoter;
+export const CHAIN_ID       = PROFILE.chainId;
 
 // ─── Reserve configs ──────────────────────────────────────────────────────────
 // liquidationBonus: 10000 = 0%, 10500 = 5%, 10750 = 7.5%, 11000 = 10%, 11500 = 15%
-// All addresses verified on Arbiscan.
-export interface ReserveConfig {
-  symbol:               string;
-  address:              string;
-  decimals:             number;
-  liquidationBonus:     number;
-  liquidationThreshold: number;
-}
-
-// liquidationBonus / liquidationThreshold below are the BOOTSTRAP values used
-// only as a bootstrap/reference. At runtime the authority is ReserveRegistry,
-// which loads every reserve's real configuration from Pool.getReserveData at
-// startup and refreshes it on an interval — e-mode included, which this static
-// table cannot express. Values here were verified against
-// AaveProtocolDataProvider.getReserveConfigurationData on Arbitrum One.
 //
-// Keep them close to reality even though they are overridden: the local HF
-// recomputation in the trigger engine runs on whatever is available at that
-// instant, and a stale threshold shifts every computed HF. The previous values
-// were off by up to 850 bps (LINK 6650 vs 7500, ARB 7000 vs 6300).
-export const RESERVES: Record<string, ReserveConfig> = {
-  // ── Stablecoins ──────────────────────────────────────────────────────────────
-  USDC: {
-    symbol: "USDC", address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
-    decimals: 6, liquidationBonus: 10500, liquidationThreshold: 7800,
-  },
-  "USDC.e": {
-    symbol: "USDC.e", address: "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
-    decimals: 6, liquidationBonus: 10500, liquidationThreshold: 7800,
-  },
-  USDT: {
-    symbol: "USDT", address: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
-    decimals: 6, liquidationBonus: 10500, liquidationThreshold: 7800,
-  },
-  DAI: {
-    symbol: "DAI", address: "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1",
-    decimals: 18, liquidationBonus: 10500, liquidationThreshold: 7700,
-  },
-  LUSD: {
-    // LT 0 / usageAsCollateral false on-chain — borrowable, but contributes
-    // nothing to a borrower's collateral side.
-    symbol: "LUSD", address: "0x93b346b6BC2548dA6A1E7d98E9a421B42541425b",
-    decimals: 18, liquidationBonus: 10500, liquidationThreshold: 0,
-  },
-  FRAX: {
-    symbol: "FRAX", address: "0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F",
-    decimals: 18, liquidationBonus: 10600, liquidationThreshold: 7200,
-  },
-  // FIX: Added GHO — Aave's native stablecoin, active on Arbitrum V3.
-  // LT 0 / usageAsCollateral false on-chain (borrow-only asset).
-  GHO: {
-    symbol: "GHO", address: "0x7dfF72693f6A4149b17e7C6314655f6A9F7c8B33",
-    decimals: 18, liquidationBonus: 10500, liquidationThreshold: 0,
-  },
-  // ── Major volatile assets ─────────────────────────────────────────────────────
-  WETH: {
-    symbol: "WETH", address: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
-    decimals: 18, liquidationBonus: 10500, liquidationThreshold: 8400,
-  },
-  WBTC: {
-    symbol: "WBTC", address: "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f",
-    decimals: 8,  liquidationBonus: 10700, liquidationThreshold: 7800,
-  },
-  tBTC: {
-    // Threshold Bitcoin — onboarded to Aave v3 Arbitrum Q1 2025 (ARFC 2025-02-27)
-    symbol: "tBTC", address: "0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40",
-    decimals: 18, liquidationBonus: 10750, liquidationThreshold: 7800,
-  },
-  ARB: {
-    symbol: "ARB", address: "0x912CE59144191C1204E64559FE8253a0e49E6548",
-    decimals: 18, liquidationBonus: 11000, liquidationThreshold: 6300,
-  },
-  LINK: {
-    symbol: "LINK", address: "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4",
-    decimals: 18, liquidationBonus: 11000, liquidationThreshold: 7500,
-  },
-  AAVE: {
-    symbol: "AAVE", address: "0xba5DdD1f9d7F570dc94a51479a000E3BCE967196",
-    decimals: 18, liquidationBonus: 11000, liquidationThreshold: 7300,
-  },
-  // GMX removed — Aave V3 Arbitrum oracle price feed for GMX was deprecated
-  // and now reverts (require(false)). Any call to getAssetPrice or getAssetsPrices
-  // including GMX causes the entire batch to fail. Removed Feb 2026.
-  // ── Liquid staking tokens ─────────────────────────────────────────────────────
-  wstETH: {
-    symbol: "wstETH", address: "0x5979D7b546E38E414F7E9822514be443A4800529",
-    decimals: 18, liquidationBonus: 10720, liquidationThreshold: 7900,
-  },
-  rETH: {
-    symbol: "rETH", address: "0xEC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA8",
-    decimals: 18, liquidationBonus: 10750, liquidationThreshold: 7400,
-  },
-  weETH: {
-    symbol: "weETH", address: "0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe",
-    decimals: 18, liquidationBonus: 10750, liquidationThreshold: 7700,
-  },
-  ezETH: {
-    // LT reduced to 10 bps on-chain — being offboarded. Positions holding it get
-    // essentially no collateral credit, which is exactly what the real HF does.
-    symbol: "ezETH", address: "0x2416092f143378750bb29b79eD961ab195CcEea5",
-    decimals: 18, liquidationBonus: 10750, liquidationThreshold: 10,
-  },
-  rsETH: {
-    // Frozen on-chain, LT 10 bps — same offboarding path as ezETH.
-    symbol: "rsETH", address: "0x4186BFC76E2E237523CBC30FD220FE055156b41F",
-    decimals: 18, liquidationBonus: 10750, liquidationThreshold: 10,
-  },
-  // ── Additional stablecoins / assets active on Aave V3 Arbitrum ───────────────
-  EURS: {
-    // STASIS Euro stablecoin — frozen on-chain but existing positions remain
-    // liquidatable, so it stays in the table.
-    symbol: "EURS", address: "0xD22a58f79e9481D1a88e00c343885A588b34b68B",
-    decimals: 2, liquidationBonus: 10750, liquidationThreshold: 6700,
-  },
-  // MAI: frozen and being wound down (LT 100 bps), but existing MAI DEBT is still
-  // liquidatable. Its oracle feed reverted in Feb 2026 and was removed; it prices
-  // again (checked on-chain Oct 2026). The oracle reads each asset in isolation, so
-  // if it dies again only MAI is blacklisted, not the whole batch.
-  MAI: {
-    symbol: "MAI", address: "0x3F56e0c36d275367b8C502090EDF38289b3dEa0d",
-    decimals: 18, liquidationBonus: 10500, liquidationThreshold: 100,
-  },
-  // USDe was removed — its oracle feed reverts (deprecated).
-  //
-  // Reserves listed on Aave AFTER this table was written need no edit here:
-  // ReserveRegistry.refreshAll() registers every on-chain reserve missing from it
-  // through registerReserve() below.
-};
+// The values in the profile are BOOTSTRAP values only. At runtime the authority is
+// ReserveRegistry, which loads every reserve's real configuration from
+// Pool.getReserveData at startup and refreshes it on an interval — e-mode
+// included, which a static table cannot express. Keep them close to reality
+// anyway: the trigger engine's local HF recomputation runs on whatever is
+// available at that instant, and a stale threshold shifts every computed HF.
+export const RESERVES: Record<string, ReserveConfig> = { ...PROFILE.reserves };
 
 // Address → symbol reverse lookup, and address → config (lowercase keys). Both are
 // kept in step with RESERVES by registerReserve().

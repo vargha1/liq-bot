@@ -6,7 +6,7 @@
 // Mirrors TriggerEngine.resolveFeeds(). Run it after any Aave oracle change to
 // confirm the trigger engine is subscribed to live emitters.
 import { ethers } from "ethers";
-import { RESERVES, AAVE_ORACLE, ORACLE_ABI, MULTICALL3, MULTICALL3_ABI, ADDRESS_TO_SYMBOL } from "./config";
+import { RESERVES, AAVE_ORACLE, ORACLE_ABI, MULTICALL3, MULTICALL3_ABI, ADDRESS_TO_SYMBOL, PROFILE } from "./config";
 
 const FEED_WALK_FNS = ["aggregator", "ASSET_TO_USD_AGGREGATOR", "BASE_TO_USD_AGGREGATOR"] as const;
 const FEED_WALK_IFACE = new ethers.Interface([
@@ -21,7 +21,7 @@ const ANSWER_UPDATED_TOPIC = new ethers.Interface([
 async function main() {
   const url = process.argv[2] ?? process.env.RPC_URL;
   if (!url) throw new Error("Pass an RPC url as argv[2] or set RPC_URL");
-  const provider = new ethers.JsonRpcProvider(url, 42161, { staticNetwork: true });
+  const provider = new ethers.JsonRpcProvider(url, PROFILE.chainId, { staticNetwork: true });
   const mc = new ethers.Contract(MULTICALL3, MULTICALL3_ABI, provider);
   const oracleIface = new ethers.Interface(ORACLE_ABI);
   const assets = Object.values(RESERVES);
