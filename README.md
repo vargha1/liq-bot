@@ -182,6 +182,12 @@ How Base differs, and what the bot does about it:
 | Chainlink SVR / sequencer feed | supported | not available, so ignored with a warning |
 | Price feeds | Chainlink + CAPO | Chainlink + CAPO (6 aggregators), resolved the same way |
 
+Seeding on Base: the first run looks for borrowers in the Aave subgraph (needs
+`THEGRAPH_API_KEY` and a correct `AAVE_SUBGRAPH_ID`), then in the holders of Aave's
+variable-debt tokens on Blockscout (no key, no archive RPC; `EXPLORER_MIN_DEBT_USD` sets how
+deep it reads), then by scanning logs. The result is cached in `borrowers-cache.base.json`;
+an empty list is never saved.
+
 Measured on Base: the in-memory health-factor model matched Aave to 0.0001 bps, and every
 liquidation pair that matters (WETH, cbBTC, USDC, cbETH, wstETH, weETH, EURC, GHO, AAVE)
 has a Uniswap V3 route within 3% of oracle value at $5k. Base-specific limits: the liquid

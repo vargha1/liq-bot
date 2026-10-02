@@ -38,7 +38,7 @@
 import { ethers } from "ethers";
 import { logger } from "./logger";
 import {
-  CONFIG, RESERVES, AAVE_ORACLE, ORACLE_ABI, MULTICALL3, MULTICALL3_ABI,
+  CONFIG, RESERVES, AAVE_ORACLE, ORACLE_ABI, MULTICALL3, MULTICALL3_ABI, PROFILE,
 } from "./config";
 import type { PositionTracker } from "./positions";
 import type { AaveOracle } from "./oracle";
@@ -312,8 +312,10 @@ export class TriggerEngine {
     if (!CONFIG.sequencerFeedEnabled) return;
     // The decoder understands Arbitrum's feed framing only. A chain without a feed
     // URL (Base) has nothing to connect to, so say so rather than fail silently.
-    if (!CONFIG.sequencerFeedUrl) {
-      logger.warn("SEQUENCER_FEED_ENABLED=true ignored: no sequencer feed is available for this chain");
+    // Keyed on the chain profile, not on the URL: a .env copied from the Arbitrum bot
+    // still carries SEQUENCER_FEED_URL, which would otherwise be connected to.
+    if (!PROFILE.sequencerFeedUrl) {
+      logger.warn(`SEQUENCER_FEED_ENABLED=true ignored: ${PROFILE.name} has no sequencer feed this bot can decode`);
       return;
     }
     this.seqFeed = new SequencerFeedWatcher(CONFIG.sequencerFeedUrl, hint => this.onFeedHint(hint));

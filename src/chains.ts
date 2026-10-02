@@ -43,6 +43,9 @@ export interface ChainProfile {
   };
   uniswap: { router: string; quoter: string };
   multicall3: string;
+  // Blockscout base URL used to seed borrowers when the subgraph and historical
+  // eth_getLogs are both unavailable ("" = none; override with EXPLORER_API_URL).
+  explorerApi: string;
 
   blockTimeMs: number;
   // eth_getLogs range per request during the historical scan (halved on failure).
@@ -117,6 +120,7 @@ const ARBITRUM: ChainProfile = {
     quoter: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",   // QuoterV2
   },
   multicall3: "0xcA11bde05977b3631167028862bE2a173976CA11",
+  explorerApi: "",   // not needed: the subgraph seeds Arbitrum. Set EXPLORER_API_URL=https://arbitrum.blockscout.com to try it.
   blockTimeMs: 250,
   scanChunk: 3_000n,
   l1Fee: { kind: "arbitrum", overheadBytes: 0 },
@@ -229,6 +233,7 @@ const BASE: ChainProfile = {
     quoter: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",   // QuoterV2
   },
   multicall3: "0xcA11bde05977b3631167028862bE2a173976CA11",
+  explorerApi: "https://base.blockscout.com",
   blockTimeMs: 2000,
   scanChunk: 10_000n,
   // Fjord GasPriceOracle: fee scales linearly with the unsigned transaction size.

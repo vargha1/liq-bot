@@ -208,6 +208,11 @@ export const CONFIG = {
   // all reserve feeds and fires liquidations on local HF recomputation, without
   // waiting for the polling cycle. Disable with TRIGGER_ENABLED=false.
   triggerEnabled:    opt("TRIGGER_ENABLED", "true") !== "false",
+  // Smallest debt (USD) worth watching when borrowers are seeded from the explorer
+  // (explorerSeed.ts). Holders are listed biggest first, so this sets how deep into the
+  // list the seed reads: lower = more requests. Liquidations under ~$100 of debt lose
+  // money after costs on every chain measured, so $25 leaves a wide margin.
+  explorerMinDebtUsd: num("EXPLORER_MIN_DEBT_USD", "25"),
   // Sequencer-feed accelerator. Arbitrum broadcasts transactions as it orders
   // them, before the block carrying them is published — so watching the feed for
   // a Chainlink transmit() beats every bot waiting on a log subscription.
@@ -363,6 +368,8 @@ function buildSubgraphUrl(): string {
   return `https://gateway.thegraph.com/api/${key}/subgraphs/id/${id}`;
 }
 export const AAVE_SUBGRAPH_URL = buildSubgraphUrl();
+// Blockscout fallback for seeding borrowers (see explorerSeed.ts).
+export const EXPLORER_API = opt("EXPLORER_API_URL", PROFILE.explorerApi);
 
 // ─── Address checksum validation ─────────────────────────────────────────────
 // ethers v6 throws INVALID_ARGUMENT on any contract call that uses an address

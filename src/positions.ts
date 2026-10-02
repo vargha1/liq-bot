@@ -5,11 +5,12 @@ import * as path from "path";
 import { logger } from "./logger";
 import {
   AAVE_POOL, AAVE_DATA_PROVIDER, UI_POOL_DATA_PROVIDER, POOL_ADDRESSES_PROVIDER,
-  MULTICALL3, AAVE_SUBGRAPH_URL,
+  MULTICALL3, AAVE_SUBGRAPH_URL, EXPLORER_API, AAVE_ORACLE, ORACLE_ABI,
   AAVE_POOL_ABI, ATOKEN_ABI, DATA_PROVIDER_ABI, UI_POOL_DATA_PROVIDER_ABI, MULTICALL3_ABI, RESERVES, RESERVE_BY_ADDRESS,
   CONFIG, AAVE_DEPLOY_BLOCK, PROFILE,
 } from "./config";
 import type { BorrowerPosition, AssetPosition } from "./types";
+import { fetchDebtHolders } from "./explorerSeed";
 import { ReserveRegistry, RAY, TOPIC_RESERVE_DATA_UPDATED, rayMul, healthFactorExact } from "./reserveState";
 import type { ReserveState } from "./reserveState";
 
@@ -127,7 +128,9 @@ function loadCache(): BorrowerCache | null {
   try {
     if (!fs.existsSync(CACHE_FILE)) return null;
     const data = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")) as BorrowerCache;
-    if (!data.scannedUpToBlock || !Array.isArray(data.borrowers)) return null;
+    // An empty list is not a cache: an earlier run that could not seed (no subgraph, no
+    // eth_getLogs) saved one, and trusting it would skip seeding for ever after.
+    if (!data.scannedUpToBlock || !Array.isArray(data.borrowers) || data.borrowers.length === 0) return null;
     logger.info(`Active cache: ${data.borrowers.length} borrowers, last block ${data.scannedUpToBlock}` +
       (data.dormant?.length ? ` + ${data.dormant.length} dormant` : ""));
     return data;
@@ -135,6 +138,7 @@ function loadCache(): BorrowerCache | null {
 }
 
 function saveCache(scannedUpToBlock: bigint, borrowers: string[], dormant?: Map<string, DormantEntry>): void {
+  if (borrowers.length === 0 && !dormant?.size) { logger.warn("Active cache not saved: no borrowers known"); return; }
   // Bug #13 fix: use async write to avoid blocking the event loop.
   const dormantArr: Array<[string, string, number, string[]?]> = dormant
     ? [...dormant.entries()].map(([addr, e]) => [addr, e.lastHF.toString(16), e.dormantSince, e.assets])
@@ -153,13 +157,14 @@ function loadFullCache(): BorrowerCache | null {
   try {
     if (!fs.existsSync(FULL_CACHE_FILE)) return null;
     const data = JSON.parse(fs.readFileSync(FULL_CACHE_FILE, "utf8")) as BorrowerCache;
-    if (!data.scannedUpToBlock || !Array.isArray(data.borrowers)) return null;
+    if (!data.scannedUpToBlock || !Array.isArray(data.borrowers) || data.borrowers.length === 0) return null;   // see loadCache
     logger.info(`Full cache: ${data.borrowers.length} borrowers, last block ${data.scannedUpToBlock}`);
     return data;
   } catch (e: any) { logger.warn(`Full cache read failed: ${e.message}`); return null; }
 }
 
 function saveFullCache(scannedUpToBlock: bigint, borrowers: string[]): void {
+  if (borrowers.length === 0) { logger.warn("Full cache not saved: no borrowers known"); return; }
   // Bug #13 fix: use async write to avoid blocking the event loop.
   const data = JSON.stringify({ scannedUpToBlock: Number(scannedUpToBlock), borrowers });
   fs.promises.writeFile(FULL_CACHE_FILE, data, "utf8")
@@ -980,6 +985,7 @@ export class PositionTracker {
       { entity: "borrows",   query: `{ borrows(first: 1) { id account { id } } }` },
       { entity: "accounts",  query: `{ accounts(first: 1, where: { borrowCount_gt: 0 }) { id } }` },
     ];
+    let firstErr: string | undefined;
     for (const { entity, query } of probes) {
       try {
         const resp = await axios.post(AAVE_SUBGRAPH_URL, { query }, { timeout: 10_000 });
@@ -987,8 +993,12 @@ export class PositionTracker {
           const key = Object.keys(resp.data.data)[0];
           if (key && Array.isArray(resp.data.data[key])) return entity;
         }
-      } catch { /* try next */ }
+        if (resp.data?.errors?.length) firstErr ??= String(resp.data.errors[0]?.message ?? "").slice(0, 160);
+      } catch (e: any) { firstErr ??= String(e?.response?.data?.errors?.[0]?.message ?? e?.message ?? e).slice(0, 160); }
     }
+    // Say WHY nothing matched: a wrong deployment id, an exhausted key and a schema
+    // without these entities all look identical otherwise ("using none").
+    if (firstErr) logger.warn(`Subgraph probe failed: ${firstErr}`);
     return "none";
   }
 
@@ -1078,6 +1088,56 @@ export class PositionTracker {
 
   // ── On-chain scan ──────────────────────────────────────────────────────────
   // FIX: SCAN_CHUNK reduced from 50 000 to 2 000 (most RPCs reject > 10 000)
+  // Seed from the current holders of every reserve's variable-debt token (see
+  // explorerSeed.ts). The floor (EXPLORER_MIN_DEBT_USD, default $25) is per holder and
+  // sits well under any liquidation worth sending, which also leaves room for the
+  // scaled-balance imprecision of the explorer figure.
+  private async seedFromExplorer(): Promise<number> {
+    logger.info(`Seeding borrowers from ${EXPLORER_API} (debt-token holders)…`);
+    const reserves = this.reserves.all().filter(r => r.variableDebtTokenAddress);
+    if (reserves.length === 0) return 0;
+
+    // Prices turn the dollar floor into a per-token raw balance floor.
+    const prices = new Map<string, bigint>();
+    try {
+      const mc    = new ethers.Contract(MULTICALL3, MULTICALL3_ABI, this.getProvider());
+      const iface = new ethers.Interface(ORACLE_ABI);
+      const res: Array<{ success: boolean; returnData: string }> = await mc.tryAggregate!.staticCall(
+        false, reserves.map(r => ({ target: AAVE_ORACLE, callData: iface.encodeFunctionData("getAssetPrice", [r.address]) })),
+      );
+      res.forEach((x, i) => {
+        if (x.success && x.returnData !== "0x") prices.set(reserves[i]!.address, iface.decodeFunctionResult("getAssetPrice", x.returnData)[0] as bigint);
+      });
+    } catch (e: any) { logger.warn(`Explorer seed: price read failed: ${e?.message ?? e}`); return 0; }
+
+    const FLOOR_USD8 = BigInt(Math.round(CONFIG.explorerMinDebtUsd * 1e8));
+    const deadlineMs = Date.now() + 20 * 60_000;
+    const before = this.positions.size;
+    for (const r of reserves) {
+      const price = prices.get(r.address) ?? 0n;
+      if (price <= 0n) { logger.debug(`Explorer seed: ${r.symbol} has no price, skipped`); continue; }
+      const minRaw = (FLOOR_USD8 * 10n ** BigInt(r.decimals)) / price;
+      try {
+        const { holders, pages, complete, error, lastRaw } = await fetchDebtHolders({
+          apiBase: EXPLORER_API, token: r.variableDebtTokenAddress, symbol: r.symbol, minRaw, deadlineMs,
+        });
+        for (const h of holders) this.upsert(h, "explorer");
+        // How deep an incomplete walk got, in USD, so the gap is visible: everything
+        // below this balance is missing from the seed.
+        const reachedUsd = lastRaw !== undefined ? Number((lastRaw * price) / 10n ** BigInt(r.decimals)) / 1e8 : undefined;
+        const note = complete ? "" : (error ? ` (INCOMPLETE: ${error})` : " (INCOMPLETE: page/time cap reached)") +
+          (reachedUsd !== undefined ? `, read down to ~$${reachedUsd.toFixed(0)} of debt` : "");
+        const line = `  ${r.symbol}: ${holders.length} borrowers over ${pages} page(s)${note}`;
+        if (complete) logger.info(line); else logger.warn(line);
+      } catch (e: any) {
+        logger.warn(`  ${r.symbol}: explorer request failed: ${e?.response?.status ?? ""} ${e?.message ?? e}`);
+      }
+    }
+    const added = this.positions.size - before;
+    logger.info(`Explorer seed: ${added} unique borrowers`);
+    return added;
+  }
+
   private async scanEvents(fromBlock: bigint, toBlock: bigint): Promise<number> {
     let loaded = 0, block = fromBlock, chunkSize = SCAN_CHUNK;
     logger.info(`  Scanning ${fromBlock}→${toBlock} (${((toBlock - fromBlock) / 1000n).toLocaleString()}k blocks)`);
@@ -1335,6 +1395,16 @@ export class PositionTracker {
         logger.info(`Ready: ${this.positions.size} borrowers from subgraph`);
       }
       return { skipPrune: clean };
+    }
+
+    if (EXPLORER_API) {
+      const e = await this.seedFromExplorer();
+      if (e > 0) {
+        saveFullCache(latest, [...this.positions.keys()]);
+        saveCache(latest, [...this.positions.keys()], this.dormant);
+        logger.info(`Ready: ${this.positions.size} borrowers from ${EXPLORER_API}`);
+        return { skipPrune: false };
+      }
     }
 
     logger.warn("Full on-chain scan (15-25 min, one-time)…");

@@ -150,6 +150,7 @@ export interface ReserveState {
   variableBorrowRate:   bigint;   // RAY per year
   lastUpdateTimestamp:  number;   // unix seconds
   aTokenAddress:        string;   // lowercase
+  variableDebtTokenAddress: string;   // lowercase; its holders are the reserve's borrowers
   // Underlying idle in the aToken contract = what a liquidation can withdraw.
   // undefined until the first refreshLiquidity().
   availableLiquidity?:  bigint;
@@ -233,6 +234,7 @@ export class ReserveRegistry {
           variableBorrowRate:   d.currentVariableBorrowRate as bigint,
           lastUpdateTimestamp:  Number(d.lastUpdateTimestamp),
           aTokenAddress:        (d.aTokenAddress as string).toLowerCase(),
+          variableDebtTokenAddress: (d.variableDebtTokenAddress as string).toLowerCase(),
           availableLiquidity:   this.byAddress.get(address)?.availableLiquidity,
         };
         this.byAddress.set(address, state);
