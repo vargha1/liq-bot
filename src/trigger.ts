@@ -163,6 +163,9 @@ interface BuiltOpp {
   // a Chainlink answer ratio rather than read from Aave's oracle. Such a health
   // factor is a prediction of what the chain will say, not a reading of it.
   usedEstimate: boolean;
+  // Some input price is older than MAX_PRICE_AGE_MS: the background refresh has
+  // been failing, so the cache may no longer describe the chain.
+  stalePrice: boolean;
   opp:     ReturnType<Evaluator["buildFromLocal"]>;
 }
 
@@ -194,6 +197,27 @@ export class TriggerEngine {
   // without a read round-trip.
   private svrAnswers = new Map<string, { answer: bigint; at: number }>();
   private reseedTimer: ReturnType<typeof setInterval> | null = null;
+  // Assets whose Aave source is a plain Chainlink proxy (first walk step was
+  // aggregator()), as opposed to a CAPO adapter that transforms the answer.
+  private directAssets = new Set<string>();
+  // Subset of directAssets whose last authoritative price EQUALLED the raw feed
+  // answer, so price(new) = answer(new) exactly. Rebuilt as bases are recorded.
+  private exactAssets  = new Set<string>();
+
+  private recordBasis(asset: string, price: bigint, answer: bigint): void {
+    this.basis.set(asset, { price, answer, at: Date.now() });
+    if (this.directAssets.has(asset) && price === answer) this.exactAssets.add(asset);
+    else this.exactAssets.delete(asset);
+  }
+
+  // True when an estimate for this asset is known to equal what Aave will read.
+  private isExactEstimate(asset: string): boolean {
+    if (!CONFIG.triggerExactDirectFeeds) return false;
+    const a = asset.toLowerCase();
+    if (!this.exactAssets.has(a)) return false;
+    const b = this.basis.get(a);
+    return !!b && Date.now() - b.at < TriggerEngine.BASIS_MAX_AGE_MS;
+  }
 
   // What the engine has actually seen. In trigger-only mode the heartbeat's
   // `liquidatable` counter is permanently zero — it is incremented by the
@@ -402,6 +426,7 @@ export class TriggerEngine {
       })),
     );
 
+    const direct = new Set<string>();
     // assetLower → address currently being walked
     let frontier = new Map<string, string>();
     for (let i = 0; i < assets.length; i++) {
@@ -431,6 +456,7 @@ export class TriggerEngine {
       const results: Array<{ success: boolean; returnData: string }> = await mc.tryAggregate(false, calls);
 
       const child = new Map<string, string>();  // node → next node in the walk
+      const viaProxy = new Set<string>();       // nodes whose forwarding step was aggregator()
       for (let i = 0; i < nodes.length; i++) {
         const node = nodes[i]!;
         for (let k = 0; k < FEED_WALK_FNS.length; k++) {
@@ -441,6 +467,7 @@ export class TriggerEngine {
             if (!next || next === ethers.ZeroAddress) continue;
             if (next.toLowerCase() === node.toLowerCase()) continue;  // self-reference guard
             child.set(node, next);
+            if (k === 0) viaProxy.add(node);
             break;  // aggregator() first — a proxy is never also a CAPO adapter
           } catch { /* not this accessor */ }
         }
@@ -449,6 +476,7 @@ export class TriggerEngine {
       const nextFrontier = new Map<string, string>();
       for (const [asset, node] of frontier) {
         const next = child.get(node);
+        if (depth === 0 && next && viaProxy.has(node)) direct.add(asset);
         if (next) nextFrontier.set(asset, next);
         else addFeed(node, asset);   // terminal — this is the event emitter
       }
@@ -459,6 +487,8 @@ export class TriggerEngine {
     // subscribe to a probably-wrong address than to drop the asset silently.
     for (const [asset, node] of frontier) addFeed(node, asset);
 
+    this.directAssets = direct;
+    for (const a of [...this.exactAssets]) if (!direct.has(a)) this.exactAssets.delete(a);
     const covered = [...feeds.values()].reduce((n, s) => n + s.size, 0);
     logger.info(
       `Trigger engine: resolved ${covered}/${assets.length} reserves to ${feeds.size} distinct aggregators`
@@ -532,7 +562,7 @@ export class TriggerEngine {
         // anchor, pinned to its own block. Never overwrite that with this.
         const existing = this.basis.get(m.asset);
         if (existing && existing.at >= t0) continue;
-        this.basis.set(m.asset, { price, answer, at: Date.now() });
+        this.recordBasis(m.asset, price, answer);
         seeded++;
       } catch { /* undecodable price */ }
     }
@@ -789,7 +819,7 @@ export class TriggerEngine {
         for (const asset of toFetch) {
           const p = prices.get(asset) ?? 0n;
           out.push([asset, p] as const);
-          if (pinned && p > 0n) this.basis.set(asset, { price: p, answer: answer!, at: Date.now() });
+          if (pinned && p > 0n) this.recordBasis(asset, p, answer!);
         }
       } catch {
         for (const asset of toFetch) out.push([asset, this.oracle.peekPrice(asset) ?? 0n] as const);
@@ -827,7 +857,10 @@ export class TriggerEngine {
       // 32, ranked by value inside findLocalCandidates: building is pure CPU and
       // the profit sort below picks what the scarce executor slots go to. Cutting
       // to the 10 lowest health factors first let dust crowd out the big ones.
-      const candidates = this.tracker.findLocalCandidates(assetsLower, prices, scanCeiling, 32);
+      const candidates = this.tracker.findLocalCandidates(
+        assetsLower, prices, scanCeiling, 32, false,
+        (a, w) => this.oracle.priceExtremes(a, w),
+      );
 
       // Audit BEFORE the early return below. This sits here and not further down
       // for a reason that cost a whole run to learn: findLocalCandidates only
@@ -889,16 +922,20 @@ export class TriggerEngine {
 
         // Captured before buildFromLocal or any later confirmation can mutate it.
         const hfE18 = cand.pos.healthFactor;
-        const usedEstimate = this.oracle.anyEstimated([
+        const assetsUsed = [
           ...cand.collaterals.map(c => c.address),
           ...cand.debts.map(d => d.address),
-        ]);
+        ];
+        // Estimates of exact direct-feed prices are as good as a read, so they
+        // do not force the confirmation round-trip; everything else still does.
+        const usedEstimate = this.oracle.anyEstimated(assetsUsed.filter(a => !this.isExactEstimate(a)));
+        const stalePrice   = this.oracle.maxAgeMs(assetsUsed) > CONFIG.maxPriceAgeMs;
 
         const opp = this.evaluator.buildFromLocal(
           cand.pos, cand.collaterals, cand.debts, prices, gasPrice, ethPrice,
         );
         if (!opp) continue;
-        built.push({ key, hfLocal: cand.hfLocal, hfE18, usedEstimate, opp });
+        built.push({ key, hfLocal: cand.hfLocal, hfE18, usedEstimate, stalePrice, opp });
       }
       built.sort((a, b) => b.opp!.netProfitUsd - a.opp!.netProfitUsd);
 
@@ -982,6 +1019,9 @@ export class TriggerEngine {
     // exactly the tick where the model is guessing. Everything after it still
     // fires blind at full speed.
     if (b.usedEstimate && CONFIG.triggerRequireConfirmedPrice) return false;
+
+    // Likewise never fire blind on prices that have not been refreshed recently.
+    if (b.stalePrice) return false;
 
     // Absolute rail, independent of statistics. A degenerate sample window
     // (every observation identical, say) must not be able to authorise a fire

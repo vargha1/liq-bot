@@ -1,20 +1,13 @@
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { CONFIG, LIQUIDATOR_ABI, ARBITRUM_SEQUENCER_RPC, CHAIN_ID } from "./config";
+import { CONFIG, LIQUIDATOR_ABI, ARBITRUM_SEQUENCER_RPC, CHAIN_ID, RESERVE_BY_ADDRESS } from "./config";
 import { estimateGasUnits, SAME_ASSET_GAS } from "./evaluator";
+import { hopsFromPath } from "./uniswap";
 import { metrics } from "./metrics";
 import type { LiquidationOpportunity } from "./types";
 
 // Re-export so index.ts doesn't need to change its import
 export { estimateGasUnits };
-
-// Count Uniswap V3 path hops from encoded path bytes
-// Path: 20-byte token + (3-byte fee + 20-byte token) * N => hops = (bytes-20)/23
-function hopsFromPath(swapPath: string): number {
-  if (!swapPath || swapPath === "0x") return 0;
-  const bytes = (swapPath.length - 2) / 2;
-  return Math.max(1, Math.round((bytes - 20) / 23));
-}
 
 // ethers reports an unparseable JSON-RPC error as the useless "could not
 // coalesce error". The provider's actual message ("insufficient funds for gas *
@@ -32,18 +25,31 @@ function describeRpcError(err: any): string {
   return parts.join(" | ");
 }
 
-type CooldownCause = "success" | "failure" | "external";
-interface CooldownEntry { ts: number; cause: CooldownCause }
+type CooldownCause = "success" | "failure" | "external" | "svr";
+interface CooldownEntry { ts: number; cause: CooldownCause; failures?: number }
 
-const COOLDOWN_SUCCESS_MS   = 30_000; // position is gone — no point retrying soon
-const COOLDOWN_FAILURE_MS   = 3_000;  // our own tx failed — retry quickly (may have been transient)
-const COOLDOWN_EXTERNAL_MS  = 30_000; // a competitor liquidated the borrower
+// Short on purpose. A partial liquidation (50% close factor) frequently leaves the
+// borrower liquidatable, and the old 30s hold forfeited the remainder to
+// competitors. The model re-reads the borrower on the event, and a position that
+// is genuinely healthy again fails the trigger's own HF check, so the cooldown
+// only has to absorb same-block duplicates.
+const COOLDOWN_SUCCESS_MS   = 4_000;
+const COOLDOWN_EXTERNAL_MS  = 4_000;
+const COOLDOWN_SVR_MS       = 6_000;   // an SVR bid for this borrower is in flight
+// Our own tx failed: retry fast the first time (may be transient), then back off
+// exponentially so a persistently reverting target cannot bleed gas.
+const COOLDOWN_FAILURE_BASE_MS = 3_000;
+const COOLDOWN_FAILURE_MAX_MS  = 300_000;
 
-function cooldownMsFor(cause: CooldownCause): number {
-  switch (cause) {
+function cooldownMsFor(entry: CooldownEntry): number {
+  switch (entry.cause) {
     case "success":  return COOLDOWN_SUCCESS_MS;
-    case "failure":  return COOLDOWN_FAILURE_MS;
     case "external": return COOLDOWN_EXTERNAL_MS;
+    case "svr":      return COOLDOWN_SVR_MS;
+    case "failure": {
+      const n = Math.max(1, entry.failures ?? 1);
+      return Math.min(COOLDOWN_FAILURE_MAX_MS, COOLDOWN_FAILURE_BASE_MS * 2 ** (n - 1));
+    }
   }
 }
 
@@ -137,7 +143,7 @@ export class Executor {
 
     // Cleanup expired cooldown entries
     setInterval(() => {
-      const cutoff = Date.now() - Math.max(COOLDOWN_SUCCESS_MS, COOLDOWN_EXTERNAL_MS) * 2;
+      const cutoff = Date.now() - COOLDOWN_FAILURE_MAX_MS * 2;
       for (const [k, v] of this.recentlyExecuted) {
         if (v.ts < cutoff) this.recentlyExecuted.delete(k);
       }
@@ -182,7 +188,39 @@ export class Executor {
   // borrower we track. Lets execute() skip instantly with an accurate reason
   // instead of waiting out the generic cooldown.
   noteExternalLiquidation(borrower: string): void {
-    this.recentlyExecuted.set(borrower.toLowerCase(), { ts: Date.now(), cause: "external" });
+    const key = borrower.toLowerCase();
+    const prev = this.recentlyExecuted.get(key);
+    // Keep the failure streak: a competitor landing first says nothing about
+    // whether our own transactions on this borrower keep reverting.
+    this.recentlyExecuted.set(key, { ts: Date.now(), cause: "external", failures: prev?.failures });
+  }
+
+  // An SVR bid covering this borrower was just submitted; the public path should
+  // not race it with a second flashloan for the same position.
+  noteSvrBid(borrower: string): void {
+    this.recentlyExecuted.set(borrower.toLowerCase(), { ts: Date.now(), cause: "svr" });
+  }
+
+  // Prices for converting realised profit to USD (8-dec Aave base units).
+  private priceSource: ((asset: string) => bigint | null) | null = null;
+  setPriceSource(fn: (asset: string) => bigint | null): void { this.priceSource = fn; }
+
+  // Realised results, read from LiquidationExecuted receipts (not estimates).
+  readonly results = { confirmed: 0, reverted: 0, timedOut: 0, realizedProfitUsd: 0, gasSpentEth: 0 };
+
+  // Rolling outcome window used to raise the profit floor when reverts are common.
+  private recentOutcomes: boolean[] = [];   // true = landed
+  private noteOutcome(landed: boolean): void {
+    this.recentOutcomes.push(landed);
+    if (this.recentOutcomes.length > 30) this.recentOutcomes.shift();
+  }
+  // MIN_PROFIT_USD scaled by 1 / (1 - revertRate): with a 50% revert rate a trade
+  // must clear twice the floor to pay for the ones that fail. Needs 8+ samples.
+  effectiveMinProfitUsd(): number {
+    const n = this.recentOutcomes.length;
+    if (n < 8) return CONFIG.minProfitUsd;
+    const rate = this.recentOutcomes.filter(x => !x).length / n;
+    return CONFIG.minProfitUsd / (1 - Math.min(rate, 0.8));
   }
 
   // OPT 3: isExecuting is true only if we've hit the concurrency cap.
@@ -210,7 +248,7 @@ export class Executor {
     // Per-cause cooldown check
     const entry = this.recentlyExecuted.get(key);
     if (entry) {
-      const limit = cooldownMsFor(entry.cause);
+      const limit = cooldownMsFor(entry);
       const age = Date.now() - entry.ts;
       if (age < limit) {
         if (entry.cause === "external") {
@@ -267,7 +305,7 @@ export class Executor {
       // therefore locked up far more ETH per in-flight tx than a liquidation
       // needs, and on a thin balance that is the difference between landing and
       // being rejected outright.
-      const gasLimit = gasUnits + BigInt(CONFIG.gasLimitBuffer);
+      const gasLimit = (gasUnits * BigInt(CONFIG.gasLimitMarginPct)) / 100n + BigInt(CONFIG.gasLimitBuffer);
 
       const feeData = feeDataOverride ?? this.feeDataSource?.() ?? await this.getFeeDataResilient();
 
@@ -413,27 +451,42 @@ export class Executor {
 
       // Wait for confirmation on the primary provider with a timeout — dropped
       // txs must not block the nonce slot forever.
-      const receipt = await this.waitForReceipt(this.receiptProviders(), signedHash, 120_000);
+      const receipt = await this.waitForReceipt(this.receiptProviders(), signedHash, CONFIG.receiptTimeoutMs);
       const confirmMs = performance.now() - t0;
       metrics.record("exec.e2e", performance.now() - e2eStart);
       if (receipt) metrics.record("exec.confirm", confirmMs - submitMs);
 
+      const prevFailures = this.recentlyExecuted.get(key)?.failures ?? 0;
       if (receipt?.status === 1) {
         logger.info(`✅ Confirmed block=${receipt.blockNumber}`);
         this.recentlyExecuted.set(key, { ts: Date.now(), cause: "success" });
+        this.results.confirmed++;
+        this.noteOutcome(true);
         this._parseReceipt(receipt);
       } else if (receipt) {
-        // Reverted — mark short failure cooldown so we retry fast but don't loop.
-        this.recentlyExecuted.set(key, { ts: Date.now(), cause: "failure" });
+        this.recentlyExecuted.set(key, { ts: Date.now(), cause: "failure", failures: prevFailures + 1 });
+        this.results.reverted++;
+        this.noteOutcome(false);
+        this.noteGas(receipt);
         logger.error(`❌ Reverted: ${signedHash}`);
       } else {
-        this.recentlyExecuted.set(key, { ts: Date.now(), cause: "failure" });
-        logger.error(`❌ Confirmation timeout: ${signedHash}`);
+        // No receipt: the tx may be dropped, leaving its nonce unused and every
+        // later transaction queued behind the gap. Resync from the pending count
+        // on the next submission rather than trusting the local counter.
+        this.recentlyExecuted.set(key, { ts: Date.now(), cause: "failure", failures: prevFailures + 1 });
+        this.results.timedOut++;
+        this.noteOutcome(false);
+        this.nonce = -1;
+        logger.error(`❌ Confirmation timeout: ${signedHash} — nonce will be resynced`);
       }
       return receipt;
 
     } catch (err: any) {
-      this.recentlyExecuted.set(opp.borrower.toLowerCase(), { ts: Date.now(), cause: "failure" });
+      const failKey = opp.borrower.toLowerCase();
+      this.recentlyExecuted.set(failKey, {
+        ts: Date.now(), cause: "failure", failures: (this.recentlyExecuted.get(failKey)?.failures ?? 0) + 1,
+      });
+      this.noteOutcome(false);
       // If nonce was wrong (race condition), reset so next call re-fetches
       const detail = describeRpcError(err);
       if (/nonce|replacement/i.test(detail)) {
@@ -537,20 +590,33 @@ export class Executor {
     return null;
   }
 
+  private noteGas(receipt: ethers.TransactionReceipt): void {
+    const gasCost = receipt.gasUsed * (receipt.gasPrice ?? 0n);
+    this.results.gasSpentEth += Number(ethers.formatEther(gasCost));
+  }
+
   private _parseReceipt(receipt: ethers.TransactionReceipt): void {
     const iface = new ethers.Interface(LIQUIDATOR_ABI);
     for (const log of receipt.logs) {
       try {
         const p = iface.parseLog(log);
         if (p?.name === "LiquidationExecuted") {
-          const { borrower, collateralAsset, debtAsset, debtCovered, collateralReceived, profitRaw, flashloanPremium } = p.args;
+          const { borrower, debtAsset, debtCovered, collateralReceived, profitRaw, flashloanPremium } = p.args;
           logger.info(
             `LiquidationExecuted | borrower=${borrower.slice(0,10)}... | ` +
             `debt=${debtCovered} col=${collateralReceived} profit=${profitRaw} premium=${flashloanPremium}`
           );
+          // Realised profit in USD from the on-chain figure, not the estimate.
+          const price = this.priceSource?.(debtAsset);
+          const reserve = RESERVE_BY_ADDRESS[String(debtAsset).toLowerCase()];
+          if (price && reserve) {
+            this.results.realizedProfitUsd +=
+              Number((BigInt(profitRaw) * price) / 10n ** BigInt(reserve.decimals)) / 1e8;
+          }
         }
       } catch { /* non-matching log */ }
     }
+    this.noteGas(receipt);
     const gasCost = receipt.gasUsed * (receipt.gasPrice ?? 0n);
     logger.info(`Gas: ${receipt.gasUsed} | ${ethers.formatEther(gasCost)} ETH`);
   }

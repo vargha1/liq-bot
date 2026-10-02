@@ -149,6 +149,10 @@ export interface ReserveState {
   liquidityRate:        bigint;   // RAY per year
   variableBorrowRate:   bigint;   // RAY per year
   lastUpdateTimestamp:  number;   // unix seconds
+  aTokenAddress:        string;   // lowercase
+  // Underlying idle in the aToken contract = what a liquidation can withdraw.
+  // undefined until the first refreshLiquidity().
+  availableLiquidity?:  bigint;
 }
 
 export interface EModeCategory {
@@ -228,6 +232,8 @@ export class ReserveRegistry {
           liquidityRate:        d.currentLiquidityRate as bigint,
           variableBorrowRate:   d.currentVariableBorrowRate as bigint,
           lastUpdateTimestamp:  Number(d.lastUpdateTimestamp),
+          aTokenAddress:        (d.aTokenAddress as string).toLowerCase(),
+          availableLiquidity:   this.byAddress.get(address)?.availableLiquidity,
         };
         this.byAddress.set(address, state);
         this.byId.set(state.id, state);
@@ -245,6 +251,28 @@ export class ReserveRegistry {
     if (first) logger.info(`ReserveRegistry: ${ok}/${list.length} reserves loaded`);
     else logger.debug(`ReserveRegistry refreshed: ${ok}/${list.length} reserves`);
   }
+
+  // Idle underlying per reserve (balanceOf(aToken)). A liquidation that seizes
+  // more than this reverts on withdraw, so the evaluator sizes against it. One
+  // multicall; cheap enough to run every few seconds.
+  async refreshLiquidity(): Promise<void> {
+    const all = this.all();
+    if (all.length === 0) return;
+    const mc = new ethers.Contract(MULTICALL3, MULTICALL3_ABI, this.getProvider());
+    const iface = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
+    const results: Array<{ success: boolean; returnData: string }> = await mc.tryAggregate(
+      false,
+      all.map(r => ({ target: r.address, callData: iface.encodeFunctionData("balanceOf", [r.aTokenAddress]) })),
+    );
+    all.forEach((r, i) => {
+      const res = results[i];
+      if (!res?.success || res.returnData === "0x") return;
+      try { r.availableLiquidity = iface.decodeFunctionResult("balanceOf", res.returnData)[0] as bigint; }
+      catch { /* keep the previous figure */ }
+    });
+  }
+
+  aTokenAddresses(): string[] { return this.all().map(r => r.aTokenAddress); }
 
   // Any reserve on-chain that the static RESERVES table lacks (a token Aave listed
   // after the table was written) is registered here, so the evaluator, oracle

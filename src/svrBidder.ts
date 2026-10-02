@@ -30,7 +30,7 @@ import { logger } from "./logger";
 import { CONFIG, RESERVES, AAVE_POOL, AAVE_POOL_ABI } from "./config";
 import { SvrFeed } from "./svrFeed";
 import type { TriggerEngine, SvrCandidate } from "./trigger";
-import { encodeHeuristicPath, getCachedRoute } from "./uniswap";
+import { encodeHeuristicPath, getCachedRoute, hopsFromPath, scheduleRouteRefresh } from "./uniswap";
 import {
   ATLAS, ATLAS_ABI, DAPP_CONTROL, DAPP_CONTROL_ABI,
   signSolverOp, solverOpToWire, queryPayload, encodeSolverItems, requiredBond,
@@ -43,7 +43,7 @@ const QUERY_DELAY_MS = 3_500;           // an auction lasts ~2s; results settle 
 const BOND_REFRESH_MS = 30_000;
 const PROBE_EVERY_MS  = 10 * 60_000;
 const SVR_PROBE_MAX_PCT = 20;   // mirrors SVR_PROBE_MAX_BPS in trigger.ts
-const SVR_LOG = path.join(process.cwd(), "logs", "svr-auctions.jsonl");
+const SVR_LOG = path.resolve(__dirname, "..", "logs", "svr-auctions.jsonl");
 
 // Gas the oracle update itself is charged to the searcher for, on success. Used
 // only to estimate the cost of winning; the bond check uses the auction's own
@@ -56,16 +56,14 @@ const ITEM_BASE_GAS  = 550_000n;   // flashloan, liquidationCall, bookkeeping
 const SWAP_HOP_GAS   = 150_000n;   // per Uniswap hop on the collateral -> debt leg
 const PROFIT_SWAP_GAS = 150_000n;  // debt -> WETH, skipped when the debt is WETH
 
-function hopsOf(swapPath: string | undefined): number {
-  if (!swapPath || swapPath === "0x") return 0;
-  return Math.max(1, Math.round(((swapPath.length - 2) / 2 - 20) / 23));
-}
+const hopsOf = hopsFromPath;
 
 export interface SvrBidderDeps {
   trigger:         TriggerEngine;
   wallet:          ethers.Wallet;
   getReadProvider: () => ethers.Provider;
   canBid:          () => boolean;
+  onBid?:          (borrower: string) => void;
 }
 
 type Decision =
@@ -220,6 +218,7 @@ export class SvrBidder {
     }
 
     if (CONFIG.svrDryRun) { this.stats.wouldBid++; return; }
+    for (const c of d.chosen) this.deps.onBid?.(c.opp.borrower);
     this.submit(a, d).catch(e => logger.error(`SVR submit failed: ${e?.message ?? e}`));
   }
 
@@ -362,6 +361,20 @@ export class SvrBidder {
       };
     }
 
+    // The profit -> WETH swap runs with no on-chain floor and a failure there is
+    // swallowed, leaving the profit in the debt token and the whole operation
+    // reverting on "Profit below bid". Only bid with a QUOTED route for it; a
+    // guessed fee tier is how that happens. Kick off the quote and skip this one.
+    for (const c of chosen) {
+      const debt = c.opp.debtAsset;
+      if (debt.toLowerCase() === WETH.toLowerCase()) continue;
+      if (!getCachedRoute(debt, WETH)) {
+        scheduleRouteRefresh(debt, WETH, c.opp.debtToCover / 20n + 1n, this.deps.getReadProvider(), true);
+        this.stats.skipped++;
+        return { kind: "skip", reason: `no verified ${c.opp.debtSymbol}->WETH route yet (quote requested)` };
+      }
+    }
+
     const premiumBps = BigInt(CONFIG.flashloanPremiumBps);
     const items: SolverItem[] = chosen.map(c => {
       const o = c.opp;
@@ -378,7 +391,7 @@ export class SvrBidder {
         debtToCover:      o.debtToCover,
         swapPath:         isSame ? "0x" : (o.swapPath && o.swapPath !== "0x" ? o.swapPath : encodeHeuristicPath(o.collateralAsset, o.debtAsset)),
         amountOutMinimum: isSame ? 0n : repay,
-        profitPath:       debtIsWeth ? "0x" : (getCachedRoute(o.debtAsset, WETH)?.path ?? encodeHeuristicPath(o.debtAsset, WETH)),
+        profitPath:       debtIsWeth ? "0x" : (getCachedRoute(o.debtAsset, WETH)!.path),
       };
     });
 

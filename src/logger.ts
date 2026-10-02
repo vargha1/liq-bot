@@ -151,7 +151,9 @@ ctrlServer.on("error", (e: Error & { code?: string }) => {
 // Example: echo debug > loglevel.ctrl
 const CTRL_FILE = path.join(PROJECT_ROOT, "loglevel.ctrl");
 
-fs.watchFile(CTRL_FILE, { interval: 1_000 }, () => {
+// unref(): the control watchers must never be the reason a process stays alive
+// (matters for tests and one-shot diagnostic scripts).
+const ctrlWatcher = fs.watchFile(CTRL_FILE, { interval: 1_000 }, () => {
   try {
     if (!fs.existsSync(CTRL_FILE)) return;
     const level = fs.readFileSync(CTRL_FILE, "utf8").trim().toLowerCase();
@@ -159,6 +161,8 @@ fs.watchFile(CTRL_FILE, { interval: 1_000 }, () => {
     setLogLevel(level);
   } catch { /* ignore read/unlink races */ }
 });
+ctrlWatcher.unref();
+ctrlServer.unref();
 
 // ── Startup info ──────────────────────────────────────────────────────────────
 logger.info(`PID ${process.pid} | log level: ${logger.level} | log dir: ${LOG_DIR}`);

@@ -6,7 +6,7 @@ import { logger } from "./logger";
 import {
   AAVE_POOL, AAVE_DATA_PROVIDER, UI_POOL_DATA_PROVIDER, POOL_ADDRESSES_PROVIDER,
   MULTICALL3, AAVE_SUBGRAPH_URL,
-  AAVE_POOL_ABI, DATA_PROVIDER_ABI, UI_POOL_DATA_PROVIDER_ABI, MULTICALL3_ABI, RESERVES, RESERVE_BY_ADDRESS,
+  AAVE_POOL_ABI, ATOKEN_ABI, DATA_PROVIDER_ABI, UI_POOL_DATA_PROVIDER_ABI, MULTICALL3_ABI, RESERVES, RESERVE_BY_ADDRESS,
   CONFIG,
 } from "./config";
 import type { BorrowerPosition, AssetPosition } from "./types";
@@ -71,13 +71,16 @@ const BREAKDOWN_CACHE_BLOCKS_NORMAL = 50n;  // all others
 //      These arrive at HF_SEED (1.10) and get a real HF on first rotation check.
 //   3. Incremental scan to pick up new borrows since last full-cache block.
 //   This ensures no historically-known borrower is permanently lost after a prune.
-const CACHE_FILE      = path.resolve(process.cwd(), "active-cache.json");
-const FULL_CACHE_FILE = path.resolve(process.cwd(), "borrowers-cache.json");
+// Anchored to the project root (like the logs), not the launch directory, so
+// starting the bot from elsewhere cannot silently begin with empty caches.
+const STATE_DIR       = path.resolve(__dirname, "..");
+const CACHE_FILE      = path.join(STATE_DIR, "active-cache.json");
+const FULL_CACHE_FILE = path.join(STATE_DIR, "borrowers-cache.json");
 // Persisted bad-debt denylist — survives restarts so known bad-debt positions are never
 // re-evaluated. Without this, every restart re-seeds 0x04511e… and 0xf740382c from the
 // full cache, detects them as liquidatable (HF=0), runs breakdown+evaluate, then evicts —
 // wasting a cycle and logging a false "liquidatable=1" indefinitely.
-const DENYLIST_FILE    = path.resolve(process.cwd(), "bad-debt-denylist.json");
+const DENYLIST_FILE    = path.join(STATE_DIR, "bad-debt-denylist.json");
 // A dormant position remembers which reserve addresses it actually touches, so a
 // price drop on an unrelated asset doesn't wake it. Populated from the breakdown
 // cache at park time; absent when the position was parked without a breakdown
@@ -178,9 +181,12 @@ const TOPIC_WITHDRAW         = IFACE.getEvent("Withdraw")!.topicHash;
 const TOPIC_LIQUIDATION_CALL = IFACE.getEvent("LiquidationCall")!.topicHash;
 const TOPIC_COLLATERAL_ON    = IFACE.getEvent("ReserveUsedAsCollateralEnabled")!.topicHash;
 const TOPIC_COLLATERAL_OFF   = IFACE.getEvent("ReserveUsedAsCollateralDisabled")!.topicHash;
+const TOPIC_EMODE_SET        = IFACE.getEvent("UserEModeSet")!.topicHash;
+const ATOKEN_IFACE           = new ethers.Interface(ATOKEN_ABI);
+const TOPIC_BALANCE_TRANSFER = ATOKEN_IFACE.getEvent("BalanceTransfer")!.topicHash;
 export const MONITORED_TOPICS = [
   TOPIC_BORROW, TOPIC_SUPPLY, TOPIC_REPAY, TOPIC_WITHDRAW, TOPIC_LIQUIDATION_CALL,
-  TOPIC_COLLATERAL_ON, TOPIC_COLLATERAL_OFF,
+  TOPIC_COLLATERAL_ON, TOPIC_COLLATERAL_OFF, TOPIC_EMODE_SET,
 ];
 
 // ── Breakdown cache entry ──────────────────────────────────────────────────────
@@ -536,6 +542,7 @@ export class PositionTracker {
     // Balances changed, so any cached health factor for this address describes a
     // position that no longer exists. The skip bound must never be applied to it.
     this.localHfCache.delete(address);
+    this.hfVolatile.add(address);
     this.userStates.set(address, state);
     for (const r of state.reserves) {
       let set = this.assetIndex.get(r.asset);
@@ -557,6 +564,7 @@ export class PositionTracker {
     this.clearAssetIndex(address);
     this.userStates.delete(address);
     this.localHfCache.delete(address);
+    this.hfVolatile.delete(address);
   }
 
   // Bounded write path for the legacy breakdown cache. It previously had no
@@ -715,6 +723,7 @@ export class PositionTracker {
     // Balances changed, so the skip bound's cached HF describes a position that
     // no longer exists.
     this.localHfCache.delete(address);
+    this.hfVolatile.add(address);
     const delay = this.positions.has(address)
       ? PositionTracker.DIRTY_ACTIVE_MS : PositionTracker.DIRTY_LAZY_MS;
     const due = Date.now() + delay;
@@ -912,6 +921,7 @@ export class PositionTracker {
         case TOPIC_LIQUIDATION_CALL: addr = parsed.args[2]; break;
         case TOPIC_COLLATERAL_ON:    addr = parsed.args[1]; break;
         case TOPIC_COLLATERAL_OFF:   addr = parsed.args[1]; break;
+        case TOPIC_EMODE_SET:        addr = parsed.args[0]; break;
       }
       if (addr) {
         const key = addr.toLowerCase();
@@ -1346,6 +1356,7 @@ export class PositionTracker {
   // onSubId kept in signature for backward compat but no longer used.
   private logFilter: ethers.Filter | null = null;
   private reserveFilter: ethers.Filter | null = null;
+  private transferFilter: ethers.Filter | null = null;
   private activeWsProvider: ethers.WebSocketProvider | null = null;
 
   // Ceiling on how many positions a single gap recovery will re-read. The active
@@ -1409,8 +1420,9 @@ export class PositionTracker {
         // Bug #14 fix: increased gap-fill window from 2,000 to 10,000 blocks.
         // If WS is disconnected for >2,000 blocks (~55 min), events in the gap
         // were permanently missed. 10,000 blocks (~4.6 hours) is a much safer window.
-        const fromBlock = current - this.lastEventBlock > 10_000n
-          ? current - 10_000n   // cap — older gaps covered by position cache
+        const truncated = current - this.lastEventBlock > 10_000n;
+        const fromBlock = truncated
+          ? current - 10_000n   // cap: ~42 min on Arbitrum (0.25s blocks)
           : this.lastEventBlock;
         logger.info(`Gap-filling ${fromBlock}→${current}…`);
         // Chunked: the previous single unchunked request could span the full
@@ -1455,6 +1467,12 @@ export class PositionTracker {
         if (failedChunks === 0) {
           logger.info(`  Gap-fill: ${total} events`);
           this.lastEventBlock = current;
+          // The cap dropped the oldest part of the gap: those events can never be
+          // replayed, so re-read state instead of trusting it.
+          if (truncated && isReconnect) {
+            logger.warn(`  Gap exceeded ${10_000n} blocks (~42 min) — oldest events unrecoverable`);
+            this.recoverFromUnrecoveredGap();
+          }
         } else {
           // CRITICAL: the watermark used to be set to `current` unconditionally,
           // even when every chunk had been refused. That marked the gap as
@@ -1506,6 +1524,7 @@ export class PositionTracker {
       };
       detach(this.logFilter, this._onLog);
       detach(this.reserveFilter, this._onReserveLog);
+      detach(this.transferFilter, this._onTransferLog);
     }
     this.activeWsProvider = wsProvider;
 
@@ -1534,13 +1553,40 @@ export class PositionTracker {
     // it into the gap-fill getLogs would balloon those result sets for no gain —
     // the periodic registry refresh already resyncs indices after a disconnect.
     this.reserveFilter = { address: AAVE_POOL, topics: [TOPIC_RESERVE_DATA_UPDATED] };
+    this.transferFilter = this.reserves.loaded
+      ? { address: this.reserves.aTokenAddresses(), topics: [TOPIC_BALANCE_TRANSFER] }
+      : null;
     try {
       await wsProvider.on(this.reserveFilter, this._onReserveLog);
       logger.info("Subscribed to ReserveDataUpdated — indices now update without RPC");
     } catch (e: any) {
       logger.warn(`provider.on(ReserveDataUpdated) failed: ${e.message}`);
     }
+    if (this.transferFilter) {
+      try {
+        await wsProvider.on(this.transferFilter, this._onTransferLog);
+        logger.info(`Subscribed to aToken BalanceTransfer (${this.reserves.aTokenAddresses().length} aTokens)`);
+      } catch (e: any) {
+        logger.warn(`provider.on(BalanceTransfer) failed: ${e.message}`);
+      }
+    }
   }
+
+  // aToken.transfer moves collateral between accounts without any Pool event, so
+  // both parties' scaled balances change unseen. Mark them dirty; markUserDirty
+  // ignores addresses that are not modelled.
+  private _onTransferLog = (log: ethers.Log): void => {
+    try {
+      if (log.removed || log.topics.length < 3) return;
+      for (const t of [log.topics[1]!, log.topics[2]!]) {
+        const addr = ethers.getAddress("0x" + t.slice(26)).toLowerCase();
+        if (this.userStates.has(addr)) {
+          this.breakdownCache.delete(addr);
+          this.markUserDirty(addr);
+        }
+      }
+    } catch { /* never throw from a log handler */ }
+  };
 
   // Arrow function so `this` is bound correctly when passed as a listener
   private _onLog = (log: ethers.Log): void => {
@@ -2363,23 +2409,38 @@ export class PositionTracker {
     ceiling: bigint,
     maxResults = 10,
     hypothetical = false,
+    // Oracle price extremes over a window. When given (and the pass is not
+    // hypothetical) candidate selection uses the sorted health-factor index
+    // instead of visiting every holder of the moved assets.
+    extremes?: (asset: string, windowMs: number) => { lo: bigint; hi: bigint } | null,
   ): LocalCandidate[] {
     const out: LocalCandidate[] = [];
     if (assetsLower.size === 0 || !this.reserves.loaded) return out;
 
-    // Candidate borrowers = union of holders of any moved asset.
-    const candidates = new Set<string>();
-    for (const asset of assetsLower) {
-      const holders = this.assetIndex.get(asset);
-      if (!holders) continue;
-      for (const addr of holders) candidates.add(addr);
-    }
-    if (candidates.size === 0) return out;
-
     const nowSec = Math.floor(Date.now() / 1000);
     const nowMs  = Date.now();
+
+    // Candidate borrowers = holders of any moved asset. With the index, only the
+    // ones that CAN have crossed are selected (provably a superset of those the
+    // per-position bound below would keep); the rest are never touched.
+    let candidates: Set<string> | null = null;
+    let indexSkipped = 0;
+    if (extremes && !hypothetical) {
+      const sel = this.indexedCandidates(assetsLower, prices, ceiling, extremes, nowMs);
+      if (sel) { candidates = sel.set; indexSkipped = sel.skipped; }
+    }
+    if (candidates === null) {
+      candidates = new Set<string>();
+      for (const asset of assetsLower) {
+        const holders = this.assetIndex.get(asset);
+        if (!holders) continue;
+        for (const addr of holders) candidates.add(addr);
+      }
+    }
+    if (candidates.size === 0) { this.boundSkipped += indexSkipped; return out; }
+
     const ctxOf  = this.makeReserveCtx(nowSec);
-    let skipped = 0, evaluated_ = 0;
+    let skipped = indexSkipped, evaluated_ = 0;
 
     for (const address of candidates) {
       if (this.badDebtDenylist.has(address)) continue;
@@ -2520,6 +2581,113 @@ export class PositionTracker {
     return out.slice(0, maxResults);
   }
 
+  // ── Sorted health-factor index ─────────────────────────────────────────────
+  // Visiting every holder of a moved asset costs O(holders) per price tick even
+  // when nearly all of them are provably far from 1.0. This index makes selection
+  // O(log n + k):
+  //
+  //   * hfSorted* hold every position with a still-valid cached health factor,
+  //     ordered by that figure.
+  //   * hfVolatile holds every modelled address NOT covered by the index (no
+  //     cache yet, balances changed since, or too old). They are always examined,
+  //     exactly as before.
+  //
+  // For an indexed position the cached figure came from prices inside the last
+  // LOCAL_HF_CACHE_MS. Over that window each asset's price p_snap lies within
+  // [lo, hi] (the oracle keeps the history), so with the CURRENT price p
+  //     p/p_snap  in  [p/hi, p/lo].
+  // The per-position bound HF' >= HF * min(coll ratio)/max(debt ratio) is then
+  // implied by HF' >= HF * F where
+  //     F = min over ALL assets of (p/hi)  /  max over ALL assets of (p/lo)
+  // — a single user-independent factor, never larger than any one position's own.
+  // A position with cachedHF * F * accrual * slack >= ceiling is therefore
+  // skipped by the old bound too, so this selects the same candidates, only
+  // without visiting the others. Anything uncertain falls back to the full scan.
+  private hfSortedAddr: string[]     = [];
+  private hfSortedHf:   Float64Array = new Float64Array(0);
+  private hfVolatile    = new Set<string>();
+  private hfIndexBuiltAt = 0;
+  private hfIndexReady   = false;
+  private hfRebuildQueued = false;
+  private static readonly HF_INDEX_REBUILD_MS = 5_000;
+
+  private rebuildHfIndex(nowMs: number): void {
+    const maxAge = PositionTracker.LOCAL_HF_CACHE_MS - 2 * PositionTracker.HF_INDEX_REBUILD_MS;
+    const rows: Array<[string, number]> = [];
+    const indexed = new Set<string>();
+    for (const [addr, c] of this.localHfCache) {
+      if (c.hf <= 0n || nowMs - c.at > maxAge || !this.userStates.has(addr)) continue;
+      rows.push([addr, Number(c.hf) / 1e18]);
+      indexed.add(addr);
+    }
+    rows.sort((a, b) => a[1] - b[1]);
+    this.hfSortedAddr = rows.map(r => r[0]);
+    this.hfSortedHf   = Float64Array.from(rows, r => r[1]);
+    const vol = new Set<string>();
+    for (const addr of this.userStates.keys()) if (!indexed.has(addr)) vol.add(addr);
+    this.hfVolatile     = vol;
+    this.hfIndexBuiltAt = nowMs;
+    this.hfIndexReady   = true;
+  }
+
+  // Candidate set for a price move, or null to make the caller scan all holders.
+  private indexedCandidates(
+    moved:    Set<string>,
+    prices:   Map<string, bigint>,
+    ceiling:  bigint,
+    extremes: (asset: string, windowMs: number) => { lo: bigint; hi: bigint } | null,
+    nowMs:    number,
+  ): { set: Set<string>; skipped: number } | null {
+    const age = nowMs - this.hfIndexBuiltAt;
+    if (!this.hfIndexReady || age > 2 * PositionTracker.HF_INDEX_REBUILD_MS) {
+      this.rebuildHfIndex(nowMs);                 // first use or long idle: rebuild now
+    } else if (age > PositionTracker.HF_INDEX_REBUILD_MS && !this.hfRebuildQueued) {
+      this.hfRebuildQueued = true;                // keep the O(n) rebuild off the hot path
+      setImmediate(() => { this.hfRebuildQueued = false; this.rebuildHfIndex(Date.now()); });
+    }
+
+    // Global slack factor over every asset that currently has a usable price.
+    const WINDOW = PositionTracker.LOCAL_HF_CACHE_MS + 10_000;
+    let minColl = Infinity, maxDebt = 0;
+    for (const [asset, cur] of prices) {
+      if (cur <= 0n) continue;                    // positions holding it have no HF now
+      const ex = extremes(asset, WINDOW);
+      if (!ex || ex.lo <= 0n || ex.hi <= 0n) return null;   // cannot bound -> full scan
+      const c = Number(cur);
+      const down = c / Number(ex.hi), up = c / Number(ex.lo);
+      if (!Number.isFinite(down) || !Number.isFinite(up)) return null;
+      if (down < minColl) minColl = down;
+      if (up > maxDebt) maxDebt = up;
+    }
+    if (minColl === Infinity || maxDebt === 0) return null;
+
+    // Worst-case accrual over the longest age an indexed entry can have.
+    const accrual = 1 - PositionTracker.LOCAL_HF_DRIFT_PER_SEC * (WINDOW / 1000);
+    const factor  = (minColl / maxDebt) * accrual * PositionTracker.LOCAL_HF_BOUND_SLACK;
+    if (!(factor > 0) || !Number.isFinite(factor)) return null;
+    const thr = (Number(ceiling) / 1e18) / factor;   // examine cached HF below this
+
+    // First index with hf >= thr.
+    const hfs = this.hfSortedHf;
+    let lo = 0, hi = hfs.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (hfs[mid]! < thr) lo = mid + 1; else hi = mid; }
+
+    const holds = (addr: string): boolean => {
+      for (const asset of moved) if (this.assetIndex.get(asset)?.has(addr)) return true;
+      return false;
+    };
+    const set = new Set<string>();
+    for (let i = 0; i < lo; i++) { const a = this.hfSortedAddr[i]!; if (holds(a)) set.add(a); }
+    for (const a of this.hfVolatile) if (holds(a)) set.add(a);
+
+    let holders = 0;
+    for (const asset of moved) holders += this.assetIndex.get(asset)?.size ?? 0;
+    return { set, skipped: Math.max(0, holders - set.size) };
+  }
+
+  /** Test hook: force the index to rebuild now. */
+  rebuildHfIndexForTest(): void { this.rebuildHfIndex(Date.now()); }
+
   // ── Local-HF skip bound ────────────────────────────────────────────────────
   // Cached health factor per address, together with the prices it was computed
   // from. Cleared whenever the model entry changes (setUserState/dropUserState),
@@ -2657,14 +2825,18 @@ export class PositionTracker {
       if (r.usageAsCollateral && r.scaledATokenBalance > 0n) {
         // rayMul, matching _getUserBalanceInBaseCurrency's scaledBalance.rayMul(index).
         const balance = rayMul(r.scaledATokenBalance, c.income);
-        if (balance > 0n) {
+        // GenericLogic skips collateral whose liquidation threshold is 0: it
+        // counts toward neither the collateral total nor the weighted average.
+        // Including it would dilute the average threshold and understate HF.
+        const lt = BigInt(this.reserves.effectiveLiquidationThreshold(c.reserve, state.emodeId));
+        if (balance > 0n && lt !== 0n) {
           const usd8 = (price * balance) / c.unit;
           colUsd8Total += usd8;
           // E-mode aware. A position in a category uses the CATEGORY threshold
           // for assets inside that category's collateral bitmap; assets OUTSIDE
           // it keep their own reserve threshold and still count as collateral
           // (Aave 3.2 "liquid e-mode").
-          ltAccum += usd8 * BigInt(this.reserves.effectiveLiquidationThreshold(c.reserve, state.emodeId));
+          ltAccum += usd8 * lt;
         }
       }
 

@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { ethers } from "ethers";
 import { logger } from "./logger";
-import { CONFIG } from "./config";
+import { CONFIG, AAVE_POOL, AAVE_POOL_ABI } from "./config";
 import { PositionTracker } from "./positions";
 import { AaveOracle } from "./oracle";
 import { Evaluator } from "./evaluator";
@@ -20,7 +20,13 @@ const HF_ONE = 10n ** 18n;
 let shuttingDown = false;
 process.on("SIGINT",  () => { shuttingDown = true; logger.info("Shutting down…"); process.exit(0); });
 process.on("SIGTERM", () => { shuttingDown = true; process.exit(0); });
-process.on("uncaughtException",  e => logger.error(`Uncaught: ${e.message}`, e));
+// An uncaught exception leaves nonce, reconnect and cache state in an unknown
+// condition; carrying on would trade with it. Log, flush, exit non-zero and let
+// the supervisor (pm2/systemd/docker restart policy) bring up a clean process.
+process.on("uncaughtException", e => {
+  logger.error(`Uncaught exception — exiting for a clean restart: ${e.message}`, e);
+  setTimeout(() => process.exit(1), 500);
+});
 process.on("unhandledRejection", r => logger.error(`Rejection: ${r}`));
 
 async function main(): Promise<void> {
@@ -60,7 +66,7 @@ async function main(): Promise<void> {
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let providerGeneration = 0;   // incremented on every reconnect; stale cycles self-abort
 
-  let cycles = 0, liquidatable = 0, executed = 0, totalProfitUsd = 0;
+  let cycles = 0, liquidatable = 0;
   let lastCycleBlockMs = Date.now();  // Opt #25: watchdog timestamp
   let lastCycleStartMs = 0;           // throttle reference — see requestCycle
   let cycleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -182,7 +188,9 @@ async function main(): Promise<void> {
       : "";
     logger.info(
       `📊 uptime=${upMin}m | cycles=${cycles} | liquidatable=${liquidatable} | ` +
-      `executed=${executed} | profit=$${totalProfitUsd.toFixed(2)} | ` +
+      `landed=${executor?.results.confirmed ?? 0} reverted=${executor?.results.reverted ?? 0} ` +
+      `timeout=${executor?.results.timedOut ?? 0} | profit=$${(executor?.results.realizedProfitUsd ?? 0).toFixed(2)} ` +
+      `gas=${(executor?.results.gasSpentEth ?? 0).toFixed(5)}ETH | ` +
       `watching=${tracker?.size ?? 0} dormant=${tracker?.dormantSize ?? 0}` +
       (cov ? ` model=${cov.modelled}/${cov.total}` : "") +
       dangerStr + rpcStr + boundStr + trigStr +
@@ -207,7 +215,10 @@ async function main(): Promise<void> {
 
   function createProvider(): ethers.WebSocketProvider {
     const wsUrl = CONFIG.RPC_WS;
-    logger.info(`WS connecting: ${wsUrl.replace(/:[^:@]+@/, ":***@")}`);
+    // Provider keys usually sit in the URL path, so log the host only.
+    let wsHost = "(unparseable url)";
+    try { wsHost = new URL(wsUrl).host; } catch { /* keep placeholder */ }
+    logger.info(`WS connecting: ${wsHost}`);
 
     const p = new ethers.WebSocketProvider(wsUrl, undefined, { staticNetwork: true });
 
@@ -694,8 +705,6 @@ async function main(): Promise<void> {
         // and to avoid redundant getFeeData call (Opt #21).
         executor.execute(opp, bn, feeData).then(receipt => {
           if (receipt?.status === 1) {
-            executed++;
-            totalProfitUsd += opp.netProfitUsd;
             logger.info(`  ✅ ${receipt.hash}`);
             lastEvaluatedHF.delete(pos.address);
           } else if (receipt) {
@@ -783,23 +792,9 @@ async function main(): Promise<void> {
   const ethBal = await httpProvider.getBalance(wallet.address); // FIX: reuse existing provider, don't leak a new one
   logger.info(`Wallet: ${wallet.address} | ETH: ${ethers.formatEther(ethBal)}`);
 
-  // No balance threshold is checked here, deliberately.
-  //
-  // Every version of this warning has been wrong about Arbitrum. The original
-  // used 0.05/0.02 ETH — figures borrowed from mainnet, where they are sane and
-  // here are roughly $125/$50 for a transaction that costs two or three cents.
-  // It was then replaced with gasLimit × CONFIG.maxGasGwei, which is worse in a
-  // subtler way: maxGasGwei is the 2 gwei SANITY CAP used to reject bogus
-  // L1-style estimates (see sanitizeGasPrice), not a fee anyone actually pays.
-  // Arbitrum runs at 0.01-0.1 gwei, so that priced the floor 20-200x too high
-  // and declared a perfectly fundable wallet unable to execute.
-  //
-  // Any constant here is a guess about a number the executor already knows
-  // exactly. Executor._executeOne reserves gasLimit × the LIVE maxFeePerGas for
-  // each in-flight transaction and refuses to submit when the balance cannot
-  // cover it, logging the real requirement and the real balance at error level.
-  // That check runs at submission time with actual values, so it cannot be
-  // miscalibrated — and it is the only place the answer matters.
+  // No balance threshold is checked here: any constant would be a guess about a
+  // number the node already enforces when it validates a transaction. The only
+  // case worth flagging is a completely empty wallet.
   if (ethBal === 0n) {
     logger.warn("Wallet holds no ETH — the executor will refuse every submission until it is funded.");
   }
@@ -823,6 +818,22 @@ async function main(): Promise<void> {
   // httpProvider doubles as a broadcast + receipt-polling endpoint so a WS
   // reconnect can't strand an in-flight liquidation.
   executor  = new Executor(wallet, CONFIG.contractAddress, httpProvider);
+  executor.setPriceSource(a => oracle.peekPrice(a));
+  // Raise the profit floor as the recent revert rate climbs.
+  evaluator.setMinProfitSource(() => executor.effectiveMinProfitUsd());
+
+  // The flashloan premium is governance-set; read it instead of trusting the
+  // default. A read failure keeps the configured value.
+  try {
+    const pool = new ethers.Contract(AAVE_POOL, AAVE_POOL_ABI, httpProvider);
+    const premium = Number(await pool.FLASHLOAN_PREMIUM_TOTAL());
+    if (Number.isFinite(premium) && premium >= 0 && premium !== CONFIG.flashloanPremiumBps) {
+      logger.warn(`Flashloan premium on-chain is ${premium} bps (configured ${CONFIG.flashloanPremiumBps}) — using on-chain value`);
+      CONFIG.flashloanPremiumBps = premium;
+    }
+  } catch (e: any) {
+    logger.warn(`Could not read FLASHLOAN_PREMIUM_TOTAL, keeping ${CONFIG.flashloanPremiumBps} bps: ${e?.message ?? e}`);
+  }
 
   // Competitor-liquidation awareness: when someone else's LiquidationCall is
   // seen for a tracked borrower, mark it so the executor skips accurately.
@@ -932,6 +943,14 @@ async function main(): Promise<void> {
     } catch { /* silent — cycle will fetch its own prices if cache is stale */ }
   }, BG_PRICE_INTERVAL_MS);
 
+  // Idle liquidity per reserve: what a liquidation can actually withdraw. One
+  // multicall; the evaluator sizes seizures against it.
+  const LIQUIDITY_REFRESH_MS = 10_000;
+  reserveRegistry.refreshLiquidity().catch(e => logger.debug(`Liquidity refresh: ${e?.message ?? e}`));
+  setInterval(() => {
+    if (!shuttingDown) reserveRegistry.refreshLiquidity().catch(e => logger.debug(`Liquidity refresh: ${e?.message ?? e}`));
+  }, LIQUIDITY_REFRESH_MS);
+
   // Reserve registry refresh — indices are kept current for free by the
   // ReserveDataUpdated subscription below; this periodic full refresh picks up
   // governance changes to thresholds/bonuses and resyncs any missed index.
@@ -1011,6 +1030,8 @@ async function main(): Promise<void> {
       wallet,
       getReadProvider,
       canBid: () => ready && !pruning && !reconnecting && !shuttingDown,
+      // Keep the public executor off borrowers an SVR bid is already covering.
+      onBid: (borrower: string) => executor.noteSvrBid(borrower),
     });
     await svr.start().catch(e => {
       logger.error(`SVR bidder start failed: ${e?.message ?? e}`);

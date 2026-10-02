@@ -191,6 +191,13 @@ const ROUTE_TTL_MS                  = 10 * 60_000; // routes older than this are
 const ROUTE_FORCE_BACKOFF_MS        = 15_000;      // min gap between forced refreshes of one uncached pair
 const MAX_CONCURRENT_REFRESHES      = 2;           // background quote fan-outs in flight at once
 
+// Count hops in an encoded path: 20-byte token + (3-byte fee + 20-byte token) * N.
+export function hopsFromPath(swapPath: string | undefined): number {
+  if (!swapPath || swapPath === "0x") return 0;
+  const bytes = (swapPath.length - 2) / 2;
+  return Math.max(1, Math.round((bytes - 20) / 23));
+}
+
 function pairKey(tokenIn: string, tokenOut: string): string {
   return `${tokenIn.toLowerCase()}->${tokenOut.toLowerCase()}`;
 }
@@ -235,16 +242,20 @@ export function scheduleRouteRefresh(
   amountHint: bigint,
   provider:  ethers.Provider,
   force = false,
+  // The cached quote was taken at a much smaller size than needed: refresh even
+  // though it is recent (still bounded by the per-minute throttle below).
+  undersized = false,
 ): void {
   const key = pairKey(tokenIn, tokenOut);
   const now = Date.now();
 
   const cached = routeCache.get(key);
-  if (!force && cached && now - cached.ts < ROUTE_REFRESH_MIN_INTERVAL_MS) return;
+  if (!force && cached && now - cached.ts < ROUTE_REFRESH_MIN_INTERVAL_MS && !(undersized && amountHint > cached.amountIn * 2n)) return;
   // force skips the per-minute throttle but not a short backoff: a pair whose
   // quote just failed (shed by the limiter) must not be re-fanned-out every eval.
   const sinceLast = now - (lastRefreshAttempt.get(key) ?? 0);
   if (!cached && sinceLast < (force ? ROUTE_FORCE_BACKOFF_MS : ROUTE_REFRESH_MIN_INTERVAL_MS)) return;
+  if (cached && undersized && sinceLast < ROUTE_REFRESH_MIN_INTERVAL_MS) return;
 
   const inflight = inflightRefreshes.get(key);
   if (inflight) return;

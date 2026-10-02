@@ -1,7 +1,7 @@
 {
   "name": "aave-liquidation-bot",
   "version": "1.0.0",
-  "description": "Aave V3 liquidation bot — monitors positions, executes via flashloan + Uniswap V3",
+  "description": "Aave V3 liquidation bot \u00e2\u20ac\u201d monitors positions, executes via flashloan + Uniswap V3",
   "scripts": {
     "dev": "tsx src/index.ts",
     "diagnose": "tsx src/diagnose.ts",
@@ -14,7 +14,8 @@
     "svr-plumbing": "tsx src/svrPlumbingCheck.ts",
     "sizing-check": "tsx src/sizingCheck.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "@types/ws": "^8.18.1",

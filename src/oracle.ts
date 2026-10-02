@@ -21,6 +21,20 @@ const CACHE_TTL = 15_000;
 interface PriceEntry { price: bigint; ts: number; estimated?: boolean; block?: number }
 const priceCache   = new Map<string, PriceEntry>();
 
+// Every price the cache has held, newest last, for the last HIST_KEEP_MS. Lets a
+// caller bound how far a price can have been from "now" at any earlier moment in
+// a window (see priceExtremes) — the basis of the trigger's candidate index.
+const priceHist = new Map<string, Array<{ ts: number; price: bigint }>>();
+const HIST_KEEP_MS = 12 * 60_000;
+function recordHist(key: string, price: bigint, ts: number): void {
+  if (price <= 0n) return;
+  let h = priceHist.get(key);
+  if (!h) { h = []; priceHist.set(key, h); }
+  const last = h[h.length - 1];
+  if (!last || last.price !== price) h.push({ ts, price });
+  while (h.length > 1 && h[1]!.ts < ts - HIST_KEEP_MS) h.shift();
+}
+
 // Returns true when the entry was stored.
 function putPrice(key: string, e: PriceEntry): boolean {
   const cur = priceCache.get(key);
@@ -34,6 +48,7 @@ function putPrice(key: string, e: PriceEntry): boolean {
     }
   }
   priceCache.set(key, e);
+  recordHist(key, e.price, e.ts);
   return true;
 }
 
@@ -356,6 +371,37 @@ export class AaveOracle {
   /** True when the cached price for this asset was inferred, not read on-chain. */
   isEstimated(tokenAddress: string): boolean {
     return priceCache.get(tokenAddress.toLowerCase())?.estimated === true;
+  }
+
+  /**
+   * Lowest and highest price this asset has held at any point in the last
+   * `windowMs`, including the price in force when the window opened. Null when
+   * there is no history.
+   */
+  priceExtremes(tokenAddress: string, windowMs: number): { lo: bigint; hi: bigint } | null {
+    const h = priceHist.get(tokenAddress.toLowerCase());
+    if (!h || h.length === 0) return null;
+    const cutoff = Date.now() - windowMs;
+    let lo = h[h.length - 1]!.price, hi = lo;
+    for (let i = h.length - 1; i >= 0; i--) {
+      const p = h[i]!.price;
+      if (p < lo) lo = p;
+      if (p > hi) hi = p;
+      if (h[i]!.ts < cutoff) break;   // this sample was in force at the window start
+    }
+    return { lo, hi };
+  }
+
+  /** Age in ms of the OLDEST cached price among these assets (Infinity if any is missing). */
+  maxAgeMs(addresses: Iterable<string>): number {
+    const now = Date.now();
+    let oldest = 0;
+    for (const a of addresses) {
+      const c = priceCache.get(a.toLowerCase());
+      if (!c) return Infinity;
+      oldest = Math.max(oldest, now - c.ts);
+    }
+    return oldest;
   }
 
   /** True if ANY of these assets is currently priced from an estimate. */

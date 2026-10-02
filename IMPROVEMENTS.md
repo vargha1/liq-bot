@@ -1,3 +1,7 @@
+> **Status:** historical plan. The watchlist now keeps every known borrower in a
+> dormant tier that the in-memory model evaluates directly; the active-set
+> threshold is `HF_WATCH` = 1.09 in `src/positions.ts`, not the 1.30 proposed below.
+
 # Bot Improvement Plan
 
 ## Problem 1: HF_WATCH threshold too aggressive (MOST IMPACTFUL)

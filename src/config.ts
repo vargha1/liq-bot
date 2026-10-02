@@ -3,17 +3,32 @@ dotenv.config();
 
 function req(k: string): string { const v = process.env[k]; if (!v) throw new Error(`Missing env var: ${k}`); return v; }
 function opt(k: string, d: string): string { return process.env[k] ?? d; }
+// Numeric env vars are validated at load: a typo such as MIN_PROFIT_USD=abc used
+// to become NaN, and every `x >= NaN` comparison is false, so the bot silently
+// never fired. Fail fast instead.
+function int(k: string, d: string): number {
+  const raw = opt(k, d).trim();
+  const v = Number(raw);
+  if (raw === "" || !Number.isInteger(v)) throw new Error(`Invalid integer for ${k}: "${raw}"`);
+  return v;
+}
+function num(k: string, d: string): number {
+  const raw = opt(k, d).trim();
+  const v = Number(raw);
+  if (raw === "" || !Number.isFinite(v)) throw new Error(`Invalid number for ${k}: "${raw}"`);
+  return v;
+}
 
 export const CONFIG = {
   rpcUrl:            req("RPC_URL"),
   privateKey:        req("PRIVATE_KEY"),
   contractAddress:   req("CONTRACT_ADDRESS"),
-  minProfitUsd:      parseFloat(opt("MIN_PROFIT_USD",      "0.07")),  // lowered from $0.50 — on Arbitrum gas is cheap
+  minProfitUsd:      num("MIN_PROFIT_USD", "0.07"),  // lowered from $0.50 — on Arbitrum gas is cheap
   // Lowered from 1000: each multicall sub-chunk costs a full RPC round-trip
   // (~0.3-3s depending on provider) and the whole cycle serializes behind it.
   // Detection latency now comes from event-driven triggers + price-drop wakes;
   // the sweep is just a safety net, so a smaller targeted batch wins.
-  positionsPerCycle: parseInt(opt("POSITIONS_PER_CYCLE",   "300"),  10),
+  positionsPerCycle: int("POSITIONS_PER_CYCLE", "300"),
   // Multicall3 sub-chunk size for refreshBatch's getUserAccountData scan. Was
   // hardcoded at 300 — fine on providers with a generous eth_call gas cap, but
   // some shared/free-tier RPC nodes reject large batched multicalls outright
@@ -30,7 +45,7 @@ export const CONFIG = {
   // sweep is now 2 calls. 150 × ~200k gas ≈ 30M gas per eth_call, comfortably
   // under the 300 this file's own refreshBatch comment calls safe. Drop back to
   // 50 if your provider returns "missing revert data" on the larger request.
-  mcSubchunk:        parseInt(opt("MC_SUBCHUNK",            "150"),  10),
+  mcSubchunk:        int("MC_SUBCHUNK", "150"),
   // Global cap on NEW eth_call requests started per second on the shared
   // provider (see rpcLimiter.ts). Restricted RPC plans typically enforce a
   // requests-per-second ceiling, not a concurrency ceiling — a concurrency cap
@@ -39,7 +54,7 @@ export const CONFIG = {
   // Default of 4 matches the pace the startup prune sustains successfully
   // (8-wide waves resolving in ~2.1s ≈ ~4 req/s). Lower further (2-3) if
   // "missing revert data" errors persist; raise if your provider tolerates more.
-  rpcCallsPerSecond: parseInt(opt("RPC_CALLS_PER_SECOND",   "4"),    10),
+  rpcCallsPerSecond: int("RPC_CALLS_PER_SECOND", "4"),
   // Hard ceiling on how long a queued eth_call may wait for its rate-limit slot.
   // Past this the call is rejected immediately instead of being queued (see
   // rpcLimiter.ts). This is what makes the limiter self-correcting: without a
@@ -47,12 +62,12 @@ export const CONFIG = {
   // refreshBatch wait 300707 ms, five minutes, for data that goes stale in one
   // block. Anything above a few seconds is already useless to a liquidation
   // bot, so shedding is strictly better than waiting.
-  rpcMaxQueueMs:     parseInt(opt("RPC_MAX_QUEUE_MS",       "5000"), 10),
+  rpcMaxQueueMs:     int("RPC_MAX_QUEUE_MS", "5000"),
   // Skip a polling sweep when the limiter backlog is already deeper than this.
   // The sweep is a safety net; the event-driven trigger is the detection path
   // that matters, and it needs call budget to confirm prices. Letting the sweep
   // queue behind its own backlog starves exactly the wrong thing.
-  cycleSkipQueueMs:  parseInt(opt("CYCLE_SKIP_QUEUE_MS",    "2500"), 10),
+  cycleSkipQueueMs:  int("CYCLE_SKIP_QUEUE_MS", "2500"),
   // Prune performance: the bottleneck is number of waves, not concurrency.
   // Each multicall round-trip takes ~2.9s regardless of concurrent count.
   // getUserAccountData is gas-heavy (iterates all Aave reserves internally).
@@ -60,8 +75,8 @@ export const CONFIG = {
   //   chunk=500, conc=8 → 36 waves → ~1.5 min   (safe default)
   //   chunk=700, conc=8 → 26 waves → ~1.1 min   (risky on some providers)
   //   chunk=1500 causes CALL_EXCEPTION on every chunk → 0 pruned
-  pruneChunk:        parseInt(opt("PRUNE_CHUNK",           "500"),  10),  // addresses per multicall during prune
-  pruneConcurrency:  parseInt(opt("PRUNE_CONCURRENCY",     "8"),    10),  // parallel waves during prune
+  pruneChunk:        int("PRUNE_CHUNK", "500"),  // addresses per multicall during prune
+  pruneConcurrency:  int("PRUNE_CONCURRENCY", "8"),  // parallel waves during prune
   // Max danger-tier positions whose breakdown is pre-warmed per sweep.
   //
   // This is coupled to RPC_CALLS_PER_SECOND and it is easy to starve the bot
@@ -76,7 +91,7 @@ export const CONFIG = {
   // the default below assumes you raise rpcCallsPerSecond once you know what
   // your Chainstack plan tolerates. Coverage matters — the trigger engine can
   // only fire on positions whose breakdown is cached — so raise BOTH together.
-  prewarmMax:        parseInt(opt("PREWARM_MAX",            "40"),   10),
+  prewarmMax:        int("PREWARM_MAX", "40"),
   // Minimum gap between polling sweeps, in milliseconds.
   //
   // Arbitrum produces a block every ~250ms and the cycle used to fire on every
@@ -90,7 +105,7 @@ export const CONFIG = {
   // need not run every block. Detection latency is unaffected: the trigger
   // fires on Chainlink events independently of this interval. Set to 0 to
   // restore the old every-block behaviour.
-  cycleMinIntervalMs: parseInt(opt("CYCLE_MIN_INTERVAL_MS", "1000"), 10),
+  cycleMinIntervalMs: int("CYCLE_MIN_INTERVAL_MS", "1000"),
   // Run the polling sweep at all. Set false for trigger-only operation.
   //
   // The sweep is the dominant RPC cost by a wide margin and almost all of it is
@@ -124,17 +139,26 @@ export const CONFIG = {
   // confidence. This is that safety net: one multicall per tick, feeding the
   // same arith-err distribution the sweep used to. At the defaults it is ~0.7
   // reads/sec against the sweep's ~300. Set 0 to disable (not recommended).
-  modelAuditPositions:  parseInt(opt("MODEL_AUDIT_POSITIONS", "20"), 10),
-  modelAuditIntervalMs: parseInt(opt("MODEL_AUDIT_INTERVAL_MS", "30000"), 10),
+  modelAuditPositions:  int("MODEL_AUDIT_POSITIONS", "20"),
+  modelAuditIntervalMs: int("MODEL_AUDIT_INTERVAL_MS", "30000"),
   // Head-room added to the estimated gas units. Arbitrum refunds unused L2 gas,
   // but the node reserves gasLimit × maxFeePerGas from the wallet balance when
   // validating a transaction — so an oversized buffer starves concurrent
   // submissions on a thin balance. 400k is ample over the measured estimates.
-  gasLimitBuffer:    parseInt(opt("GAS_LIMIT_BUFFER",      "400000"), 10),
-  maxGasGwei:        parseFloat(opt("MAX_GAS_GWEI",        "2")),
+  gasLimitBuffer:    int("GAS_LIMIT_BUFFER", "300000"),
+  // Multiplier (percent) applied to the estimated gas units before the buffer.
+  gasLimitMarginPct: int("GAS_LIMIT_MARGIN_PCT", "125"),
+  // Share (bps) of the expected swap profit the on-chain swap floor must keep,
+  // on top of break-even. 0 = floor at break-even only (fully sandwichable).
+  swapFloorProfitShareBps: int("SWAP_FLOOR_PROFIT_SHARE_BPS", "3000"),
+  // Prices older than this are not trusted for a blind fire (ms).
+  maxPriceAgeMs:     int("MAX_PRICE_AGE_MS", "60000"),
+  // Wait for a receipt this long before treating a tx as dropped (ms).
+  receiptTimeoutMs:  int("RECEIPT_TIMEOUT_MS", "45000"),
+  maxGasGwei:        num("MAX_GAS_GWEI", "2"),
   // Haircut (bps) on the estimated swap output in the profit decision. NOT the
   // on-chain floor — that is the break-even output; see Evaluator.finalize.
-  slippageBps:       parseInt(opt("SLIPPAGE_BPS",          "30"), 10),
+  slippageBps:       int("SLIPPAGE_BPS", "30"),
   // OPT 1: Separate RPC for tx submission — can be a lower-latency endpoint.
   // If not set, falls back to the main RPC_URL. On Arbitrum, Timeboost express
   // lane is dominated by Selini/Wintermute (~90% of rounds per empirical research).
@@ -154,27 +178,27 @@ export const CONFIG = {
   // while this comment did not). Ordering is decided by arrival time and, above
   // that, by Timeboost's express lane — which is auctioned, not tipped for.
   // The tip is kept because it is harmless and costs almost nothing on L2.
-  timeboostPriorityGwei: parseFloat(opt("TIMEBOOST_PRIORITY_GWEI", "0.1")),
+  timeboostPriorityGwei: num("TIMEBOOST_PRIORITY_GWEI", "0.1"),
   // OPT 3: Max concurrent liquidation executions in the parallel queue.
-  maxConcurrentExecutions: parseInt(opt("MAX_CONCURRENT_EXECUTIONS", "3"), 10),
+  maxConcurrentExecutions: int("MAX_CONCURRENT_EXECUTIONS", "3"),
   // OPT 4 (retired): hot-path Uniswap quotes were removed — amountOutMinimum is
   // now derived from Aave oracle prices and routes come from a background cache.
   // Key kept for env compat; no longer read on the hot path.
-  minDebtForQuoteUsd: parseFloat(opt("MIN_DEBT_FOR_QUOTE_USD", "50")),
+  minDebtForQuoteUsd: num("MIN_DEBT_FOR_QUOTE_USD", "50"),
   // FIX: deadline passed to liquidate() to prevent stale txs executing at wrong prices.
   // 20 seconds is ample on Arbitrum (inclusion is ~1-2 blocks when submitted
   // promptly); a tight deadline kills stale txs fast instead of letting them
   // execute into post-competition state. Calibrated against chain clock skew —
   // see executor.ts clock calibration.
-  deadlineSecs: parseInt(opt("DEADLINE_SECS", "20"), 10),
+  deadlineSecs: int("DEADLINE_SECS", "20"),
   logLevel:          opt("LOG_LEVEL", "info"),
   RPC_WS:            req("RPC_WS"),
   thegraphApiKey:    opt("THEGRAPH_API_KEY", ""),
   // pollIntervalMs kept for diagnose.ts compatibility (not used in main WS loop)
-  pollIntervalMs:    parseInt(opt("POLL_INTERVAL_MS",      "3000"), 10),
+  pollIntervalMs:    int("POLL_INTERVAL_MS", "3000"),
   // Bug #4 fix: flashloan premium is governance-configurable — was hardcoded to 0.05% (5 bps).
   // If Aave changes the premium, update this env var or the default below.
-  flashloanPremiumBps: parseInt(opt("FLASHLOAN_PREMIUM_BPS", "5"), 10),  // 5 = 0.05%
+  flashloanPremiumBps: int("FLASHLOAN_PREMIUM_BPS", "5"),  // 5 = 0.05%
   // Event-driven trigger engine: subscribes to Chainlink AnswerUpdated events for
   // all reserve feeds and fires liquidations on local HF recomputation, without
   // waiting for the polling cycle. Disable with TRIGGER_ENABLED=false.
@@ -202,7 +226,7 @@ export const CONFIG = {
   // The decision now comes from ModelErrorTracker's measured distribution plus
   // the opportunity's own economics (see TriggerEngine.shouldFireBlind). This
   // value only applies before minSamples confirmations have accumulated.
-  triggerConfirmHf:     parseFloat(opt("TRIGGER_CONFIRM_HF", "0.995")),
+  triggerConfirmHf:     num("TRIGGER_CONFIRM_HF", "0.995"),
   // Health factor up to which the trigger will CONSIDER a position, as opposed to
   // fire on one. Must be >= 1.0.
   //
@@ -222,7 +246,7 @@ export const CONFIG = {
   //
   // Set to 1.0 to restore the old behaviour. Sized against the measured
   // p99.9 of ~11.7 bps.
-  triggerScanCeiling:   parseFloat(opt("TRIGGER_SCAN_CEILING", "1.0015")),
+  triggerScanCeiling:   num("TRIGGER_SCAN_CEILING", "1.0015"),
   // Require an authoritative price before firing without confirmation.
   //
   // The trigger estimates Aave prices from Chainlink answer ratios so it can act
@@ -238,10 +262,15 @@ export const CONFIG = {
   // authoritative read within about a second, so only the first tick after a feed
   // moves pays the confirmation; the rest of the fast path is unaffected.
   triggerRequireConfirmedPrice: opt("TRIGGER_REQUIRE_CONFIRMED_PRICE", "true") !== "false",
+  // A price estimated from a DIRECT Chainlink feed (the Aave source is the feed's
+  // own proxy, no CAPO adapter) whose last authoritative read equalled the raw
+  // answer is exact: Aave returns the answer unchanged. Such estimates need no
+  // confirmation round-trip. CAPO-wrapped assets (LSTs, stables) still do.
+  triggerExactDirectFeeds: opt("TRIGGER_EXACT_DIRECT_FEEDS", "true") !== "false",
   // Absolute rail: never fire without confirmation above this local health
   // factor, whatever the measured distribution says. Guards against a
   // degenerate sample window authorising a fire arbitrarily close to 1.0.
-  triggerBlindMaxHf:    parseFloat(opt("TRIGGER_BLIND_MAX_HF", "0.999")),
+  triggerBlindMaxHf:    num("TRIGGER_BLIND_MAX_HF", "0.999"),
   // Probability that a dispatch confirms one near-threshold position against the
   // chain purely to record an error sample.
   //
@@ -251,13 +280,13 @@ export const CONFIG = {
   // sample in thirteen hours and the decision stayed pinned to the fallback
   // constant. At 0.25 the distribution becomes usable inside an hour, for well
   // under one extra multicall per minute.
-  triggerAuditRate:     parseFloat(opt("TRIGGER_AUDIT_RATE", "0.25")),
+  triggerAuditRate:     num("TRIGGER_AUDIT_RATE", "0.25"),
   // Dedicated HTTP endpoint for the trigger's hot-path reads (price confirmation,
   // health-factor confirmation). It gets its OWN rate limiter instead of sharing
   // the background budget, so model fill, prefetch and audits can never queue
   // ahead of — or shed — the calls that gate a fire. Defaults to RPC_URL.
   hotRpcUrl:            opt("HOT_RPC_URL", ""),
-  hotRpcCallsPerSecond: parseInt(opt("HOT_RPC_CALLS_PER_SECOND", "20"), 10),
+  hotRpcCallsPerSecond: int("HOT_RPC_CALLS_PER_SECOND", "20"),
 
   // ── Chainlink SVR / Atlas bidding ──────────────────────────────────────────
   // Aave's Arbitrum oracle reads SVR feeds, whose price updates are sold to the
@@ -275,37 +304,37 @@ export const CONFIG = {
   // Share of the estimated net profit offered as the bid. The winner is whoever
   // bids most, so this is the whole competitive lever: higher wins more auctions
   // and keeps less of each. Observed winning bids sit very close to break-even.
-  svrBidFraction:     parseFloat(opt("SVR_BID_FRACTION", "0.90")),
+  svrBidFraction:     num("SVR_BID_FRACTION", "0.90"),
   // Skip an auction unless the profit left after the bid clears this, in USD.
-  svrMinNetUsd:       parseFloat(opt("SVR_MIN_NET_USD", "0.05")),
+  svrMinNetUsd:       num("SVR_MIN_NET_USD", "0.05"),
   // Upper bound on the gas limit signed into a solver operation (the bot signs
   // for what the chosen liquidations need, never more). Atlas sizes the required
   // bond from the limit plus the oracle update's own gas, so a tight cap keeps
   // the bond small. One liquidation costs about 0.85M gas, so 2.0M fits two. The
   // DappControl's own ceiling is 6,000,000.
-  svrSolverGas:       BigInt(opt("SVR_SOLVER_GAS", "2000000")),
+  svrSolverGas:       BigInt(int("SVR_SOLVER_GAS", "2000000")),
   // Liquidations bundled into one operation, most profitable first.
-  svrMaxItems:        parseInt(opt("SVR_MAX_ITEMS", "3"), 10),
+  svrMaxItems:        int("SVR_MAX_ITEMS", "3"),
   // Health factor up to which a position is included as a BONUS item. Items below
   // 1.0 are the ones the bid is sized on; ones in [1.0, ceiling) ride along and
   // are skipped on-chain if they turn out not to be liquidatable. Operations that
   // fail the gateway's simulation never land on-chain, so over-including is free.
-  svrScanCeiling:     parseFloat(opt("SVR_SCAN_CEILING", "1.002")),
+  svrScanCeiling:     num("SVR_SCAN_CEILING", "1.002"),
   // Estimated gas beyond the three limits Atlas counts: metacall bookkeeping and
   // calldata. Only used to size the bond check.
-  svrOverheadGas:     BigInt(opt("SVR_OVERHEAD_GAS", "700000")),
+  svrOverheadGas:     BigInt(int("SVR_OVERHEAD_GAS", "700000")),
   // Flat allowance, in USD, for the L1 data fee Atlas bills on the operation.
-  svrExtraCostUsd:    parseFloat(opt("SVR_EXTRA_COST_USD", "0.03")),
+  svrExtraCostUsd:    num("SVR_EXTRA_COST_USD", "0.03"),
   // An announced answer further than this (percent) from the last one seen is
   // treated as a model fault, not a market move, and never bid on. Routine
   // updates are a fraction of a percent; a bid sized on a 10%+ jump that is not
   // real costs the bond and wastes the auction.
-  svrMaxMovePct:      parseFloat(opt("SVR_MAX_MOVE_PCT", "10")),
+  svrMaxMovePct:      num("SVR_MAX_MOVE_PCT", "10"),
   // Before bidding, each borrower's health factor is read from the chain and
   // compared with the model's at the same prices. A larger relative difference
   // means the model's picture of that borrower is stale or wrong.
-  svrVerifyTolerance: parseFloat(opt("SVR_VERIFY_TOLERANCE", "0.005")),
-} as const;
+  svrVerifyTolerance: num("SVR_VERIFY_TOLERANCE", "0.005"),
+};
 
 // ─── Aave V3 Arbitrum core addresses ─────────────────────────────────────────
 // All addresses are EIP-55 checksummed. ethers v6 validates checksums on every
@@ -543,6 +572,14 @@ export const AAVE_POOL_ABI = [
   // off was invisible until something else touched their position.
   "event ReserveUsedAsCollateralEnabled(address indexed reserve, address indexed user)",
   "event ReserveUsedAsCollateralDisabled(address indexed reserve, address indexed user)",
+  // Switching e-mode changes thresholds without moving a balance.
+  "event UserEModeSet(address indexed user, uint8 categoryId)",
+  "function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128)",
+];
+
+// aToken transfers move collateral between accounts WITHOUT any Pool event.
+export const ATOKEN_ABI = [
+  "event BalanceTransfer(address indexed from, address indexed to, uint256 value, uint256 index)",
 ];
 
 export const DATA_PROVIDER_ABI = [
