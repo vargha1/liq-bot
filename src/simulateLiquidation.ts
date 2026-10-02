@@ -42,6 +42,13 @@ function check(name: string, ok: boolean, detail = ""): void {
 const constWord = (w: bigint) => "0x7f" + w.toString(16).padStart(64, "0") + "6000526020" + "6000" + "f3";
 
 let rpcUrl = "";
+const chainOf = async (url: string): Promise<bigint | null> => {
+  const r: any = await fetch(url, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
+  }).then(x => x.json()).catch(() => null);
+  return r?.result ? BigInt(r.result) : null;
+};
 async function rpc(method: string, params: unknown[]): Promise<any> {
   let lastErr = "";
   for (const url of RPCS) {
@@ -106,6 +113,17 @@ async function findBorrower(): Promise<string> {
 }
 
 async function main(): Promise<void> {
+  // Keep only endpoints that really serve this chain: RPC_URL often still points at
+  // the chain the .env was first written for.
+  const usable: string[] = [];
+  for (const url of RPCS) {
+    const id = await chainOf(url);
+    if (id === BigInt(PROFILE.chainId)) usable.push(url);
+    else if (id !== null) console.log(`skipping ${url.split("/")[2]}: serves chain ${id}, need ${PROFILE.chainId}`);
+  }
+  if (usable.length === 0) throw new Error(`no RPC serving ${PROFILE.name} (chain ${PROFILE.chainId}) is reachable - set SIM_RPC`);
+  RPCS.length = 0; RPCS.push(...usable);
+
   const borrower = process.argv[2] ?? await findBorrower();
   console.log(`Chain ${PROFILE.name} | borrower ${borrower} | rpc ${rpcUrl.split("/")[2]}`);
 

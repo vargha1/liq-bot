@@ -49,9 +49,13 @@ async function main(): Promise<void> {
   if (!rpc || !pk) die("Set RPC_URL and PRIVATE_KEY in the environment or .env");
 
   const provider = new ethers.JsonRpcProvider(rpc, PROFILE.chainId, { staticNetwork: true });
-  const net = await provider.getNetwork();
-  if (net.chainId !== BigInt(PROFILE.chainId)) {
-    die(`RPC reports chain ${net.chainId} but CHAIN=${PROFILE.key} expects ${PROFILE.chainId}`);
+  // Ask the node itself. With a pinned network, provider.getNetwork() just echoes the
+  // value passed to the constructor and never contacts the RPC, so it cannot catch an
+  // RPC_URL that still points at another chain (the usual mistake when a second
+  // chain is added to an existing .env).
+  const reported = BigInt(await provider.send("eth_chainId", []));
+  if (reported !== BigInt(PROFILE.chainId)) {
+    die(`RPC_URL serves chain ${reported}, but CHAIN=${PROFILE.key} needs chain ${PROFILE.chainId} (${PROFILE.name}). Point RPC_URL at a ${PROFILE.name} endpoint.`);
   }
   const wallet = new ethers.Wallet(pk, provider);
 
@@ -81,12 +85,14 @@ async function main(): Promise<void> {
   console.log(`Swap router       ${router}`);
   console.log(`Gas estimate      ${gas} (~${ethers.formatEther(cost)} ${PROFILE.nativeSymbol} at ${Number(gasPrice) / 1e9} gwei, L1 data fee extra)`);
   console.log(`Balance           ${ethers.formatEther(bal)} ${PROFILE.nativeSymbol}`);
-  if (bal < cost) die("Balance below the estimated deployment cost.");
+  const underfunded = bal < cost;
 
   if (!process.argv.includes("--yes")) {
+    if (underfunded) console.log("\nNote: balance is below the estimated cost - fund the deployer before --yes.");
     console.log("\nDry run only. Re-run with --yes to broadcast.");
     return;
   }
+  if (underfunded) die("Balance below the estimated deployment cost.");
 
   const contract = await factory.deploy(router, pool);
   console.log(`Deploy tx         ${contract.deploymentTransaction()?.hash}`);
